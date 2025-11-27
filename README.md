@@ -4,8 +4,9 @@
 📦 설치 및 실행
 Python 환경에서 필요한 라이브러리를 설치한 후 실행합니다.
 
-'''python
+```python
 pip install PyQt6 pyqtgraph pandas numpy scikit-learn openpyxl
+```
 
 # 실행
 python app.py
