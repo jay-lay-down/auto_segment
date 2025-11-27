@@ -1,9 +1,9 @@
 # auto_segment
 
 복잡한 코딩 없이 클릭만으로 변수를 가공하고, Demand Space(=segmentation과 혼용하여 사용) 상에서 드래그 앤 드롭으로 세그먼트를 조정하여 최적의 타겟 그룹을 발굴할 수 있습니다.
-📦 설치 및 실행
-Python 환경에서 필요한 라이브러리를 설치한 후 실행합니다.
+![세그먼트 자동화 v2](https://raw.githubusercontent.com/jay-lay-down/auto_segment/main/source/%EC%84%B8%EA%B7%B8%EB%A8%BC%ED%8A%B8%20%EC%9E%90%EB%8F%99%ED%99%94_v2.png)
 
+📦 설치 및 실행
 ```python
 pip install PyQt6 pyqtgraph pandas numpy scikit-learn openpyxl
 ```
