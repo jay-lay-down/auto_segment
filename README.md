@@ -2,6 +2,7 @@
 
 복잡한 코딩 없이 클릭만으로 변수를 가공하고, Demand Space(=segmentation과 혼용하여 사용) 상에서 드래그 앤 드롭으로 세그먼트를 조정하여 최적의 타겟 그룹을 발굴할 수 있습니다.
 ![세그먼트 자동화 v2](https://raw.githubusercontent.com/jay-lay-down/auto_segment/main/source/%EC%84%B8%EA%B7%B8%EB%A8%BC%ED%8A%B8%20%EC%9E%90%EB%8F%99%ED%99%94_v2.png)
+**AI 어시스턴트(RAG)**가 탑재되어 분석 결과에 대한 즉각적인 해석과 오류 디버그, 질의응답이 가능합니다.
 
 📦 설치 및 실행
 ```python
@@ -62,7 +63,16 @@ Shift + 클릭: 점을 다중 선택합니다.
 [Export] 탭에서 파일 경로를 지정하고 저장 버튼을 누릅니다.
 전처리된 데이터, PCA 결과, 트리 분석 결과, 그리고 수작업으로 조정한 Demand Space 좌표 및 클러스터 정보까지 모두 엑셀 시트로 분리되어 저장됩니다.
 
+### 🔑 AI 기능 설정 (API Key)
+AI 어시스턴트 기능을 사용하려면 OpenAI API Key가 필요합니다.
+프로그램 실행 후 AI Assistant (RAG) 탭으로 이동합니다.
+sk-로 시작하는 본인의 API 키를 입력합니다.
+질문을 입력하고 Send를 누르면 데이터 기반의 답변을 받을 수 있습니다.
+
 ### 💡 활용 팁
 보통 [데이터 로드] → [PCA] (성향 파악) → [Compose] (인구통계 변수 조합) → [Demand Space] (Segments-as-points 모드) 순서로 진행하면 효율적입니다.
 Demand Space에서 자동 클러스터링된 결과가 마음에 들지 않으면, 마우스로 라벨을 드래그하여 직관적으로 그룹을 합치세요.
 _seg 변수를 만들 때 일관된 규칙(예: 변수명_seg)을 사용하면 관리가 편합니다. (툴에서 자동 처리해 줌)
+
+### 👨‍💻 Author: Jihee Cho (https://github.com/jay-lay-down)
+
