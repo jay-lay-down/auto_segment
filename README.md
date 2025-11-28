@@ -8,7 +8,7 @@
 
 📦 설치 및 실행
 ```python
-pip install PyQt6 pyqtgraph pandas numpy scikit-learn openpyxl request
+pip install PyQt6 pyqtgraph pandas numpy scikit-learn openpyxl requests
 ```
 
 # 실행
