@@ -242,6 +242,7 @@ class AppState:
     demand_xy: Optional[pd.DataFrame] = None
     cluster_assign: Optional[pd.Series] = None
     cluster_names: Dict[int, str] = field(default_factory=dict)
+    demand_seg_separator: str = "|"
 
     # Demand Space Profile Data
     demand_seg_profile: Optional[pd.DataFrame] = None
@@ -1294,6 +1295,7 @@ class DemandClusterPlot(pg.PlotWidget):
     """
     sigClustersChanged = QtCore.pyqtSignal()
     sigCoordsChanged = QtCore.pyqtSignal()
+    sigPointClusterClicked = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None, editable: bool = True):
         self._vb = ClusterViewBox(self)
@@ -1537,6 +1539,7 @@ class DemandClusterPlot(pg.PlotWidget):
             if not shift:
                 self._selected.clear()
                 self._draw_scatter()
+                self.sigPointClusterClicked.emit(None)
             return
         if shift:
             if i in self._selected:
@@ -1546,6 +1549,8 @@ class DemandClusterPlot(pg.PlotWidget):
         else:
             self._selected = {i}
         self._draw_scatter()
+        cid = int(self._cluster[i]) if len(self._cluster) else None
+        self.sigPointClusterClicked.emit(cid)
 
     def _cluster_centroids(self) -> Dict[int, Tuple[float, float]]:
         out = {}
@@ -3377,6 +3382,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
+                self.state.demand_seg_separator = sep
                 self.state.demand_features_used = feat_cols
                 self.state.manual_dirty = False
 
@@ -3523,6 +3529,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.tbl_cluster_summary = DataFrameTable(float_decimals=2)
         left.addWidget(self.tbl_cluster_summary, 1)
 
+        left.addWidget(QtWidgets.QLabel("<b>Selected Cluster Details</b>"))
+        self.tbl_cluster_detail = DataFrameTable(float_decimals=2)
+        left.addWidget(self.tbl_cluster_detail, 1)
+
         rename_box = QtWidgets.QHBoxLayout()
         self.spin_rename_cluster_id = QtWidgets.QSpinBox()
         self.spin_rename_cluster_id.setRange(1, 999)
@@ -3542,6 +3552,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.plot_edit = DemandClusterPlot(editable=True)
         self.plot_edit.sigClustersChanged.connect(self._on_manual_clusters_changed)
         self.plot_edit.sigCoordsChanged.connect(self._on_manual_coords_changed)
+        self.plot_edit.sigPointClusterClicked.connect(self._on_cluster_detail_requested)
         center.addWidget(self.plot_edit, 1)
         layout.addLayout(center, 2)
 
@@ -3566,6 +3577,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         """[v8.1] Enhanced to show sub-segment details for each cluster."""
         if self.state.demand_xy is None or self.state.cluster_assign is None:
             self.tbl_cluster_summary.set_df(None)
+            self.tbl_cluster_detail.set_df(None)
             return
 
         cl = self.state.cluster_assign.copy()
@@ -3596,6 +3608,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
             })
         out = pd.DataFrame(rows).sort_values(["Cluster ID"]).reset_index(drop=True)
         self.tbl_cluster_summary.set_df(out, max_rows=500)
+
+        first_cluster = int(out.iloc[0]["Cluster ID"]) if not out.empty else None
+        self._update_cluster_detail(first_cluster)
 
     def _update_profiler(self):
         """Calculates Z-scores for each cluster to find distinctive features."""
@@ -3647,6 +3662,46 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 report += f"<b>=== {cname} ===</b><br>"
                 report += ", ".join(vars_in) + "<br><br>"
             self.txt_profile_report.setHtml(report)
+
+    def _cluster_detail_rows(self, cluster_id: Optional[int]) -> Optional[pd.DataFrame]:
+        if cluster_id is None or self.state.cluster_assign is None:
+            return None
+
+        cl = self.state.cluster_assign
+        if cluster_id not in set(map(int, cl.values)):
+            return None
+
+        rows = []
+        comps = self.state.demand_seg_components or []
+        sep = self.state.demand_seg_separator or "|"
+        n_lookup = None
+        if self.state.demand_seg_profile is not None and "n" in self.state.demand_seg_profile.columns:
+            n_lookup = self.state.demand_seg_profile["n"]
+
+        for seg_label in cl[cl == cluster_id].index.tolist():
+            entry = {"Segment": seg_label, "Cluster": int(cluster_id)}
+            parts = str(seg_label).split(sep) if comps else []
+            for idx, comp in enumerate(comps):
+                entry[comp] = parts[idx] if idx < len(parts) else ""
+            if n_lookup is not None and seg_label in n_lookup.index:
+                entry["n"] = int(n_lookup.loc[seg_label])
+            rows.append(entry)
+
+        if not rows:
+            return None
+        df_out = pd.DataFrame(rows)
+        if "n" in df_out.columns:
+            df_out = df_out.sort_values("n", ascending=False)
+        return df_out.reset_index(drop=True)
+
+    def _update_cluster_detail(self, cluster_id: Optional[int]):
+        df_out = self._cluster_detail_rows(cluster_id)
+        self.tbl_cluster_detail.set_df(df_out, max_rows=300)
+
+    def _on_cluster_detail_requested(self, cluster_id: Optional[int]):
+        if cluster_id is None:
+            return
+        self._update_cluster_detail(cluster_id)
 
     def _on_manual_clusters_changed(self):
         if self.state.demand_xy is None:
@@ -3745,6 +3800,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             with pd.ExcelWriter(out, engine="openpyxl") as w:
                 self.state.df.to_excel(w, sheet_name="01_Data", index=False)
+                # Export data with cluster labels when available
+                if self.state.cluster_assign is not None and self.state.demand_seg_components:
+                    try:
+                        df_with_cl = self.state.df.copy()
+                        sep = self.state.demand_seg_separator or "|"
+                        seg_cols = self.state.demand_seg_components
+                        df_with_cl["_SEG_LABEL_"] = df_with_cl[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+                        df_with_cl["cluster_id"] = df_with_cl["_SEG_LABEL_"].map(self.state.cluster_assign)
+                        df_with_cl["cluster_name"] = df_with_cl["cluster_id"].map(self.state.cluster_names)
+                        df_with_cl.to_excel(w, sheet_name="01b_Data_With_Clusters", index=False)
+                    except Exception:
+                        pass
                 if self.state.recode_df is not None:
                     self.state.recode_df.to_excel(w, sheet_name="02_RECODE", index=False)
 
@@ -3769,6 +3836,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     cl_df.columns = ["id", "cluster_id"]
                     cl_df["cluster_name"] = cl_df["cluster_id"].map(self.state.cluster_names).fillna("")
                     cl_df.to_excel(w, sheet_name="13_Demand_Clusters", index=False)
+
+                    # Add per-cluster sheets with segment details
+                    for cid in sorted(cl_df["cluster_id"].unique()):
+                        detail_df = self._cluster_detail_rows(int(cid))
+                        if detail_df is not None:
+                            sheet_name = f"13_{int(cid):02d}_Cluster"
+                            detail_df.to_excel(w, sheet_name=sheet_name[:31], index=False)
 
                 # [v8.1] Export variable types
                 if self.state.var_types:
