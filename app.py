@@ -240,7 +240,9 @@ class AppState:
     # Demand Space Data
     demand_mode: str = "Segments-as-points"
     demand_xy: Optional[pd.DataFrame] = None
-    cluster_assign: Optional[pd.Series] = None
+    cluster_assign: Optional[pd.Series] = None  # effective assignment (base + overrides)
+    base_cluster_assign: Optional[pd.Series] = None
+    cluster_manual_override: Dict[str, int] = field(default_factory=dict)
     cluster_names: Dict[int, str] = field(default_factory=dict)
     demand_seg_separator: str = "|"
 
@@ -1421,6 +1423,17 @@ class DemandClusterPlot(pg.PlotWidget):
         except Exception:
             pass
 
+    def update_clusters(self, clusters: np.ndarray, cluster_names: Optional[Dict[int, str]] = None):
+        if clusters is None:
+            return
+        if len(clusters) != len(self._ids):
+            # Length mismatch; ignore to avoid inconsistent state
+            return
+        self._cluster = np.asarray(clusters, dtype=int)
+        if cluster_names is not None:
+            self._cluster_names = dict(cluster_names or {})
+        self.redraw_all()
+
     def get_cluster_series(self) -> pd.Series:
         return pd.Series(self._cluster.copy(), index=self._ids)
 
@@ -1604,8 +1617,8 @@ class DemandClusterPlot(pg.PlotWidget):
             if i is None:
                 ev.ignore()
                 return
-            if i not in self._selected:
-                self._selected = {i}
+            # Drag is always single-point to avoid unintended bulk moves
+            self._selected = {i}
             self._dragging = True
             self._drag_temp_positions = self._xy.copy()
             self._drag_anchor_xy = (pos[0], pos[1])
@@ -1972,6 +1985,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if self.state.dt_improve_pivot is not None:
                     self.tbl_dt_pivot.set_df(self.state.dt_improve_pivot)
+
+                if not hasattr(self.state, "cluster_manual_override"):
+                    self.state.cluster_manual_override = {}
+                if not hasattr(self.state, "base_cluster_assign"):
+                    self.state.base_cluster_assign = self.state.cluster_assign.copy() if self.state.cluster_assign is not None else None
 
                 self.statusBar().showMessage(f"Project loaded from {path}")
             except Exception as e:
@@ -3378,15 +3396,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 self.state.demand_mode = "Segments-as-points"
                 self.state.demand_xy = xy_df
-                self.state.cluster_assign = cl_s
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
                 self.state.demand_seg_separator = sep
                 self.state.demand_features_used = feat_cols
-                self.state.manual_dirty = False
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
+                self._set_base_clusters(cl_s)
+                xy_df["cluster_id"] = self.state.cluster_assign.reindex(ids).values
+                self.state.manual_dirty = bool(self.state.cluster_manual_override)
+
+                clusters_eff = self.state.cluster_assign.reindex(ids).fillna(0).astype(int).values
+                args = (ids, labels, xy, clusters_eff, self.state.cluster_names)
                 self.plot_preview.set_data(*args)
                 self.plot_edit.set_data(*args)
                 self._update_cluster_summary()
@@ -3423,12 +3444,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 self.state.demand_mode = "Variables-as-points"
                 self.state.demand_xy = xy_df
-                self.state.cluster_assign = cl_s
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = None
-                self.state.manual_dirty = False
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
+                self._set_base_clusters(cl_s)
+                xy_df["cluster_id"] = self.state.cluster_assign.reindex(ids).values
+                self.state.manual_dirty = bool(self.state.cluster_manual_override)
+
+                clusters_eff = self.state.cluster_assign.reindex(ids).fillna(0).astype(int).values
+                args = (ids, labels, xy, clusters_eff, self.state.cluster_names)
                 self.plot_preview.set_data(*args)
                 self.plot_edit.set_data(*args)
                 self._update_cluster_summary()
@@ -3573,6 +3597,42 @@ class IntegratedApp(QtWidgets.QMainWindow):
         else:
             self._set_status("View Mode: Pan/Zoom enabled. (Editing locked)")
 
+    # ------------------------------------------------------------------
+    # Cluster assignment helpers (base + manual overrides)
+    # ------------------------------------------------------------------
+    def _prune_manual_overrides(self):
+        base = self.state.base_cluster_assign
+        if base is None:
+            return
+        valid = set(map(str, base.index))
+        self.state.cluster_manual_override = {
+            str(k): int(v) for k, v in self.state.cluster_manual_override.items() if str(k) in valid
+        }
+
+    def _apply_cluster_overrides(self, base: pd.Series) -> pd.Series:
+        eff = base.copy()
+        for k, v in self.state.cluster_manual_override.items():
+            key = str(k)
+            if key in eff.index:
+                eff.loc[key] = int(v)
+        return eff
+
+    def _set_base_clusters(self, base: pd.Series):
+        self.state.base_cluster_assign = base.copy()
+        self._prune_manual_overrides()
+        self.state.cluster_assign = self._apply_cluster_overrides(base)
+
+    def _refresh_plots_from_state(self):
+        if self.state.demand_xy is None or self.state.cluster_assign is None:
+            return
+        df = self.state.demand_xy
+        ids = df["id"].astype(str).tolist()
+        labels = df["label"].astype(str).tolist() if "label" in df.columns else ids
+        xy = df[["x", "y"]].values
+        clusters = self.state.cluster_assign.reindex(ids).fillna(0).astype(int).values
+        self.plot_edit.update_clusters(clusters, self.state.cluster_names)
+        self.plot_preview.update_clusters(clusters, self.state.cluster_names)
+
     def _update_cluster_summary(self):
         """[v8.1] Enhanced to show sub-segment details for each cluster."""
         if self.state.demand_xy is None or self.state.cluster_assign is None:
@@ -3677,14 +3737,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
         n_lookup = None
         if self.state.demand_seg_profile is not None and "n" in self.state.demand_seg_profile.columns:
             n_lookup = self.state.demand_seg_profile["n"]
+        elif self.state.demand_xy is not None and "n" in self.state.demand_xy.columns:
+            tmp = self.state.demand_xy.set_index("id")
+            n_lookup = tmp["n"] if "n" in tmp.columns else None
 
         for seg_label in cl[cl == cluster_id].index.tolist():
-            entry = {"Segment": seg_label, "Cluster": int(cluster_id)}
+            entry = {"level_label": seg_label, "Cluster": int(cluster_id)}
             parts = str(seg_label).split(sep) if comps else []
             for idx, comp in enumerate(comps):
                 entry[comp] = parts[idx] if idx < len(parts) else ""
             if n_lookup is not None and seg_label in n_lookup.index:
                 entry["n"] = int(n_lookup.loc[seg_label])
+            entry["segment_key"] = seg_label
             rows.append(entry)
 
         if not rows:
@@ -3692,7 +3756,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         df_out = pd.DataFrame(rows)
         if "n" in df_out.columns:
             df_out = df_out.sort_values("n", ascending=False)
-        return df_out.reset_index(drop=True)
+        cols_order = ["Cluster", "level_label", "n"]
+        cols_order += [c for c in comps if c in df_out.columns]
+        cols_order += [c for c in df_out.columns if c not in cols_order]
+        return df_out[cols_order].reset_index(drop=True)
 
     def _update_cluster_detail(self, cluster_id: Optional[int]):
         df_out = self._cluster_detail_rows(cluster_id)
@@ -3707,8 +3774,34 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if self.state.demand_xy is None:
             return
         s = self.plot_edit.get_cluster_series()
-        self.state.cluster_assign = s
-        self.state.manual_dirty = True
+        if self.state.base_cluster_assign is None:
+            self._set_base_clusters(s)
+        else:
+            overrides = {}
+            base = self.state.base_cluster_assign
+            for idx, val in s.items():
+                if idx not in base.index:
+                    continue
+                base_val = base.loc[idx]
+                if pd.isna(base_val):
+                    continue
+                if int(val) != int(base_val):
+                    overrides[str(idx)] = int(val)
+            self.state.cluster_manual_override = overrides
+            self.state.cluster_assign = self._apply_cluster_overrides(base)
+
+        if self.state.cluster_assign is None:
+            return
+
+        try:
+            df = self.state.demand_xy.copy()
+            df["cluster_id"] = df["id"].astype(str).map(self.state.cluster_assign)
+            self.state.demand_xy = df
+        except Exception:
+            pass
+
+        self.state.manual_dirty = bool(self.state.cluster_manual_override)
+        self._refresh_plots_from_state()
         self._update_cluster_summary()
         self._update_profiler()
         self._set_status("Manual clusters updated.")
@@ -3800,6 +3893,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             with pd.ExcelWriter(out, engine="openpyxl") as w:
                 self.state.df.to_excel(w, sheet_name="01_Data", index=False)
+                df_with_cl = None
                 # Export data with cluster labels when available
                 if self.state.cluster_assign is not None and self.state.demand_seg_components:
                     try:
@@ -3810,8 +3904,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
                         df_with_cl["cluster_id"] = df_with_cl["_SEG_LABEL_"].map(self.state.cluster_assign)
                         df_with_cl["cluster_name"] = df_with_cl["cluster_id"].map(self.state.cluster_names)
                         df_with_cl.to_excel(w, sheet_name="01b_Data_With_Clusters", index=False)
+                        df_with_cl.to_excel(w, sheet_name="raw_with_cluster", index=False)
                     except Exception:
-                        pass
+                        df_with_cl = None
                 if self.state.recode_df is not None:
                     self.state.recode_df.to_excel(w, sheet_name="02_RECODE", index=False)
 
@@ -3841,8 +3936,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     for cid in sorted(cl_df["cluster_id"].unique()):
                         detail_df = self._cluster_detail_rows(int(cid))
                         if detail_df is not None:
-                            sheet_name = f"13_{int(cid):02d}_Cluster"
+                            sheet_name = f"Cluster_{int(cid)}"
                             detail_df.to_excel(w, sheet_name=sheet_name[:31], index=False)
+                    if df_with_cl is not None and "cluster_id" in df_with_cl.columns:
+                        grouped = df_with_cl.groupby("cluster_id").size().reset_index(name="n")
+                        grouped["cluster_name"] = grouped["cluster_id"].map(self.state.cluster_names)
+                        grouped.to_excel(w, sheet_name="cluster_counts", index=False)
 
                 # [v8.1] Export variable types
                 if self.state.var_types:
