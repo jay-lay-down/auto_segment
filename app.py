@@ -3733,7 +3733,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             n_lookup = self.state.demand_seg_profile["n"]
 
         for seg_label in cl[cl == cluster_id].index.tolist():
-            entry = {"level_label": seg_label, "Segment": seg_label, "Cluster": int(cluster_id)}
+            entry = {"Segment": seg_label, "Cluster": int(cluster_id)}
             parts = str(seg_label).split(sep) if comps else []
             for idx, comp in enumerate(comps):
                 entry[comp] = parts[idx] if idx < len(parts) else ""
@@ -3879,7 +3879,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
                         df_with_cl["cluster_id"] = df_with_cl["_SEG_LABEL_"].map(self.state.cluster_assign)
                         df_with_cl["cluster_name"] = df_with_cl["cluster_id"].map(self.state.cluster_names)
                         df_with_cl.to_excel(w, sheet_name="01b_Data_With_Clusters", index=False)
-                        df_with_cl.to_excel(w, sheet_name="raw_with_cluster", index=False)
                     except Exception:
                         pass
                 if self.state.recode_df is not None:
@@ -3911,13 +3910,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     for cid in sorted(cl_df["cluster_id"].unique()):
                         detail_df = self._cluster_detail_rows(int(cid))
                         if detail_df is not None:
-                            detail_export = detail_df.copy()
-                            if "n" in detail_export.columns:
-                                detail_export["cluster_total_n"] = detail_export["n"].sum()
-                            else:
-                                detail_export["cluster_total_n"] = len(detail_export)
-                            sheet_name = f"Cluster_{int(cid)}"
-                            detail_export.to_excel(w, sheet_name=sheet_name[:31], index=False)
+                            sheet_name = f"13_{int(cid):02d}_Cluster"
+                            detail_df.to_excel(w, sheet_name=sheet_name[:31], index=False)
 
                 # [v8.1] Export variable types
                 if self.state.var_types:
