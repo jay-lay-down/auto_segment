@@ -240,7 +240,9 @@ class AppState:
     # Demand Space Data
     demand_mode: str = "Segments-as-points"
     demand_xy: Optional[pd.DataFrame] = None
+    cluster_assign_base: Optional[pd.Series] = None
     cluster_assign: Optional[pd.Series] = None
+    manual_cluster_override: Dict[str, int] = field(default_factory=dict)
     cluster_names: Dict[int, str] = field(default_factory=dict)
     demand_seg_separator: str = "|"
 
@@ -1604,8 +1606,7 @@ class DemandClusterPlot(pg.PlotWidget):
             if i is None:
                 ev.ignore()
                 return
-            if i not in self._selected:
-                self._selected = {i}
+            self._selected = {i}
             self._dragging = True
             self._drag_temp_positions = self._xy.copy()
             self._drag_anchor_xy = (pos[0], pos[1])
@@ -1960,6 +1961,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 with open(path, "rb") as f:
                     self.state = pickle.load(f)
 
+                if not hasattr(self.state, "cluster_assign_base"):
+                    self.state.cluster_assign_base = getattr(self.state, "cluster_assign", None)
+                if not hasattr(self.state, "manual_cluster_override"):
+                    self.state.manual_cluster_override = {}
+                self._apply_overrides_to_base()
+
                 if self.state.df is not None:
                     self.tbl_preview.set_df(self.state.df)
                     self._refresh_all_column_lists()
@@ -1972,6 +1979,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if self.state.dt_improve_pivot is not None:
                     self.tbl_dt_pivot.set_df(self.state.dt_improve_pivot)
+
+                self._sync_plots_from_state()
+                self._update_cluster_summary()
+                self._update_profiler()
 
                 self.statusBar().showMessage(f"Project loaded from {path}")
             except Exception as e:
@@ -3378,17 +3389,19 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 self.state.demand_mode = "Segments-as-points"
                 self.state.demand_xy = xy_df
-                self.state.cluster_assign = cl_s
+                self.state.cluster_assign_base = cl_s
+                if self.state.manual_cluster_override:
+                    self._apply_overrides_to_base()
+                else:
+                    self.state.cluster_assign = cl_s.copy()
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
                 self.state.demand_seg_separator = sep
                 self.state.demand_features_used = feat_cols
-                self.state.manual_dirty = False
+                self.state.manual_dirty = bool(self.state.manual_cluster_override)
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
-                self.plot_preview.set_data(*args)
-                self.plot_edit.set_data(*args)
+                self._sync_plots_from_state()
                 self._update_cluster_summary()
                 self._update_profiler()
 
@@ -3423,14 +3436,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 self.state.demand_mode = "Variables-as-points"
                 self.state.demand_xy = xy_df
-                self.state.cluster_assign = cl_s
+                self.state.cluster_assign_base = cl_s
+                if self.state.manual_cluster_override:
+                    self._apply_overrides_to_base()
+                else:
+                    self.state.cluster_assign = cl_s.copy()
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = None
-                self.state.manual_dirty = False
+                self.state.manual_dirty = bool(self.state.manual_cluster_override)
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
-                self.plot_preview.set_data(*args)
-                self.plot_edit.set_data(*args)
+                self._sync_plots_from_state()
                 self._update_cluster_summary()
                 self._update_profiler()
 
@@ -3573,6 +3588,45 @@ class IntegratedApp(QtWidgets.QMainWindow):
         else:
             self._set_status("View Mode: Pan/Zoom enabled. (Editing locked)")
 
+    # ------------------------------------------------------------------
+    # Cluster assignment utilities (base + manual overrides)
+    # ------------------------------------------------------------------
+    def _apply_overrides_to_base(self):
+        base = self.state.cluster_assign_base
+        if base is None:
+            self.state.cluster_assign = None
+            return
+
+        eff = base.copy()
+        overrides = dict(self.state.manual_cluster_override or {})
+        missing = []
+        for key, cid in overrides.items():
+            if key in eff.index:
+                eff.loc[key] = int(cid)
+            else:
+                missing.append(key)
+
+        if missing:
+            for m in missing:
+                overrides.pop(m, None)
+            self.state.manual_cluster_override = overrides
+
+        self.state.cluster_assign = eff
+
+    def _sync_plots_from_state(self):
+        if self.state.demand_xy is None or self.state.cluster_assign is None:
+            return
+
+        df = self.state.demand_xy
+        ids = df["id"].astype(str).tolist() if "id" in df.columns else []
+        labels = df["label"].astype(str).tolist() if "label" in df.columns else ids
+        xy = df[["x", "y"]].values if {"x", "y"}.issubset(df.columns) else np.zeros((len(ids), 2))
+        cl = self.state.cluster_assign.reindex(ids).fillna(0).astype(int).values if ids else np.array([], dtype=int)
+
+        args = (ids, labels, xy, cl, self.state.cluster_names)
+        self.plot_edit.set_data(*args)
+        self.plot_preview.set_data(*args)
+
     def _update_cluster_summary(self):
         """[v8.1] Enhanced to show sub-segment details for each cluster."""
         if self.state.demand_xy is None or self.state.cluster_assign is None:
@@ -3707,8 +3761,22 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if self.state.demand_xy is None:
             return
         s = self.plot_edit.get_cluster_series()
-        self.state.cluster_assign = s
+        if self.state.cluster_assign_base is None:
+            self.state.cluster_assign_base = s.copy()
+
+        overrides = dict(self.state.manual_cluster_override or {})
+        base = self.state.cluster_assign_base
+        for key, val in s.items():
+            base_val = base.loc[key] if base is not None and key in base.index else None
+            if base_val is None or int(base_val) != int(val):
+                overrides[key] = int(val)
+            elif key in overrides:
+                overrides.pop(key, None)
+
+        self.state.manual_cluster_override = overrides
+        self._apply_overrides_to_base()
         self.state.manual_dirty = True
+        self._sync_plots_from_state()
         self._update_cluster_summary()
         self._update_profiler()
         self._set_status("Manual clusters updated.")
@@ -3718,13 +3786,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
         xy_map = self.plot_edit.get_xy_map()
         try:
-            df = self.state.demand_xy.copy()
-            if "id" in df.columns:
-                df["x"] = df["id"].astype(str).map(lambda k: xy_map.get(str(k), (np.nan, np.nan))[0])
-                df["y"] = df["id"].astype(str).map(lambda k: xy_map.get(str(k), (np.nan, np.nan))[1])
-                self.state.demand_xy = df
-                self.state.manual_dirty = True
-                self._set_status("Manual coords updated.")
+                df = self.state.demand_xy.copy()
+                if "id" in df.columns:
+                    df["x"] = df["id"].astype(str).map(lambda k: xy_map.get(str(k), (np.nan, np.nan))[0])
+                    df["y"] = df["id"].astype(str).map(lambda k: xy_map.get(str(k), (np.nan, np.nan))[1])
+                    self.state.demand_xy = df
+                    self.state.manual_dirty = True
+                    self._sync_plots_from_state()
+                    self._set_status("Manual coords updated.")
         except Exception:
             self._set_status("Manual coords update failed.")
 
