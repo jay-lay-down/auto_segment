@@ -3451,7 +3451,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self._update_cluster_summary()
                 self._update_profiler()
 
-                self.lbl_demand_status.setText(f"Done: {coord_name}, segments={len(ids)}, k={k}, alg={cluster_alg}.")
+                min_used = int(prof.attrs.get("min_n_used", min_n))
+                min_req = int(prof.attrs.get("min_n_requested", min_n))
+                min_note = ""
+                if min_req > 1 and min_used <= 1:
+                    min_note = " (Min N ignored to show all segments)"
+                self.lbl_demand_status.setText(f"Done: {coord_name}, segments={len(ids)}, k={k}, alg={cluster_alg}.{min_note}")
                 self._set_status("Demand Space Analysis Completed.")
 
             else:
@@ -3518,10 +3523,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         df["_SEG_LABEL_"] = df[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
 
         cnt = df["_SEG_LABEL_"].value_counts()
-        valid_segs = cnt[cnt >= min_n].index
+        # [Request] Always keep all segment combinations visible (no Min N filtering)
+        min_used = 1 if min_n > 1 else min_n
+        valid_segs = cnt.index
         df = df[df["_SEG_LABEL_"].isin(valid_segs)].copy()
-        if df.empty:
-            raise RuntimeError(f"No segments have >= {min_n} size.")
+        if df.empty or len(valid_segs) < 1:
+            raise RuntimeError("No segment rows available after composing labels.")
 
         feat_cols = []
         prof_parts = []
@@ -3550,6 +3557,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         prof = pd.concat(prof_parts, axis=1) if len(prof_parts) > 1 else prof_parts[0]
         prof["n"] = df.groupby("_SEG_LABEL_").size()
+        prof.attrs["min_n_used"] = min_used
+        prof.attrs["min_n_requested"] = min_n
         return prof, feat_cols
 
     def _build_segment_target_pivot(self, seg_cols: List[str], sep: str, target: str, min_n: int):
@@ -3560,10 +3569,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         df["_SEG_LABEL_"] = df[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
         cnt = df["_SEG_LABEL_"].value_counts()
-        valid_segs = cnt[cnt >= min_n].index
+        min_used = 1 if min_n > 1 else min_n
+        valid_segs = cnt.index
         df = df[df["_SEG_LABEL_"].isin(valid_segs)].copy()
-        if df.empty:
-            raise RuntimeError(f"No segments have >= {min_n} size after filtering.")
+        if df.empty or len(valid_segs) < 1:
+            raise RuntimeError("No segment rows available after composing labels.")
 
         pivot = pd.crosstab(df[target], df["_SEG_LABEL_"])
         if pivot.empty:
@@ -3574,6 +3584,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         dist.columns = [f"{target}::{c}" for c in dist.columns]
 
         dist["n"] = cnt.reindex(dist.index).fillna(0).astype(int)
+        dist.attrs["min_n_used"] = min_used
+        dist.attrs["min_n_requested"] = min_n
         feat_cols = [c for c in dist.columns if c != "n"]
         if not feat_cols:
             raise RuntimeError("No target distribution features available for clustering.")
