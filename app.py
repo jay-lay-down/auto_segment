@@ -43,7 +43,7 @@ import pyqtgraph as pg
 
 from sklearn.decomposition import PCA, FactorAnalysis
 from sklearn.manifold import MDS
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.preprocessing import StandardScaler
 
 # -----------------------------------------------------------------------------
@@ -3269,6 +3269,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         self.cmb_demand_coord = QtWidgets.QComboBox()
         self.cmb_demand_coord.addItems(["PCA (Dim1/Dim2)", "MDS (1-corr distance)"])
+        self.cmb_demand_cluster_alg = QtWidgets.QComboBox()
+        self.cmb_demand_cluster_alg.addItems(["K-Means", "Hierarchical (Ward)"])
         self.spin_demand_k = QtWidgets.QSpinBox()
         self.spin_demand_k.setRange(2, 30)
         self.spin_demand_k.setValue(6)
@@ -3278,7 +3280,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         row.addWidget(QtWidgets.QLabel("Method"))
         row.addWidget(self.cmb_demand_coord)
-        row.addWidget(QtWidgets.QLabel("K-Means (k)"))
+        row.addWidget(QtWidgets.QLabel("Clustering"))
+        row.addWidget(self.cmb_demand_cluster_alg)
+        row.addWidget(QtWidgets.QLabel("Clusters (k)"))
         row.addWidget(self.spin_demand_k)
         row.addWidget(self.btn_run_demand)
         left.addLayout(row)
@@ -3344,6 +3348,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             seg_mode = self.cmb_demand_mode.currentText().startswith("Segments-as-points")
             mode = self.cmb_demand_coord.currentText()
             k = int(self.spin_demand_k.value())
+            cluster_alg = self.cmb_demand_cluster_alg.currentText()
 
             if seg_mode:
                 seg_cols = self._selected_checked_items(self.lst_demand_segcols)
@@ -3381,7 +3386,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 ids = prof.index.astype(str).tolist()
                 labels = ids[:]
                 k = max(2, min(k, len(ids)))
-                km = KMeans(n_clusters=k, n_init=10, random_state=42)
+                if cluster_alg.startswith("Hierarchical"):
+                    km = AgglomerativeClustering(n_clusters=k, linkage="ward")
+                else:
+                    km = KMeans(n_clusters=k, n_init=10, random_state=42)
                 cl = km.fit_predict(xy) + 1
 
                 xy_df = pd.DataFrame({"id": ids, "label": labels, "x": xy[:, 0], "y": xy[:, 1], "n": prof["n"].values})
@@ -3405,13 +3413,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self._update_cluster_summary()
                 self._update_profiler()
 
-                self.lbl_demand_status.setText(f"Done: {coord_name}, segments={len(ids)}, k={k}.")
+                self.lbl_demand_status.setText(f"Done: {coord_name}, segments={len(ids)}, k={k}, alg={cluster_alg}.")
                 self._set_status("Demand Space Analysis Completed.")
 
             else:
                 cols = self._selected_checked_items(self.lst_demand_vars)
-                if len(cols) < 3:
-                    raise RuntimeError("Select at least 3 variables.")
+                if len(cols) < 2:
+                    raise RuntimeError("Select at least 2 variables.")
                 Vz, labels = self._variables_as_matrix(cols)
 
                 if mode.startswith("PCA"):
@@ -3427,7 +3435,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     coord_name = "MDS(1-corr,variables)"
 
                 k = max(2, min(k, xy.shape[0]))
-                km = KMeans(n_clusters=k, n_init=10, random_state=42)
+                if cluster_alg.startswith("Hierarchical"):
+                    km = AgglomerativeClustering(n_clusters=k, linkage="ward")
+                else:
+                    km = KMeans(n_clusters=k, n_init=10, random_state=42)
                 cl = km.fit_predict(xy) + 1
 
                 ids = labels
@@ -3449,7 +3460,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self._update_cluster_summary()
                 self._update_profiler()
 
-                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}.")
+                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}, alg={cluster_alg}.")
                 self._set_status("Demand Space (Vars) Analysis Completed.")
 
         except Exception as e:
@@ -3468,19 +3479,31 @@ class IntegratedApp(QtWidgets.QMainWindow):
             raise RuntimeError(f"No segments have >= {min_n} size.")
 
         feat_cols = []
+        prof_parts = []
         if use_factors:
             avail = [c for c in df.columns if str(c).startswith("Factor") and str(c)[6:].isdigit()]
             selected = [c for c in avail if int(c[6:]) <= fac_k]
             feat_cols.extend(selected)
+            if selected:
+                prof_parts.append(df.groupby("_SEG_LABEL_")[selected].mean())
 
         if target != "(None)" and target in df.columns:
-            feat_cols.append(target)
-            df[target] = pd.to_numeric(df[target], errors="coerce")
+            tser = df[target]
+            if pd.api.types.is_numeric_dtype(tser):
+                feat_cols.append(target)
+                df[target] = pd.to_numeric(df[target], errors="coerce")
+                prof_parts.append(df.groupby("_SEG_LABEL_")[[target]].mean())
+            else:
+                dist = pd.crosstab(df["_SEG_LABEL_"], tser, normalize="index")
+                dist = dist.fillna(0.0)
+                dist.columns = [f"{target}::{c}" for c in dist.columns]
+                feat_cols.extend(dist.columns.tolist())
+                prof_parts.append(dist)
 
         if not feat_cols:
             raise RuntimeError("No features for profiling (Enable Factors or select Target).")
 
-        prof = df.groupby("_SEG_LABEL_")[feat_cols].mean()
+        prof = pd.concat(prof_parts, axis=1) if len(prof_parts) > 1 else prof_parts[0]
         prof["n"] = df.groupby("_SEG_LABEL_").size()
         return prof, feat_cols
 

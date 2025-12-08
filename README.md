@@ -82,3 +82,4 @@ _seg 변수를 만들 때 일관된 규칙(예: 변수명_seg)을 사용하면 �
 
 ### 👨‍💻 Author: Jihee Cho (https://github.com/jay-lay-down)
 
+See docs/ANALYSIS_SPEC.md for clustering and similarity specifications.
