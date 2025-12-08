@@ -1216,8 +1216,8 @@ def build_univariate_tree_full(
 class DraggableClusterLabel(pg.TextItem):
     """
     A text label for a cluster centroid that can be dragged.
-    - Drag to another cluster: Merge clusters.
-    - Shift + Drag: Move label only (no merge).
+    - Dragging은 라벨 위치만 옮깁니다(클러스터 병합 없음).
+    - Shift + Drag 역시 라벨 위치만 조정합니다.
     """
     def __init__(self, plot: "DemandClusterPlot", cluster_id: int, text: str, color: QtGui.QColor):
         super().__init__(text=text, anchor=(0.5, 0.5))
@@ -1250,10 +1250,7 @@ class DraggableClusterLabel(pg.TextItem):
             shift = False
 
         if ev.isFinish():
-            if shift:
-                self.plot.remember_label_position(self.cluster_id, (float(pos_view.x()), float(pos_view.y())))
-                return
-            self.plot.try_merge_label(self.cluster_id, (float(pos_view.x()), float(pos_view.y())))
+            self.plot.remember_label_position(self.cluster_id, (float(pos_view.x()), float(pos_view.y())))
         else:
             self.setPos(float(pos_view.x()), float(pos_view.y()))
 
@@ -1563,12 +1560,29 @@ class DemandClusterPlot(pg.PlotWidget):
             out[cid] = (float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1])))
         return out
 
-    def _assign_selected_to_nearest_cluster(self, drop_xy: Tuple[float, float]):
+    def _cluster_at_position(self, drop_xy: Tuple[float, float]) -> Optional[int]:
+        """Return cluster id under drop_xy, preferring hull containment then nearest centroid."""
+        pt = QtCore.QPointF(drop_xy[0], drop_xy[1])
+
+        # 1) If the drop point is inside a drawn hull, use that cluster.
+        for cid, hull_item in self._hull_items.items():
+            try:
+                if hull_item.path().contains(pt):
+                    return int(cid)
+            except Exception:
+                continue
+
+        # 2) Fallback to nearest centroid.
         cent = self._cluster_centroids()
-        if not cent or not self._selected:
-            return
+        if not cent:
+            return None
         d2 = {cid: (drop_xy[0] - c[0]) ** 2 + (drop_xy[1] - c[1]) ** 2 for cid, c in cent.items()}
-        dst = int(min(d2, key=d2.get))
+        return int(min(d2, key=d2.get))
+
+    def _assign_selected_to_nearest_cluster(self, drop_xy: Tuple[float, float]):
+        dst = self._cluster_at_position(drop_xy)
+        if dst is None or not self._selected:
+            return
         for i in self._selected:
             self._cluster[i] = dst
         self._drag_temp_positions = None
@@ -1638,39 +1652,9 @@ class DemandClusterPlot(pg.PlotWidget):
             self._draw_scatter()
 
     def try_merge_label(self, src_cluster: int, drop_xy: Tuple[float, float]):
-        cent = self._cluster_centroids()
-        if len(cent) <= 1:
-            self.remember_label_position(src_cluster, drop_xy)
-            self._draw_hulls_and_labels()
-            return
-
-        xr, yr = self.getPlotItem().vb.viewRange()
-        scale = max((xr[1] - xr[0]), (yr[1] - yr[0]))
-        thr = max(0.05 * scale, 0.4)
-
-        best = None
-        best_d2 = None
-        for cid, (cx, cy) in cent.items():
-            if cid == src_cluster:
-                continue
-            d2 = (drop_xy[0] - cx) ** 2 + (drop_xy[1] - cy) ** 2
-            if best_d2 is None or d2 < best_d2:
-                best = cid
-                best_d2 = d2
-
-        if best is None or best_d2 is None or best_d2 > thr * thr:
-            self.remember_label_position(src_cluster, drop_xy)
-            self._draw_hulls_and_labels()
-            return
-
-        dst = int(best)
-        self._cluster[self._cluster == int(src_cluster)] = dst
-
-        if int(src_cluster) in self._label_pos_override:
-            self._label_pos_override.pop(int(src_cluster), None)
-
-        self.redraw_all()
-        self.sigClustersChanged.emit()
+        """(No-op merge) Keep existing clusters; only remember label position."""
+        self.remember_label_position(src_cluster, drop_xy)
+        self._draw_hulls_and_labels()
 
 
 # -----------------------------------------------------------------------------
