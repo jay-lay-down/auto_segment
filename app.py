@@ -37,6 +37,8 @@ import numpy as np
 import pandas as pd
 import requests
 from scipy.stats import zscore
+from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import linkage, fcluster
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
@@ -2418,7 +2420,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_dt_predictors = QtWidgets.QListWidget()
         self.lst_dt_predictors.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.lst_dt_predictors.setMaximumHeight(200)
+        self.lst_dt_predictors.setMaximumHeight(160)
         pred_layout.addWidget(self.lst_dt_predictors, 1)
         layout.addWidget(pred_box)
 
@@ -2450,7 +2452,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         splitter.addWidget(w1)
         splitter.addWidget(w2)
-        splitter.setSizes([500, 200])
+        splitter.setSizes([420, 280])
         layout.addWidget(splitter, 1)
 
     def _filter_dt_pred_list(self):
@@ -2731,7 +2733,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         bl.addWidget(self.tbl_split_detail, 1)
         splitter.addWidget(botw)
 
-        splitter.setSizes([400, 300])
+        splitter.setSizes([320, 420])
         layout.addWidget(splitter, 1)
 
     def _compute_full_tree_internal(self, dep: str, ind: str):
@@ -3354,38 +3356,46 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     seg_cols, sep, use_factors, fac_k, target, min_n
                 )
 
-                X = prof[feat_cols].copy()
-                X = X.replace([np.inf, -np.inf], np.nan).fillna(X.mean())
-                scaler = StandardScaler()
-                Xz = pd.DataFrame(scaler.fit_transform(X), index=X.index, columns=X.columns)
-                Xz = Xz.fillna(0)
-
-                n_segments, n_features = Xz.shape
+                X = prof[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                n_segments, n_features = X.shape
                 if n_segments < 2:
                     raise RuntimeError(
                         "세그먼트 조합이 1개뿐입니다. 최소 2개 이상의 세그먼트 조합이 있어야 2D 좌표와 클러스터를 계산할 수 있습니다."
                     )
 
-                coord_name = ""
-                fallback_note = ""
-                if mode.startswith("PCA") and min(n_segments, n_features) >= 2:
-                    pca = PCA(n_components=2, random_state=42)
-                    xy = pca.fit_transform(Xz.values)
-                    coord_name = "PCA(profile)"
+                # Distance on target×segment normalized distribution (R hclust equivalent)
+                dist_condensed = pdist(X.values, metric="euclidean")
+                if np.allclose(dist_condensed, 0):
+                    xy = np.zeros((n_segments, 2))
+                    coord_name = "MDS(target×segment) (모든 세그 거리가 0)"
                 else:
-                    if mode.startswith("PCA") and min(n_segments, n_features) < 2:
-                        fallback_note = " (PCA는 프로파일/세그먼트 수가 2개 이상일 때만 가능하여 MDS로 자동 전환되었습니다.)"
-                    C = np.corrcoef(Xz.values)
-                    D = 1.0 - C
-                    D = np.clip(D, 0.0, 2.0)
-                    mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42, n_init=2, max_iter=300)
-                    xy = mds.fit_transform(D)
-                    coord_name = "MDS(1-corr,profile)" + fallback_note
+                    dist_square = squareform(dist_condensed)
+                    coord_name = "MDS(target×segment)"
+                    if mode.startswith("PCA") and n_features >= 2:
+                        pca = PCA(n_components=2, random_state=42)
+                        xy = pca.fit_transform(X.values)
+                        coord_name = "PCA(target×segment 분포)"
+                    else:
+                        mds = MDS(
+                            n_components=2,
+                            dissimilarity="precomputed",
+                            random_state=42,
+                            n_init=4,
+                            max_iter=500,
+                        )
+                        xy = mds.fit_transform(dist_square)
 
                 ids = prof.index.astype(str).tolist()
                 labels = ids[:]
                 k = max(2, min(k, len(ids)))
-                cl = _cluster_labels(xy)
+
+                if cluster_method.startswith("Hierarchical"):
+                    Z = linkage(dist_condensed if len(dist_condensed) else np.array([0.0]), method="complete")
+                    cl = fcluster(Z, t=k, criterion="maxclust")
+                else:
+                    km_data = X.values
+                    km = KMeans(n_clusters=k, n_init=10, random_state=42)
+                    cl = km.fit_predict(km_data) + 1
 
                 xy_df = pd.DataFrame({
                     "id": ids,
@@ -3501,25 +3511,28 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if cnt.empty:
             raise RuntimeError("No segments found for the selected *_seg columns.")
 
-        feat_cols = []
-        if use_factors:
-            avail = [c for c in df.columns if str(c).startswith("Factor") and str(c)[6:].isdigit()]
-            selected = [c for c in avail if int(c[6:]) <= fac_k]
-            feat_cols.extend(selected)
+        if target == "(None)" or target not in df.columns:
+            raise RuntimeError("Target 변수를 선택해 주세요. (Segments-as-points는 타깃×세그 분포 기반)")
 
-        if target != "(None)" and target in df.columns:
-            feat_cols.append(target)
+        # Pivot: target rows x segment columns → normalize each segment column to sum=1
+        pivot = (
+            df.assign(_cnt=1)
+            .pivot_table(index=target, columns="_SEG_LABEL_", values="_cnt", aggfunc="sum", fill_value=0)
+            .astype(float)
+        )
 
-        if not feat_cols:
-            raise RuntimeError("No features for profiling (Enable Factors or select Target).")
+        if pivot.shape[1] < 2:
+            raise RuntimeError("세그먼트 조합이 1개뿐입니다. 최소 2개 이상이어야 합니다.")
 
-        feat_df, encoded_cols = self._encode_features(df, feat_cols)
-        df_encoded = pd.concat([df[["_SEG_LABEL_"]], feat_df], axis=1)
+        col_sum = pivot.sum(axis=0)
+        pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
 
-        prof = df_encoded.groupby("_SEG_LABEL_")[encoded_cols].mean()
-        prof["n"] = df_encoded.groupby("_SEG_LABEL_").size()
+        seg_matrix = pivot_norm.T
+        seg_matrix["n"] = seg_matrix.index.map(cnt.get).fillna(0).astype(int)
+
+        feature_cols = [c for c in seg_matrix.columns if c != "n"]
         labels_by_row = df["_SEG_LABEL_"].copy()
-        return prof, encoded_cols, labels_by_row
+        return seg_matrix, feature_cols, labels_by_row
 
     def _current_segment_labels(self) -> Optional[pd.Series]:
         if self.state.df is None or not self.state.demand_seg_components:
