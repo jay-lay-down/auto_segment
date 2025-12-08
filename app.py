@@ -43,7 +43,7 @@ import pyqtgraph as pg
 
 from sklearn.decomposition import PCA, FactorAnalysis
 from sklearn.manifold import MDS
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.preprocessing import StandardScaler
 
 # -----------------------------------------------------------------------------
@@ -3259,6 +3259,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         self.cmb_demand_coord = QtWidgets.QComboBox()
         self.cmb_demand_coord.addItems(["PCA (Dim1/Dim2)", "MDS (1-corr distance)"])
+        self.cmb_demand_cluster = QtWidgets.QComboBox()
+        self.cmb_demand_cluster.addItems(["K-Means", "Hierarchical (Ward)"])
         self.spin_demand_k = QtWidgets.QSpinBox()
         self.spin_demand_k.setRange(2, 30)
         self.spin_demand_k.setValue(6)
@@ -3268,7 +3270,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         row.addWidget(QtWidgets.QLabel("Method"))
         row.addWidget(self.cmb_demand_coord)
-        row.addWidget(QtWidgets.QLabel("K-Means (k)"))
+        row.addWidget(QtWidgets.QLabel("Clustering"))
+        row.addWidget(self.cmb_demand_cluster)
+        row.addWidget(QtWidgets.QLabel("Clusters (k)"))
         row.addWidget(self.spin_demand_k)
         row.addWidget(self.btn_run_demand)
         left.addLayout(row)
@@ -3335,6 +3339,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
             seg_mode = self.cmb_demand_mode.currentText().startswith("Segments-as-points")
             mode = self.cmb_demand_coord.currentText()
             k = int(self.spin_demand_k.value())
+            cluster_method = self.cmb_demand_cluster.currentText()
+
+            def _cluster_labels(xy: np.ndarray) -> np.ndarray:
+                if cluster_method.startswith("Hierarchical"):
+                    model = AgglomerativeClustering(n_clusters=k, linkage="ward")
+                    labels = model.fit_predict(xy)
+                else:
+                    model = KMeans(n_clusters=k, n_init=10, random_state=42)
+                    labels = model.fit_predict(xy)
+                return labels + 1
 
             if seg_mode:
                 seg_cols = self._selected_checked_items(self.lst_demand_segcols)
@@ -3372,8 +3386,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 ids = prof.index.astype(str).tolist()
                 labels = ids[:]
                 k = max(2, min(k, len(ids)))
-                km = KMeans(n_clusters=k, n_init=10, random_state=42)
-                cl = km.fit_predict(xy) + 1
+                cl = _cluster_labels(xy)
 
                 xy_df = pd.DataFrame({"id": ids, "label": labels, "x": xy[:, 0], "y": xy[:, 1], "n": prof["n"].values})
                 cl_s = pd.Series(cl, index=ids)
@@ -3415,8 +3428,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     coord_name = "MDS(1-corr,variables)"
 
                 k = max(2, min(k, xy.shape[0]))
-                km = KMeans(n_clusters=k, n_init=10, random_state=42)
-                cl = km.fit_predict(xy) + 1
+                cl = _cluster_labels(xy)
 
                 ids = labels
                 xy_df = pd.DataFrame({"id": ids, "label": labels, "x": xy[:, 0], "y": xy[:, 1]})
