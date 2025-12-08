@@ -1330,6 +1330,9 @@ class DemandClusterPlot(pg.PlotWidget):
         self._drag_temp_positions: Optional[np.ndarray] = None
         self._drag_anchor_xy: Optional[Tuple[float, float]] = None
 
+        self._n_size_map: Optional[Dict[str, float]] = None
+        self._n_size_max: float = 0.0
+
         self._free_move_points: bool = False
         self._show_all_point_labels: bool = False
 
@@ -1402,12 +1405,16 @@ class DemandClusterPlot(pg.PlotWidget):
         return qcolor(base, alpha=alpha)
 
     def set_data(self, ids: List[str], labels: List[str], xy: np.ndarray, clusters: np.ndarray,
-                 cluster_names: Optional[Dict[int, str]] = None):
+                 cluster_names: Optional[Dict[int, str]] = None,
+                 n_size_map: Optional[Dict[str, float]] = None):
         self._ids = list(map(str, ids))
         self._labels = list(map(lambda x: "" if x is None else str(x), labels))
         self._xy = np.asarray(xy, dtype=float)
         self._cluster = np.asarray(clusters, dtype=int)
         self._cluster_names = dict(cluster_names or {})
+
+        self._n_size_map = {str(k): float(v) for k, v in (n_size_map or {}).items()}
+        self._n_size_max = max(self._n_size_map.values()) if self._n_size_map else 0.0
 
         self._selected.clear()
         self._dragging = False
@@ -1451,6 +1458,12 @@ class DemandClusterPlot(pg.PlotWidget):
             pen = pg.mkPen(qcolor("#ffffff", 230) if selected else col,
                            width=2 if selected else 1)
             brush = pg.mkBrush(col)
+            size = 11
+            if self._n_size_map:
+                n_val = float(self._n_size_map.get(self._ids[i], 0.0))
+                if self._n_size_max > 0:
+                    # sqrt scaling to show relative weight without oversized markers
+                    size = 9 + 8 * math.sqrt(max(n_val, 0.0) / self._n_size_max)
             spots.append({
                 "pos": (float(xy[i, 0]), float(xy[i, 1])),
                 "data": i,
@@ -1925,6 +1938,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.cmb_demand_target.clear()
         self.cmb_demand_target.addItem("(None)")
         self.cmb_demand_target.addItems(cols)
+
+        self.cmb_demand_var_target.clear()
+        self.cmb_demand_var_target.addItem("(None)")
+        self.cmb_demand_var_target.addItems(cols)
 
     # -------------------------------------------------------------------------
     # [v8.1] Variable Type Manager
@@ -3236,6 +3253,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         r.addWidget(self.spin_demand_min_n)
         seg_l.addLayout(r)
 
+        self.chk_demand_use_target_pivot = QtWidgets.QCheckBox("Use Target Distribution Pivot (R hclust style)")
+        self.chk_demand_use_target_pivot.setToolTip("Build target-by-segment distribution matrix and cluster segments on proportions.")
+        seg_l.addWidget(self.chk_demand_use_target_pivot)
+
         feat = QtWidgets.QHBoxLayout()
         self.chk_demand_use_factors = QtWidgets.QCheckBox("Use Factors (Factor1..k) as Profile Features")
         self.chk_demand_use_factors.setChecked(True)
@@ -3255,6 +3276,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lst_demand_vars = QtWidgets.QListWidget()
         self.lst_demand_vars.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         var_l.addWidget(self.lst_demand_vars, 2)
+
+        vrow = QtWidgets.QHBoxLayout()
+        vrow.addWidget(QtWidgets.QLabel("Target (optional for mixed types)"))
+        self.cmb_demand_var_target = QtWidgets.QComboBox()
+        vrow.addWidget(self.cmb_demand_var_target, 2)
+        var_l.addLayout(vrow)
 
         vbtn = QtWidgets.QHBoxLayout()
         self.btn_demand_check_sel = QtWidgets.QPushButton("Check Selected")
@@ -3310,10 +3337,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.spin_demand_min_n.setEnabled(seg_mode)
         self.chk_demand_use_factors.setEnabled(seg_mode)
         self.spin_demand_factor_k.setEnabled(seg_mode)
+        self.chk_demand_use_target_pivot.setEnabled(seg_mode)
 
         self.lst_demand_vars.setEnabled(not seg_mode)
         self.btn_demand_check_sel.setEnabled(not seg_mode)
         self.btn_demand_uncheck_sel.setEnabled(not seg_mode)
+        self.cmb_demand_var_target.setEnabled(not seg_mode)
         
         # [v8.1] Update explanation text
         if seg_mode:
@@ -3363,7 +3392,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     target = "(None)"
                 min_n = int(self.spin_demand_min_n.value())
 
-                prof, feat_cols = self._build_segment_profiles(seg_cols, sep, use_factors, fac_k, target, min_n)
+                use_pivot = bool(self.chk_demand_use_target_pivot.isChecked())
+                if use_pivot:
+                    if target == "(None)":
+                        raise RuntimeError("Select a target variable to build the distribution pivot.")
+                    prof, feat_cols = self._build_segment_target_pivot(seg_cols, sep, target, min_n)
+                    # In pivot mode, fall back to MDS if PCA was selected but dimensions are limited
+                    if mode.startswith("PCA") and prof.shape[1] < 2:
+                        mode = "MDS (1-corr distance)"
+                else:
+                    prof, feat_cols = self._build_segment_profiles(seg_cols, sep, use_factors, fac_k, target, min_n)
 
                 X = prof[feat_cols].copy()
                 X = X.replace([np.inf, -np.inf], np.nan).fillna(X.mean())
@@ -3420,19 +3458,26 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 cols = self._selected_checked_items(self.lst_demand_vars)
                 if len(cols) < 2:
                     raise RuntimeError("Select at least 2 variables.")
-                Vz, labels = self._variables_as_matrix(cols)
+                target_col = self.cmb_demand_var_target.currentText().strip()
+                if target_col == "(None)":
+                    target_col = ""
+                Vmat, labels, is_dist = self._variables_as_matrix(cols, target_col)
 
-                if mode.startswith("PCA"):
+                if mode.startswith("PCA") and not is_dist:
                     pca = PCA(n_components=2, random_state=42)
-                    xy = pca.fit_transform(Vz)
+                    xy = pca.fit_transform(Vmat)
                     coord_name = "PCA(variables)"
                 else:
-                    C = np.corrcoef(Vz)
-                    D = 1.0 - C
-                    D = np.clip(D, 0.0, 2.0)
+                    if is_dist:
+                        D = Vmat
+                        coord_name = "MDS(Gower" + (f"|Target={target_col}" if target_col else "") + ")"
+                    else:
+                        C = np.corrcoef(Vmat)
+                        D = 1.0 - C
+                        D = np.clip(D, 0.0, 2.0)
+                        coord_name = "MDS(1-corr,variables)"
                     mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42, n_init=2, max_iter=300)
                     xy = mds.fit_transform(D)
-                    coord_name = "MDS(1-corr,variables)"
 
                 k = max(2, min(k, xy.shape[0]))
                 if cluster_alg.startswith("Hierarchical"):
@@ -3507,17 +3552,113 @@ class IntegratedApp(QtWidgets.QMainWindow):
         prof["n"] = df.groupby("_SEG_LABEL_").size()
         return prof, feat_cols
 
-    def _variables_as_matrix(self, cols: List[str]):
-        df = to_numeric_df(self.state.df, cols)
-        df = df.dropna(axis=0, how="all")
-        if df.shape[0] < 5:
-            raise RuntimeError("Not enough data rows.")
+    def _build_segment_target_pivot(self, seg_cols: List[str], sep: str, target: str, min_n: int):
+        """R hclust 스타일: 타깃-세그 조합 분포 피벗으로 세그 간 유사도 계산."""
+        df = self.state.df.copy()
+        if target not in df.columns:
+            raise RuntimeError(f"Target '{target}' not found in data.")
 
-        df = df.fillna(df.mean())
-        V = df.T
-        scaler = StandardScaler()
-        Vz = scaler.fit_transform(V)
-        return Vz, cols
+        df["_SEG_LABEL_"] = df[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+        cnt = df["_SEG_LABEL_"].value_counts()
+        valid_segs = cnt[cnt >= min_n].index
+        df = df[df["_SEG_LABEL_"].isin(valid_segs)].copy()
+        if df.empty:
+            raise RuntimeError(f"No segments have >= {min_n} size after filtering.")
+
+        pivot = pd.crosstab(df[target], df["_SEG_LABEL_"])
+        if pivot.empty:
+            raise RuntimeError("Target/segment pivot is empty.")
+
+        pivot = pivot.loc[:, pivot.sum(axis=0) > 0]
+        dist = pivot.div(pivot.sum(axis=0), axis=1).T  # 세그별 타깃 분포 (열 합 1)
+        dist.columns = [f"{target}::{c}" for c in dist.columns]
+
+        dist["n"] = cnt.reindex(dist.index).fillna(0).astype(int)
+        feat_cols = [c for c in dist.columns if c != "n"]
+        if not feat_cols:
+            raise RuntimeError("No target distribution features available for clustering.")
+        return dist, feat_cols
+
+    def _variables_as_matrix(self, cols: List[str], target: str = ""):
+        df = self.state.df.copy()
+        cols = [c for c in cols if c in df.columns]
+        base = df[cols].copy()
+        base = base.dropna(axis=0, how="all")
+        # Allow running with as few as two data rows; still guard against empty/1-row inputs
+        if base.shape[0] < 2:
+            raise RuntimeError("Not enough data rows (need at least 2 after cleaning).")
+
+        # If all numeric, keep the original z-score matrix flow
+        all_numeric = all(pd.api.types.is_numeric_dtype(base[c]) for c in cols)
+        if all_numeric:
+            base = base.apply(pd.to_numeric, errors="coerce")
+            base = base.fillna(base.mean())
+            V = base.T
+            scaler = StandardScaler()
+            Vz = scaler.fit_transform(V)
+            return Vz, cols, False
+
+        # Mixed types: compute a Gower-like distance matrix (optionally within each target group)
+        tgt = None
+        if target and target in df.columns:
+            tgt = df[target].loc[base.index]
+
+        dist = self._variable_gower_distance_matrix(base, tgt)
+        return dist, cols, True
+
+    def _variable_gower_distance_matrix(self, df_vars: pd.DataFrame, tgt: Optional[pd.Series] = None) -> np.ndarray:
+        cols = list(df_vars.columns)
+        n = len(cols)
+        D = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = self._variable_gower_distance(df_vars[cols[i]], df_vars[cols[j]], tgt)
+                D[i, j] = D[j, i] = d
+        return D
+
+    def _variable_gower_distance(self, s1: pd.Series, s2: pd.Series, tgt: Optional[pd.Series] = None) -> float:
+        def pair_distance(a: pd.Series, b: pd.Series) -> float:
+            mask = a.notna() & b.notna()
+            if mask.sum() == 0:
+                return 1.0
+            a1 = a[mask]
+            b1 = b[mask]
+            if pd.api.types.is_numeric_dtype(a1) and pd.api.types.is_numeric_dtype(b1):
+                a1 = pd.to_numeric(a1, errors="coerce")
+                b1 = pd.to_numeric(b1, errors="coerce")
+                mask2 = a1.notna() & b1.notna()
+                if mask2.sum() == 0:
+                    return 1.0
+                a1 = a1[mask2]
+                b1 = b1[mask2]
+                rng = (pd.concat([a1, b1]).max() - pd.concat([a1, b1]).min())
+                if not np.isfinite(rng) or rng == 0:
+                    diff = np.zeros_like(a1, dtype=float)
+                else:
+                    diff = np.abs(a1 - b1) / rng
+            else:
+                diff = (a1.astype(str).values != b1.astype(str).values).astype(float)
+            return float(np.nanmean(diff)) if len(diff) else 1.0
+
+        if tgt is None:
+            return pair_distance(s1, s2)
+
+        tgt = tgt.reset_index(drop=True)
+        s1 = s1.reset_index(drop=True)
+        s2 = s2.reset_index(drop=True)
+        dist_sum = 0.0
+        weight_sum = 0.0
+        total = len(tgt)
+        for val in tgt.dropna().unique():
+            mask = tgt == val
+            if mask.sum() == 0:
+                continue
+            w = mask.sum() / total
+            dist_sum += w * pair_distance(s1[mask], s2[mask])
+            weight_sum += w
+        if weight_sum == 0:
+            return pair_distance(s1, s2)
+        return dist_sum / weight_sum
 
     # -------------------------------------------------------------------------
     # Tab 8: Segmentation Editing
@@ -3645,10 +3786,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
         labels = df["label"].astype(str).tolist() if "label" in df.columns else ids
         xy = df[["x", "y"]].values if {"x", "y"}.issubset(df.columns) else np.zeros((len(ids), 2))
         cl = self.state.cluster_assign.reindex(ids).fillna(0).astype(int).values if ids else np.array([], dtype=int)
+        n_map = None
+        if "n" in df.columns:
+            try:
+                n_map = dict(zip(ids, df["n"].astype(float)))
+            except Exception:
+                n_map = None
 
-        args = (ids, labels, xy, cl, self.state.cluster_names)
+        args = (ids, labels, xy, cl, self.state.cluster_names, n_map)
         self.plot_edit.set_data(*args)
         self.plot_preview.set_data(*args)
+
+        if self.state.demand_mode and self.state.demand_mode.startswith("Segments"):
+            if not self.chk_show_all_point_labels.isChecked():
+                self.chk_show_all_point_labels.setChecked(True)
 
     def _update_cluster_summary(self):
         """[v8.1] Enhanced to show sub-segment details for each cluster."""
