@@ -230,6 +230,7 @@ class AppState:
     # Decision tree outputs (Setting Tab)
     dt_improve_pivot: Optional[pd.DataFrame] = None
     dt_split_best: Optional[pd.DataFrame] = None
+    dt_importance_summary: Optional[pd.DataFrame] = None
 
     # Decision tree full Analysis (Results Tab)
     dt_full_nodes: Optional[pd.DataFrame] = None
@@ -1948,6 +1949,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 with open(path, "rb") as f:
                     self.state = pickle.load(f)
 
+                if not hasattr(self.state, "dt_importance_summary"):
+                    self.state.dt_importance_summary = None
+
                 if self.state.df is not None:
                     self.tbl_preview.set_df(self.state.df)
                     self._refresh_all_column_lists()
@@ -1960,6 +1964,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if self.state.dt_improve_pivot is not None:
                     self.tbl_dt_pivot.set_df(self.state.dt_improve_pivot)
+                if getattr(self.state, "dt_importance_summary", None) is not None:
+                    self.tbl_dt_importance.set_df(self.state.dt_importance_summary)
 
                 self.statusBar().showMessage(f"Project loaded from {path}")
             except Exception as e:
@@ -2090,14 +2096,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.factor_cols = None
         self.state.factor_scores = None
         self.state.factor_loadings = None
+        self.state.factor_mode = "PCA"
         self.state.dt_improve_pivot = None
         self.state.dt_split_best = None
+        self.state.dt_importance_summary = None
         self.state.dt_full_nodes = None
         
         if hasattr(self, "tbl_factor_loadings"):
             self.tbl_factor_loadings.set_df(None)
         if hasattr(self, "tbl_dt_pivot"):
             self.tbl_dt_pivot.set_df(None)
+        if hasattr(self, "tbl_dt_importance"):
+            self.tbl_dt_importance.set_df(None)
 
     # -------------------------------------------------------------------------
     # Tab 2: Recode Mapping
@@ -2420,7 +2430,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_dt_predictors = QtWidgets.QListWidget()
         self.lst_dt_predictors.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.lst_dt_predictors.setMaximumHeight(160)
+        self.lst_dt_predictors.setMaximumHeight(140)
         pred_layout.addWidget(self.lst_dt_predictors, 1)
         layout.addWidget(pred_box)
 
@@ -2429,6 +2439,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
         # A) Pivot (Main View)
         w1 = QtWidgets.QWidget()
         l1 = QtWidgets.QVBoxLayout(w1)
+        l1.addWidget(QtWidgets.QLabel("Predictor Importance (sum of improve_rel, cumulative %)"))
+        self.tbl_dt_importance = DataFrameTable(float_decimals=2)
+        l1.addWidget(self.tbl_dt_importance, 1)
         l1.addWidget(QtWidgets.QLabel("Improvement Pivot (Rel. Impurity Drop) [Rows=Predictors, Cols=Targets]"))
         self.tbl_dt_pivot = DataFrameTable(float_decimals=2)
         l1.addWidget(self.tbl_dt_pivot, 1)
@@ -2452,7 +2465,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         splitter.addWidget(w1)
         splitter.addWidget(w2)
-        splitter.setSizes([420, 280])
+        splitter.setSizes([520, 240])
         layout.addWidget(splitter, 1)
 
     def _filter_dt_pred_list(self):
@@ -2533,11 +2546,37 @@ class IntegratedApp(QtWidgets.QMainWindow):
             best_df = pd.DataFrame(best_rows)
             pivot_reset = pivot.reset_index().rename(columns={"index": "ind"})
 
+            # Predictor-level importance summary with cumulative share & top split description
+            importance_summary = pd.DataFrame()
+            if not best_df.empty:
+                by_ind = best_df.groupby("ind")["improve_rel"].sum().sort_values(ascending=False).reset_index()
+                total_imp = by_ind["improve_rel"].sum()
+                by_ind["importance_pct"] = np.where(total_imp > 0, by_ind["improve_rel"] / total_imp * 100.0, np.nan)
+                by_ind["cum_importance_pct"] = by_ind["importance_pct"].cumsum()
+
+                def _split_desc(row: pd.Series) -> str:
+                    stype = str(row.get("split_type", ""))
+                    if stype.startswith("categorical"):
+                        return f"{row['ind']} in {row.get('left_items')}"
+                    return f"{row['ind']} <= {row.get('cutpoint')}"
+
+                top_split = (
+                    best_df.sort_values("improve_rel", ascending=False)
+                    .groupby("ind")
+                    .first()
+                    .reset_index()
+                )
+                top_split["split_desc"] = top_split.apply(_split_desc, axis=1)
+                importance_summary = by_ind.merge(top_split[["ind", "dep", "split_desc"]], on="ind", how="left")
+                importance_summary = importance_summary.rename(columns={"dep": "top_dep"})
+
+            self.tbl_dt_importance.set_df(importance_summary)
             self.tbl_dt_pivot.set_df(pivot_reset)
             self.tbl_dt_bestsplit.set_df(best_df)
 
             self.state.dt_improve_pivot = pivot_reset
             self.state.dt_split_best = best_df
+            self.state.dt_importance_summary = importance_summary
 
             self.cmb_dt_full_dep.clear()
             self.cmb_dt_full_dep.addItems(deps)
@@ -2733,7 +2772,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         bl.addWidget(self.tbl_split_detail, 1)
         splitter.addWidget(botw)
 
-        splitter.setSizes([320, 420])
+        splitter.setSizes([280, 520])
         layout.addWidget(splitter, 1)
 
     def _compute_full_tree_internal(self, dep: str, ind: str):
@@ -3530,6 +3569,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
         seg_matrix = pivot_norm.T
         seg_matrix["n"] = seg_matrix.index.map(cnt.get).fillna(0).astype(int)
 
+        # Optional PCA/Factor profile mean features (align with R flow: target×seg pivot + PCA profile)
+        if use_factors and self.state.factor_scores is not None:
+            fac_cols = [c for c in self.state.factor_scores.columns if str(c).startswith("Factor")]
+            fac_cols = fac_cols[: max(0, fac_k)]
+            if fac_cols:
+                fac_df = self.state.factor_scores.reindex(df.index).copy()
+                fac_df["_SEG_LABEL_"] = df["_SEG_LABEL_"].values
+                fac_mean = fac_df.groupby("_SEG_LABEL_")[fac_cols].mean()
+                seg_matrix = seg_matrix.join(fac_mean, how="left")
+                seg_matrix[fac_cols] = seg_matrix[fac_cols].fillna(0.0)
+
         feature_cols = [c for c in seg_matrix.columns if c != "n"]
         labels_by_row = df["_SEG_LABEL_"].copy()
         return seg_matrix, feature_cols, labels_by_row
@@ -3808,7 +3858,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lbl_export = QtWidgets.QLabel(
             "Export Results to Excel:\n"
             "Sheets: 01_Data, 02_RECODE, 03_Factor_Loadings, 04_Factor_Scores,\n"
-            "05_DT_ImprovePivot, 06_DT_BestSplit, 07_DT_Full_Nodes, ...\n"
+            "05_DT_ImprovePivot, 05_DT_Importance, 06_DT_BestSplit, 07_DT_Full_Nodes, ...\n"
             "13_Demand_Clusters, 14_Variable_Types, 15_Raw_with_Clusters"
         )
         self.lbl_export.setWordWrap(True)
@@ -3863,6 +3913,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if self.state.dt_improve_pivot is not None:
                     self.state.dt_improve_pivot.to_excel(w, sheet_name="05_DT_ImprovePivot", index=False)
+                if getattr(self.state, "dt_importance_summary", None) is not None:
+                    self.state.dt_importance_summary.to_excel(w, sheet_name="05_DT_Importance", index=False)
                 if self.state.dt_split_best is not None:
                     self.state.dt_split_best.to_excel(w, sheet_name="06_DT_BestSplit", index=False)
 
