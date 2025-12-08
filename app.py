@@ -43,7 +43,7 @@ import pyqtgraph as pg
 
 from sklearn.decomposition import PCA, FactorAnalysis
 from sklearn.manifold import MDS
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.preprocessing import StandardScaler
 
 # -----------------------------------------------------------------------------
@@ -247,6 +247,9 @@ class AppState:
     demand_seg_profile: Optional[pd.DataFrame] = None
     demand_seg_components: Optional[List[str]] = None
     demand_features_used: Optional[List[str]] = None
+    demand_seg_labels: Optional[pd.Series] = None
+    demand_seg_sep: str = "|"
+    demand_seg_cluster_map: Dict[str, int] = field(default_factory=dict)
 
     manual_dirty: bool = False
     label_pos_override: Dict[int, Tuple[float, float]] = field(default_factory=dict)
@@ -3259,6 +3262,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         self.cmb_demand_coord = QtWidgets.QComboBox()
         self.cmb_demand_coord.addItems(["PCA (Dim1/Dim2)", "MDS (1-corr distance)"])
+        self.cmb_demand_cluster = QtWidgets.QComboBox()
+        self.cmb_demand_cluster.addItems(["K-Means", "Hierarchical (Ward)"])
         self.spin_demand_k = QtWidgets.QSpinBox()
         self.spin_demand_k.setRange(2, 30)
         self.spin_demand_k.setValue(6)
@@ -3268,7 +3273,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         row.addWidget(QtWidgets.QLabel("Method"))
         row.addWidget(self.cmb_demand_coord)
-        row.addWidget(QtWidgets.QLabel("K-Means (k)"))
+        row.addWidget(QtWidgets.QLabel("Clustering"))
+        row.addWidget(self.cmb_demand_cluster)
+        row.addWidget(QtWidgets.QLabel("Clusters (k)"))
         row.addWidget(self.spin_demand_k)
         row.addWidget(self.btn_run_demand)
         left.addLayout(row)
@@ -3335,6 +3342,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
             seg_mode = self.cmb_demand_mode.currentText().startswith("Segments-as-points")
             mode = self.cmb_demand_coord.currentText()
             k = int(self.spin_demand_k.value())
+            cluster_method = self.cmb_demand_cluster.currentText()
+
+            def _cluster_labels(xy: np.ndarray) -> np.ndarray:
+                if cluster_method.startswith("Hierarchical"):
+                    model = AgglomerativeClustering(n_clusters=k, linkage="ward")
+                    labels = model.fit_predict(xy)
+                else:
+                    model = KMeans(n_clusters=k, n_init=10, random_state=42)
+                    labels = model.fit_predict(xy)
+                return labels + 1
 
             if seg_mode:
                 seg_cols = self._selected_checked_items(self.lst_demand_segcols)
@@ -3349,7 +3366,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     target = "(None)"
                 min_n = int(self.spin_demand_min_n.value())
 
-                prof, feat_cols = self._build_segment_profiles(seg_cols, sep, use_factors, fac_k, target, min_n)
+                prof, feat_cols, labels_by_row = self._build_segment_profiles(
+                    seg_cols, sep, use_factors, fac_k, target, min_n
+                )
 
                 X = prof[feat_cols].copy()
                 X = X.replace([np.inf, -np.inf], np.nan).fillna(X.mean())
@@ -3357,25 +3376,41 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 Xz = pd.DataFrame(scaler.fit_transform(X), index=X.index, columns=X.columns)
                 Xz = Xz.fillna(0)
 
-                if mode.startswith("PCA"):
+                n_segments, n_features = Xz.shape
+                if n_segments < 2:
+                    raise RuntimeError(
+                        "세그먼트 조합이 1개뿐입니다. 최소 2개 이상의 세그먼트 조합이 있어야 2D 좌표와 클러스터를 계산할 수 있습니다."
+                    )
+
+                coord_name = ""
+                fallback_note = ""
+                if mode.startswith("PCA") and min(n_segments, n_features) >= 2:
                     pca = PCA(n_components=2, random_state=42)
                     xy = pca.fit_transform(Xz.values)
                     coord_name = "PCA(profile)"
                 else:
+                    if mode.startswith("PCA") and min(n_segments, n_features) < 2:
+                        fallback_note = " (PCA는 프로파일/세그먼트 수가 2개 이상일 때만 가능하여 MDS로 자동 전환되었습니다.)"
                     C = np.corrcoef(Xz.values)
                     D = 1.0 - C
                     D = np.clip(D, 0.0, 2.0)
                     mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42, n_init=2, max_iter=300)
                     xy = mds.fit_transform(D)
-                    coord_name = "MDS(1-corr,profile)"
+                    coord_name = "MDS(1-corr,profile)" + fallback_note
 
                 ids = prof.index.astype(str).tolist()
                 labels = ids[:]
                 k = max(2, min(k, len(ids)))
-                km = KMeans(n_clusters=k, n_init=10, random_state=42)
-                cl = km.fit_predict(xy) + 1
+                cl = _cluster_labels(xy)
 
-                xy_df = pd.DataFrame({"id": ids, "label": labels, "x": xy[:, 0], "y": xy[:, 1], "n": prof["n"].values})
+                xy_df = pd.DataFrame({
+                    "id": ids,
+                    "label": labels,
+                    "x": xy[:, 0],
+                    "y": xy[:, 1],
+                    "n": prof["n"].values,
+                    "cluster_id": cl,
+                })
                 cl_s = pd.Series(cl, index=ids)
 
                 self.state.demand_mode = "Segments-as-points"
@@ -3385,6 +3420,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
                 self.state.demand_features_used = feat_cols
+                self.state.demand_seg_labels = labels_by_row
+                self.state.demand_seg_sep = sep
+                self.state.demand_seg_cluster_map = dict(zip(ids, cl))
                 self.state.manual_dirty = False
 
                 args = (ids, labels, xy, cl, self.state.cluster_names)
@@ -3402,24 +3440,33 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     raise RuntimeError("Select at least 3 variables.")
                 Vz, labels = self._variables_as_matrix(cols)
 
-                if mode.startswith("PCA"):
+                coord_name = ""
+                fallback_note = ""
+                if mode.startswith("PCA") and Vz.shape[0] >= 2:
                     pca = PCA(n_components=2, random_state=42)
                     xy = pca.fit_transform(Vz)
                     coord_name = "PCA(variables)"
                 else:
+                    if mode.startswith("PCA") and Vz.shape[0] < 2:
+                        fallback_note = " (선택한 변수 수가 2개 미만이라 MDS로 자동 전환되었습니다.)"
                     C = np.corrcoef(Vz)
                     D = 1.0 - C
                     D = np.clip(D, 0.0, 2.0)
                     mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42, n_init=2, max_iter=300)
                     xy = mds.fit_transform(D)
-                    coord_name = "MDS(1-corr,variables)"
+                    coord_name = "MDS(1-corr,variables)" + fallback_note
 
                 k = max(2, min(k, xy.shape[0]))
-                km = KMeans(n_clusters=k, n_init=10, random_state=42)
-                cl = km.fit_predict(xy) + 1
+                cl = _cluster_labels(xy)
 
                 ids = labels
-                xy_df = pd.DataFrame({"id": ids, "label": labels, "x": xy[:, 0], "y": xy[:, 1]})
+                xy_df = pd.DataFrame({
+                    "id": ids,
+                    "label": labels,
+                    "x": xy[:, 0],
+                    "y": xy[:, 1],
+                    "cluster_id": cl,
+                })
                 cl_s = pd.Series(cl, index=ids)
 
                 self.state.demand_mode = "Variables-as-points"
@@ -3442,16 +3489,33 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.last_error = str(e)
             show_error(self, "Demand Space Error", e)
 
-    def _build_segment_profiles(self, seg_cols: List[str], sep: str, use_factors: bool, fac_k: int, target: str, min_n: int):
+    def _encode_features(self, df: pd.DataFrame, feat_cols: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+        numeric_parts = []
+        feature_names: List[str] = []
+
+        for col in feat_cols:
+            series = df[col]
+            if pd.api.types.is_numeric_dtype(series):
+                numeric_parts.append(pd.to_numeric(series, errors="coerce"))
+                feature_names.append(col)
+            else:
+                dummies = pd.get_dummies(series.astype(str), prefix=col)
+                numeric_parts.append(dummies)
+                feature_names.extend(list(dummies.columns))
+
+        merged = pd.concat(numeric_parts, axis=1)
+        return merged, feature_names
+
+    def _build_segment_profiles(
+        self, seg_cols: List[str], sep: str, use_factors: bool, fac_k: int, target: str, min_n: int
+    ):
         df = self.state.df.copy()
 
         df["_SEG_LABEL_"] = df[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
 
         cnt = df["_SEG_LABEL_"].value_counts()
-        valid_segs = cnt[cnt >= min_n].index
-        df = df[df["_SEG_LABEL_"].isin(valid_segs)].copy()
-        if df.empty:
-            raise RuntimeError(f"No segments have >= {min_n} size.")
+        if cnt.empty:
+            raise RuntimeError("No segments found for the selected *_seg columns.")
 
         feat_cols = []
         if use_factors:
@@ -3461,14 +3525,26 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         if target != "(None)" and target in df.columns:
             feat_cols.append(target)
-            df[target] = pd.to_numeric(df[target], errors="coerce")
 
         if not feat_cols:
             raise RuntimeError("No features for profiling (Enable Factors or select Target).")
 
-        prof = df.groupby("_SEG_LABEL_")[feat_cols].mean()
-        prof["n"] = df.groupby("_SEG_LABEL_").size()
-        return prof, feat_cols
+        feat_df, encoded_cols = self._encode_features(df, feat_cols)
+        df_encoded = pd.concat([df[["_SEG_LABEL_"]], feat_df], axis=1)
+
+        prof = df_encoded.groupby("_SEG_LABEL_")[encoded_cols].mean()
+        prof["n"] = df_encoded.groupby("_SEG_LABEL_").size()
+        labels_by_row = df["_SEG_LABEL_"].copy()
+        return prof, encoded_cols, labels_by_row
+
+    def _current_segment_labels(self) -> Optional[pd.Series]:
+        if self.state.df is None or not self.state.demand_seg_components:
+            return None
+        sep = self.state.demand_seg_sep or "|"
+        lbl = self.state.df[self.state.demand_seg_components].astype(str).apply(
+            lambda r: sep.join(r.values), axis=1
+        )
+        return lbl
 
     def _variables_as_matrix(self, cols: List[str]):
         df = to_numeric_df(self.state.df, cols)
@@ -3589,20 +3665,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if n_map:
                 n_sum = int(sum(int(n_map.get(x, 0)) for x in items))
 
-            # [v8.1] Format items list with truncation for display
-            items_display = ", ".join(items[:5])
-            if len(items) > 5:
-                items_display += f" ... (+{len(items)-5} more)"
-
-            rows.append({
-                "Cluster ID": int(cid),
-                "Name": names.get(int(cid), f"Cluster {int(cid)}"),
-                "Points": len(items),
-                "Total N": n_sum if n_map else "-",
-                "Sub-segments": items_display
-            })
-        out = pd.DataFrame(rows).sort_values(["Cluster ID"]).reset_index(drop=True)
-        self.tbl_cluster_summary.set_df(out, max_rows=500)
+            for seg in items:
+                rows.append({
+                    "Cluster ID": int(cid),
+                    "Name": names.get(int(cid), f"Cluster {int(cid)}"),
+                    "Sub-segment": seg,
+                    "Sub-segment N": int(n_map.get(seg, 0)) if n_map else "-",
+                    "Cluster Total N": n_sum if n_map else "-",
+                    "Points in Cluster": len(items),
+                })
+        out = pd.DataFrame(rows).sort_values(["Cluster ID", "Sub-segment"]).reset_index(drop=True)
+        self.tbl_cluster_summary.set_df(out, max_rows=2000)
 
     def _update_profiler(self):
         """Calculates Z-scores for each cluster to find distinctive features."""
@@ -3660,9 +3733,19 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
         s = self.plot_edit.get_cluster_series()
         self.state.cluster_assign = s
+        if self.state.demand_xy is not None and "id" in self.state.demand_xy.columns:
+            df = self.state.demand_xy.copy()
+            mapped = df["id"].astype(str).map(s)
+            if "cluster_id" in df.columns:
+                mapped = mapped.fillna(df["cluster_id"])
+            df["cluster_id"] = mapped.astype(int)
+            self.state.demand_xy = df
+        if self.state.demand_mode.startswith("Segments"):
+            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
         self.state.manual_dirty = True
         self._update_cluster_summary()
         self._update_profiler()
+        self._refresh_demand_preview()
         self._set_status("Manual clusters updated.")
 
     def _on_manual_coords_changed(self):
@@ -3676,9 +3759,30 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 df["y"] = df["id"].astype(str).map(lambda k: xy_map.get(str(k), (np.nan, np.nan))[1])
                 self.state.demand_xy = df
                 self.state.manual_dirty = True
+                self._refresh_demand_preview()
                 self._set_status("Manual coords updated.")
         except Exception:
             self._set_status("Manual coords update failed.")
+
+    def _refresh_demand_preview(self):
+        if self.state.demand_xy is None or self.state.cluster_assign is None:
+            return
+        df = self.state.demand_xy
+        if "id" not in df.columns or "x" not in df.columns or "y" not in df.columns:
+            return
+
+        ids = df["id"].astype(str).tolist()
+        labels = df["label"].astype(str).tolist() if "label" in df.columns else ids
+        xy = df[["x", "y"]].to_numpy()
+
+        cl = self.state.cluster_assign.reindex(ids)
+        if cl.isna().any():
+            fallback = cl.dropna().mode()
+            default_cl = int(fallback.iloc[0]) if not fallback.empty else 1
+            cl = cl.fillna(default_cl)
+
+        clusters = cl.astype(int).to_numpy()
+        self.plot_preview.set_data(ids, labels, xy, clusters, self.state.cluster_names)
 
     def _rename_cluster(self):
         try:
@@ -3708,7 +3812,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             "Export Results to Excel:\n"
             "Sheets: 01_Data, 02_RECODE, 03_Factor_Loadings, 04_Factor_Scores,\n"
             "05_DT_ImprovePivot, 06_DT_BestSplit, 07_DT_Full_Nodes, ...\n"
-            "13_Demand_Clusters, 14_Demand_Summary, 15_Demand_SegProfile"
+            "13_Demand_Clusters, 14_Variable_Types, 15_Raw_with_Clusters"
         )
         self.lbl_export.setWordWrap(True)
         layout.addWidget(self.lbl_export)
@@ -3776,6 +3880,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     cl_df.columns = ["id", "cluster_id"]
                     cl_df["cluster_name"] = cl_df["cluster_id"].map(self.state.cluster_names).fillna("")
                     cl_df.to_excel(w, sheet_name="13_Demand_Clusters", index=False)
+
+                if self.state.demand_mode.startswith("Segments") and self.state.cluster_assign is not None:
+                    seg_labels = self.state.demand_seg_labels or self._current_segment_labels()
+                    if seg_labels is not None:
+                        cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
+                        raw = self.state.df.copy()
+                        raw["demand_seg_label"] = seg_labels.values
+                        raw["demand_cluster_id"] = seg_labels.astype(str).map(cl_map).fillna(-1).astype(int)
+                        raw["demand_cluster_name"] = raw["demand_cluster_id"].map(self.state.cluster_names).fillna("")
+                        raw.to_excel(w, sheet_name="15_Raw_with_Clusters", index=False)
 
                 # [v8.1] Export variable types
                 if self.state.var_types:
