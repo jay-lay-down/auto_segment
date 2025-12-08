@@ -43,7 +43,7 @@ import pyqtgraph as pg
 
 from sklearn.decomposition import PCA, FactorAnalysis
 from sklearn.manifold import MDS
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.preprocessing import StandardScaler
 
 # -----------------------------------------------------------------------------
@@ -240,8 +240,11 @@ class AppState:
     # Demand Space Data
     demand_mode: str = "Segments-as-points"
     demand_xy: Optional[pd.DataFrame] = None
+    cluster_assign_base: Optional[pd.Series] = None
     cluster_assign: Optional[pd.Series] = None
+    manual_cluster_override: Dict[str, int] = field(default_factory=dict)
     cluster_names: Dict[int, str] = field(default_factory=dict)
+    demand_seg_separator: str = "|"
 
     # Demand Space Profile Data
     demand_seg_profile: Optional[pd.DataFrame] = None
@@ -1294,6 +1297,7 @@ class DemandClusterPlot(pg.PlotWidget):
     """
     sigClustersChanged = QtCore.pyqtSignal()
     sigCoordsChanged = QtCore.pyqtSignal()
+    sigPointClusterClicked = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None, editable: bool = True):
         self._vb = ClusterViewBox(self)
@@ -1325,6 +1329,9 @@ class DemandClusterPlot(pg.PlotWidget):
         self._dragging = False
         self._drag_temp_positions: Optional[np.ndarray] = None
         self._drag_anchor_xy: Optional[Tuple[float, float]] = None
+
+        self._n_size_map: Optional[Dict[str, float]] = None
+        self._n_size_max: float = 0.0
 
         self._free_move_points: bool = False
         self._show_all_point_labels: bool = False
@@ -1398,12 +1405,16 @@ class DemandClusterPlot(pg.PlotWidget):
         return qcolor(base, alpha=alpha)
 
     def set_data(self, ids: List[str], labels: List[str], xy: np.ndarray, clusters: np.ndarray,
-                 cluster_names: Optional[Dict[int, str]] = None):
+                 cluster_names: Optional[Dict[int, str]] = None,
+                 n_size_map: Optional[Dict[str, float]] = None):
         self._ids = list(map(str, ids))
         self._labels = list(map(lambda x: "" if x is None else str(x), labels))
         self._xy = np.asarray(xy, dtype=float)
         self._cluster = np.asarray(clusters, dtype=int)
         self._cluster_names = dict(cluster_names or {})
+
+        self._n_size_map = {str(k): float(v) for k, v in (n_size_map or {}).items()}
+        self._n_size_max = max(self._n_size_map.values()) if self._n_size_map else 0.0
 
         self._selected.clear()
         self._dragging = False
@@ -1447,6 +1458,12 @@ class DemandClusterPlot(pg.PlotWidget):
             pen = pg.mkPen(qcolor("#ffffff", 230) if selected else col,
                            width=2 if selected else 1)
             brush = pg.mkBrush(col)
+            size = 11
+            if self._n_size_map:
+                n_val = float(self._n_size_map.get(self._ids[i], 0.0))
+                if self._n_size_max > 0:
+                    # sqrt scaling to show relative weight without oversized markers
+                    size = 9 + 8 * math.sqrt(max(n_val, 0.0) / self._n_size_max)
             spots.append({
                 "pos": (float(xy[i, 0]), float(xy[i, 1])),
                 "data": i,
@@ -1537,6 +1554,7 @@ class DemandClusterPlot(pg.PlotWidget):
             if not shift:
                 self._selected.clear()
                 self._draw_scatter()
+                self.sigPointClusterClicked.emit(None)
             return
         if shift:
             if i in self._selected:
@@ -1546,6 +1564,8 @@ class DemandClusterPlot(pg.PlotWidget):
         else:
             self._selected = {i}
         self._draw_scatter()
+        cid = int(self._cluster[i]) if len(self._cluster) else None
+        self.sigPointClusterClicked.emit(cid)
 
     def _cluster_centroids(self) -> Dict[int, Tuple[float, float]]:
         out = {}
@@ -1599,8 +1619,7 @@ class DemandClusterPlot(pg.PlotWidget):
             if i is None:
                 ev.ignore()
                 return
-            if i not in self._selected:
-                self._selected = {i}
+            self._selected = {i}
             self._dragging = True
             self._drag_temp_positions = self._xy.copy()
             self._drag_anchor_xy = (pos[0], pos[1])
@@ -1920,6 +1939,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.cmb_demand_target.addItem("(None)")
         self.cmb_demand_target.addItems(cols)
 
+        self.cmb_demand_var_target.clear()
+        self.cmb_demand_var_target.addItem("(None)")
+        self.cmb_demand_var_target.addItems(cols)
+
     # -------------------------------------------------------------------------
     # [v8.1] Variable Type Manager
     # -------------------------------------------------------------------------
@@ -1955,6 +1978,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 with open(path, "rb") as f:
                     self.state = pickle.load(f)
 
+                if not hasattr(self.state, "cluster_assign_base"):
+                    self.state.cluster_assign_base = getattr(self.state, "cluster_assign", None)
+                if not hasattr(self.state, "manual_cluster_override"):
+                    self.state.manual_cluster_override = {}
+                self._apply_overrides_to_base()
+
                 if self.state.df is not None:
                     self.tbl_preview.set_df(self.state.df)
                     self._refresh_all_column_lists()
@@ -1967,6 +1996,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if self.state.dt_improve_pivot is not None:
                     self.tbl_dt_pivot.set_df(self.state.dt_improve_pivot)
+
+                self._sync_plots_from_state()
+                self._update_cluster_summary()
+                self._update_profiler()
 
                 self.statusBar().showMessage(f"Project loaded from {path}")
             except Exception as e:
@@ -3220,6 +3253,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         r.addWidget(self.spin_demand_min_n)
         seg_l.addLayout(r)
 
+        self.chk_demand_use_target_pivot = QtWidgets.QCheckBox("Use Target Distribution Pivot (R hclust style)")
+        self.chk_demand_use_target_pivot.setToolTip("Build target-by-segment distribution matrix and cluster segments on proportions.")
+        seg_l.addWidget(self.chk_demand_use_target_pivot)
+
         feat = QtWidgets.QHBoxLayout()
         self.chk_demand_use_factors = QtWidgets.QCheckBox("Use Factors (Factor1..k) as Profile Features")
         self.chk_demand_use_factors.setChecked(True)
@@ -3240,6 +3277,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lst_demand_vars.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         var_l.addWidget(self.lst_demand_vars, 2)
 
+        vrow = QtWidgets.QHBoxLayout()
+        vrow.addWidget(QtWidgets.QLabel("Target (optional for mixed types)"))
+        self.cmb_demand_var_target = QtWidgets.QComboBox()
+        vrow.addWidget(self.cmb_demand_var_target, 2)
+        var_l.addLayout(vrow)
+
         vbtn = QtWidgets.QHBoxLayout()
         self.btn_demand_check_sel = QtWidgets.QPushButton("Check Selected")
         self.btn_demand_uncheck_sel = QtWidgets.QPushButton("Uncheck Selected")
@@ -3253,6 +3296,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         self.cmb_demand_coord = QtWidgets.QComboBox()
         self.cmb_demand_coord.addItems(["PCA (Dim1/Dim2)", "MDS (1-corr distance)"])
+        self.cmb_demand_cluster_alg = QtWidgets.QComboBox()
+        self.cmb_demand_cluster_alg.addItems(["K-Means", "Hierarchical (Ward)"])
         self.spin_demand_k = QtWidgets.QSpinBox()
         self.spin_demand_k.setRange(2, 30)
         self.spin_demand_k.setValue(6)
@@ -3262,7 +3307,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         row.addWidget(QtWidgets.QLabel("Method"))
         row.addWidget(self.cmb_demand_coord)
-        row.addWidget(QtWidgets.QLabel("K-Means (k)"))
+        row.addWidget(QtWidgets.QLabel("Clustering"))
+        row.addWidget(self.cmb_demand_cluster_alg)
+        row.addWidget(QtWidgets.QLabel("Clusters (k)"))
         row.addWidget(self.spin_demand_k)
         row.addWidget(self.btn_run_demand)
         left.addLayout(row)
@@ -3290,10 +3337,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.spin_demand_min_n.setEnabled(seg_mode)
         self.chk_demand_use_factors.setEnabled(seg_mode)
         self.spin_demand_factor_k.setEnabled(seg_mode)
+        self.chk_demand_use_target_pivot.setEnabled(seg_mode)
 
         self.lst_demand_vars.setEnabled(not seg_mode)
         self.btn_demand_check_sel.setEnabled(not seg_mode)
         self.btn_demand_uncheck_sel.setEnabled(not seg_mode)
+        self.cmb_demand_var_target.setEnabled(not seg_mode)
         
         # [v8.1] Update explanation text
         if seg_mode:
@@ -3328,6 +3377,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             seg_mode = self.cmb_demand_mode.currentText().startswith("Segments-as-points")
             mode = self.cmb_demand_coord.currentText()
             k = int(self.spin_demand_k.value())
+            cluster_alg = self.cmb_demand_cluster_alg.currentText()
 
             if seg_mode:
                 seg_cols = self._selected_checked_items(self.lst_demand_segcols)
@@ -3342,7 +3392,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     target = "(None)"
                 min_n = int(self.spin_demand_min_n.value())
 
-                prof, feat_cols = self._build_segment_profiles(seg_cols, sep, use_factors, fac_k, target, min_n)
+                use_pivot = bool(self.chk_demand_use_target_pivot.isChecked())
+                if use_pivot:
+                    if target == "(None)":
+                        raise RuntimeError("Select a target variable to build the distribution pivot.")
+                    prof, feat_cols = self._build_segment_target_pivot(seg_cols, sep, target, min_n)
+                    # In pivot mode, fall back to MDS if PCA was selected but dimensions are limited
+                    if mode.startswith("PCA") and prof.shape[1] < 2:
+                        mode = "MDS (1-corr distance)"
+                else:
+                    prof, feat_cols = self._build_segment_profiles(seg_cols, sep, use_factors, fac_k, target, min_n)
 
                 X = prof[feat_cols].copy()
                 X = X.replace([np.inf, -np.inf], np.nan).fillna(X.mean())
@@ -3365,7 +3424,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 ids = prof.index.astype(str).tolist()
                 labels = ids[:]
                 k = max(2, min(k, len(ids)))
-                km = KMeans(n_clusters=k, n_init=10, random_state=42)
+                if cluster_alg.startswith("Hierarchical"):
+                    km = AgglomerativeClustering(n_clusters=k, linkage="ward")
+                else:
+                    km = KMeans(n_clusters=k, n_init=10, random_state=42)
                 cl = km.fit_predict(xy) + 1
 
                 xy_df = pd.DataFrame({"id": ids, "label": labels, "x": xy[:, 0], "y": xy[:, 1], "n": prof["n"].values})
@@ -3373,42 +3435,55 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 self.state.demand_mode = "Segments-as-points"
                 self.state.demand_xy = xy_df
-                self.state.cluster_assign = cl_s
+                self.state.cluster_assign_base = cl_s
+                if self.state.manual_cluster_override:
+                    self._apply_overrides_to_base()
+                else:
+                    self.state.cluster_assign = cl_s.copy()
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
+                self.state.demand_seg_separator = sep
                 self.state.demand_features_used = feat_cols
-                self.state.manual_dirty = False
+                self.state.manual_dirty = bool(self.state.manual_cluster_override)
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
-                self.plot_preview.set_data(*args)
-                self.plot_edit.set_data(*args)
+                self._sync_plots_from_state()
                 self._update_cluster_summary()
                 self._update_profiler()
 
-                self.lbl_demand_status.setText(f"Done: {coord_name}, segments={len(ids)}, k={k}.")
+                self.lbl_demand_status.setText(f"Done: {coord_name}, segments={len(ids)}, k={k}, alg={cluster_alg}.")
                 self._set_status("Demand Space Analysis Completed.")
 
             else:
                 cols = self._selected_checked_items(self.lst_demand_vars)
-                if len(cols) < 3:
-                    raise RuntimeError("Select at least 3 variables.")
-                Vz, labels = self._variables_as_matrix(cols)
+                if len(cols) < 2:
+                    raise RuntimeError("Select at least 2 variables.")
+                target_col = self.cmb_demand_var_target.currentText().strip()
+                if target_col == "(None)":
+                    target_col = ""
+                Vmat, labels, is_dist = self._variables_as_matrix(cols, target_col)
 
-                if mode.startswith("PCA"):
+                if mode.startswith("PCA") and not is_dist:
                     pca = PCA(n_components=2, random_state=42)
-                    xy = pca.fit_transform(Vz)
+                    xy = pca.fit_transform(Vmat)
                     coord_name = "PCA(variables)"
                 else:
-                    C = np.corrcoef(Vz)
-                    D = 1.0 - C
-                    D = np.clip(D, 0.0, 2.0)
+                    if is_dist:
+                        D = Vmat
+                        coord_name = "MDS(Gower" + (f"|Target={target_col}" if target_col else "") + ")"
+                    else:
+                        C = np.corrcoef(Vmat)
+                        D = 1.0 - C
+                        D = np.clip(D, 0.0, 2.0)
+                        coord_name = "MDS(1-corr,variables)"
                     mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42, n_init=2, max_iter=300)
                     xy = mds.fit_transform(D)
-                    coord_name = "MDS(1-corr,variables)"
 
                 k = max(2, min(k, xy.shape[0]))
-                km = KMeans(n_clusters=k, n_init=10, random_state=42)
+                if cluster_alg.startswith("Hierarchical"):
+                    km = AgglomerativeClustering(n_clusters=k, linkage="ward")
+                else:
+                    km = KMeans(n_clusters=k, n_init=10, random_state=42)
                 cl = km.fit_predict(xy) + 1
 
                 ids = labels
@@ -3417,18 +3492,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 self.state.demand_mode = "Variables-as-points"
                 self.state.demand_xy = xy_df
-                self.state.cluster_assign = cl_s
+                self.state.cluster_assign_base = cl_s
+                if self.state.manual_cluster_override:
+                    self._apply_overrides_to_base()
+                else:
+                    self.state.cluster_assign = cl_s.copy()
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = None
-                self.state.manual_dirty = False
+                self.state.manual_dirty = bool(self.state.manual_cluster_override)
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
-                self.plot_preview.set_data(*args)
-                self.plot_edit.set_data(*args)
+                self._sync_plots_from_state()
                 self._update_cluster_summary()
                 self._update_profiler()
 
-                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}.")
+                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}, alg={cluster_alg}.")
                 self._set_status("Demand Space (Vars) Analysis Completed.")
 
         except Exception as e:
@@ -3447,33 +3524,141 @@ class IntegratedApp(QtWidgets.QMainWindow):
             raise RuntimeError(f"No segments have >= {min_n} size.")
 
         feat_cols = []
+        prof_parts = []
         if use_factors:
             avail = [c for c in df.columns if str(c).startswith("Factor") and str(c)[6:].isdigit()]
             selected = [c for c in avail if int(c[6:]) <= fac_k]
             feat_cols.extend(selected)
+            if selected:
+                prof_parts.append(df.groupby("_SEG_LABEL_")[selected].mean())
 
         if target != "(None)" and target in df.columns:
-            feat_cols.append(target)
-            df[target] = pd.to_numeric(df[target], errors="coerce")
+            tser = df[target]
+            if pd.api.types.is_numeric_dtype(tser):
+                feat_cols.append(target)
+                df[target] = pd.to_numeric(df[target], errors="coerce")
+                prof_parts.append(df.groupby("_SEG_LABEL_")[[target]].mean())
+            else:
+                dist = pd.crosstab(df["_SEG_LABEL_"], tser, normalize="index")
+                dist = dist.fillna(0.0)
+                dist.columns = [f"{target}::{c}" for c in dist.columns]
+                feat_cols.extend(dist.columns.tolist())
+                prof_parts.append(dist)
 
         if not feat_cols:
             raise RuntimeError("No features for profiling (Enable Factors or select Target).")
 
-        prof = df.groupby("_SEG_LABEL_")[feat_cols].mean()
+        prof = pd.concat(prof_parts, axis=1) if len(prof_parts) > 1 else prof_parts[0]
         prof["n"] = df.groupby("_SEG_LABEL_").size()
         return prof, feat_cols
 
-    def _variables_as_matrix(self, cols: List[str]):
-        df = to_numeric_df(self.state.df, cols)
-        df = df.dropna(axis=0, how="all")
-        if df.shape[0] < 5:
-            raise RuntimeError("Not enough data rows.")
+    def _build_segment_target_pivot(self, seg_cols: List[str], sep: str, target: str, min_n: int):
+        """R hclust 스타일: 타깃-세그 조합 분포 피벗으로 세그 간 유사도 계산."""
+        df = self.state.df.copy()
+        if target not in df.columns:
+            raise RuntimeError(f"Target '{target}' not found in data.")
 
-        df = df.fillna(df.mean())
-        V = df.T
-        scaler = StandardScaler()
-        Vz = scaler.fit_transform(V)
-        return Vz, cols
+        df["_SEG_LABEL_"] = df[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+        cnt = df["_SEG_LABEL_"].value_counts()
+        valid_segs = cnt[cnt >= min_n].index
+        df = df[df["_SEG_LABEL_"].isin(valid_segs)].copy()
+        if df.empty:
+            raise RuntimeError(f"No segments have >= {min_n} size after filtering.")
+
+        pivot = pd.crosstab(df[target], df["_SEG_LABEL_"])
+        if pivot.empty:
+            raise RuntimeError("Target/segment pivot is empty.")
+
+        pivot = pivot.loc[:, pivot.sum(axis=0) > 0]
+        dist = pivot.div(pivot.sum(axis=0), axis=1).T  # 세그별 타깃 분포 (열 합 1)
+        dist.columns = [f"{target}::{c}" for c in dist.columns]
+
+        dist["n"] = cnt.reindex(dist.index).fillna(0).astype(int)
+        feat_cols = [c for c in dist.columns if c != "n"]
+        if not feat_cols:
+            raise RuntimeError("No target distribution features available for clustering.")
+        return dist, feat_cols
+
+    def _variables_as_matrix(self, cols: List[str], target: str = ""):
+        df = self.state.df.copy()
+        cols = [c for c in cols if c in df.columns]
+        base = df[cols].copy()
+        base = base.dropna(axis=0, how="all")
+        # Allow running with as few as two data rows; still guard against empty/1-row inputs
+        if base.shape[0] < 2:
+            raise RuntimeError("Not enough data rows (need at least 2 after cleaning).")
+
+        # If all numeric, keep the original z-score matrix flow
+        all_numeric = all(pd.api.types.is_numeric_dtype(base[c]) for c in cols)
+        if all_numeric:
+            base = base.apply(pd.to_numeric, errors="coerce")
+            base = base.fillna(base.mean())
+            V = base.T
+            scaler = StandardScaler()
+            Vz = scaler.fit_transform(V)
+            return Vz, cols, False
+
+        # Mixed types: compute a Gower-like distance matrix (optionally within each target group)
+        tgt = None
+        if target and target in df.columns:
+            tgt = df[target].loc[base.index]
+
+        dist = self._variable_gower_distance_matrix(base, tgt)
+        return dist, cols, True
+
+    def _variable_gower_distance_matrix(self, df_vars: pd.DataFrame, tgt: Optional[pd.Series] = None) -> np.ndarray:
+        cols = list(df_vars.columns)
+        n = len(cols)
+        D = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = self._variable_gower_distance(df_vars[cols[i]], df_vars[cols[j]], tgt)
+                D[i, j] = D[j, i] = d
+        return D
+
+    def _variable_gower_distance(self, s1: pd.Series, s2: pd.Series, tgt: Optional[pd.Series] = None) -> float:
+        def pair_distance(a: pd.Series, b: pd.Series) -> float:
+            mask = a.notna() & b.notna()
+            if mask.sum() == 0:
+                return 1.0
+            a1 = a[mask]
+            b1 = b[mask]
+            if pd.api.types.is_numeric_dtype(a1) and pd.api.types.is_numeric_dtype(b1):
+                a1 = pd.to_numeric(a1, errors="coerce")
+                b1 = pd.to_numeric(b1, errors="coerce")
+                mask2 = a1.notna() & b1.notna()
+                if mask2.sum() == 0:
+                    return 1.0
+                a1 = a1[mask2]
+                b1 = b1[mask2]
+                rng = (pd.concat([a1, b1]).max() - pd.concat([a1, b1]).min())
+                if not np.isfinite(rng) or rng == 0:
+                    diff = np.zeros_like(a1, dtype=float)
+                else:
+                    diff = np.abs(a1 - b1) / rng
+            else:
+                diff = (a1.astype(str).values != b1.astype(str).values).astype(float)
+            return float(np.nanmean(diff)) if len(diff) else 1.0
+
+        if tgt is None:
+            return pair_distance(s1, s2)
+
+        tgt = tgt.reset_index(drop=True)
+        s1 = s1.reset_index(drop=True)
+        s2 = s2.reset_index(drop=True)
+        dist_sum = 0.0
+        weight_sum = 0.0
+        total = len(tgt)
+        for val in tgt.dropna().unique():
+            mask = tgt == val
+            if mask.sum() == 0:
+                continue
+            w = mask.sum() / total
+            dist_sum += w * pair_distance(s1[mask], s2[mask])
+            weight_sum += w
+        if weight_sum == 0:
+            return pair_distance(s1, s2)
+        return dist_sum / weight_sum
 
     # -------------------------------------------------------------------------
     # Tab 8: Segmentation Editing
@@ -3523,6 +3708,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.tbl_cluster_summary = DataFrameTable(float_decimals=2)
         left.addWidget(self.tbl_cluster_summary, 1)
 
+        left.addWidget(QtWidgets.QLabel("<b>Selected Cluster Details</b>"))
+        self.tbl_cluster_detail = DataFrameTable(float_decimals=2)
+        left.addWidget(self.tbl_cluster_detail, 1)
+
         rename_box = QtWidgets.QHBoxLayout()
         self.spin_rename_cluster_id = QtWidgets.QSpinBox()
         self.spin_rename_cluster_id.setRange(1, 999)
@@ -3542,6 +3731,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.plot_edit = DemandClusterPlot(editable=True)
         self.plot_edit.sigClustersChanged.connect(self._on_manual_clusters_changed)
         self.plot_edit.sigCoordsChanged.connect(self._on_manual_coords_changed)
+        self.plot_edit.sigPointClusterClicked.connect(self._on_cluster_detail_requested)
         center.addWidget(self.plot_edit, 1)
         layout.addLayout(center, 2)
 
@@ -3562,10 +3752,60 @@ class IntegratedApp(QtWidgets.QMainWindow):
         else:
             self._set_status("View Mode: Pan/Zoom enabled. (Editing locked)")
 
+    # ------------------------------------------------------------------
+    # Cluster assignment utilities (base + manual overrides)
+    # ------------------------------------------------------------------
+    def _apply_overrides_to_base(self):
+        base = self.state.cluster_assign_base
+        if base is None:
+            self.state.cluster_assign = None
+            return
+
+        eff = base.copy()
+        overrides = dict(self.state.manual_cluster_override or {})
+        missing = []
+        for key, cid in overrides.items():
+            if key in eff.index:
+                eff.loc[key] = int(cid)
+            else:
+                missing.append(key)
+
+        if missing:
+            for m in missing:
+                overrides.pop(m, None)
+            self.state.manual_cluster_override = overrides
+
+        self.state.cluster_assign = eff
+
+    def _sync_plots_from_state(self):
+        if self.state.demand_xy is None or self.state.cluster_assign is None:
+            return
+
+        df = self.state.demand_xy
+        ids = df["id"].astype(str).tolist() if "id" in df.columns else []
+        labels = df["label"].astype(str).tolist() if "label" in df.columns else ids
+        xy = df[["x", "y"]].values if {"x", "y"}.issubset(df.columns) else np.zeros((len(ids), 2))
+        cl = self.state.cluster_assign.reindex(ids).fillna(0).astype(int).values if ids else np.array([], dtype=int)
+        n_map = None
+        if "n" in df.columns:
+            try:
+                n_map = dict(zip(ids, df["n"].astype(float)))
+            except Exception:
+                n_map = None
+
+        args = (ids, labels, xy, cl, self.state.cluster_names, n_map)
+        self.plot_edit.set_data(*args)
+        self.plot_preview.set_data(*args)
+
+        if self.state.demand_mode and self.state.demand_mode.startswith("Segments"):
+            if not self.chk_show_all_point_labels.isChecked():
+                self.chk_show_all_point_labels.setChecked(True)
+
     def _update_cluster_summary(self):
         """[v8.1] Enhanced to show sub-segment details for each cluster."""
         if self.state.demand_xy is None or self.state.cluster_assign is None:
             self.tbl_cluster_summary.set_df(None)
+            self.tbl_cluster_detail.set_df(None)
             return
 
         cl = self.state.cluster_assign.copy()
@@ -3596,6 +3836,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
             })
         out = pd.DataFrame(rows).sort_values(["Cluster ID"]).reset_index(drop=True)
         self.tbl_cluster_summary.set_df(out, max_rows=500)
+
+        first_cluster = int(out.iloc[0]["Cluster ID"]) if not out.empty else None
+        self._update_cluster_detail(first_cluster)
 
     def _update_profiler(self):
         """Calculates Z-scores for each cluster to find distinctive features."""
@@ -3648,12 +3891,71 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 report += ", ".join(vars_in) + "<br><br>"
             self.txt_profile_report.setHtml(report)
 
+    def _cluster_detail_rows(self, cluster_id: Optional[int]) -> Optional[pd.DataFrame]:
+        if cluster_id is None or self.state.cluster_assign is None:
+            return None
+
+        cl = self.state.cluster_assign
+        if cluster_id not in set(map(int, cl.values)):
+            return None
+
+        rows = []
+        comps = self.state.demand_seg_components or []
+        sep = self.state.demand_seg_separator or "|"
+        n_lookup = None
+        if self.state.demand_seg_profile is not None and "n" in self.state.demand_seg_profile.columns:
+            n_lookup = self.state.demand_seg_profile["n"]
+        elif self.state.demand_xy is not None and "n" in self.state.demand_xy.columns:
+            try:
+                n_lookup = self.state.demand_xy.set_index("id")["n"]
+            except Exception:
+                n_lookup = None
+
+        for seg_label in cl[cl == cluster_id].index.tolist():
+            entry = {"level_label": seg_label, "Segment": seg_label, "Cluster": int(cluster_id)}
+            parts = str(seg_label).split(sep) if comps else []
+            for idx, comp in enumerate(comps):
+                entry[comp] = parts[idx] if idx < len(parts) else ""
+            if n_lookup is not None and seg_label in n_lookup.index:
+                entry["n"] = int(n_lookup.loc[seg_label])
+            rows.append(entry)
+
+        if not rows:
+            return None
+        df_out = pd.DataFrame(rows)
+        if "n" in df_out.columns:
+            df_out = df_out.sort_values("n", ascending=False)
+        return df_out.reset_index(drop=True)
+
+    def _update_cluster_detail(self, cluster_id: Optional[int]):
+        df_out = self._cluster_detail_rows(cluster_id)
+        self.tbl_cluster_detail.set_df(df_out, max_rows=300)
+
+    def _on_cluster_detail_requested(self, cluster_id: Optional[int]):
+        if cluster_id is None:
+            return
+        self._update_cluster_detail(cluster_id)
+
     def _on_manual_clusters_changed(self):
         if self.state.demand_xy is None:
             return
         s = self.plot_edit.get_cluster_series()
-        self.state.cluster_assign = s
+        if self.state.cluster_assign_base is None:
+            self.state.cluster_assign_base = s.copy()
+
+        overrides = dict(self.state.manual_cluster_override or {})
+        base = self.state.cluster_assign_base
+        for key, val in s.items():
+            base_val = base.loc[key] if base is not None and key in base.index else None
+            if base_val is None or int(base_val) != int(val):
+                overrides[key] = int(val)
+            elif key in overrides:
+                overrides.pop(key, None)
+
+        self.state.manual_cluster_override = overrides
+        self._apply_overrides_to_base()
         self.state.manual_dirty = True
+        self._sync_plots_from_state()
         self._update_cluster_summary()
         self._update_profiler()
         self._set_status("Manual clusters updated.")
@@ -3663,13 +3965,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
         xy_map = self.plot_edit.get_xy_map()
         try:
-            df = self.state.demand_xy.copy()
-            if "id" in df.columns:
-                df["x"] = df["id"].astype(str).map(lambda k: xy_map.get(str(k), (np.nan, np.nan))[0])
-                df["y"] = df["id"].astype(str).map(lambda k: xy_map.get(str(k), (np.nan, np.nan))[1])
-                self.state.demand_xy = df
-                self.state.manual_dirty = True
-                self._set_status("Manual coords updated.")
+                df = self.state.demand_xy.copy()
+                if "id" in df.columns:
+                    df["x"] = df["id"].astype(str).map(lambda k: xy_map.get(str(k), (np.nan, np.nan))[0])
+                    df["y"] = df["id"].astype(str).map(lambda k: xy_map.get(str(k), (np.nan, np.nan))[1])
+                    self.state.demand_xy = df
+                    self.state.manual_dirty = True
+                    self._sync_plots_from_state()
+                    self._set_status("Manual coords updated.")
         except Exception:
             self._set_status("Manual coords update failed.")
 
@@ -3745,6 +4048,19 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             with pd.ExcelWriter(out, engine="openpyxl") as w:
                 self.state.df.to_excel(w, sheet_name="01_Data", index=False)
+                # Export data with cluster labels when available
+                if self.state.cluster_assign is not None and self.state.demand_seg_components:
+                    try:
+                        df_with_cl = self.state.df.copy()
+                        sep = self.state.demand_seg_separator or "|"
+                        seg_cols = self.state.demand_seg_components
+                        df_with_cl["_SEG_LABEL_"] = df_with_cl[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+                        df_with_cl["cluster_id"] = df_with_cl["_SEG_LABEL_"].map(self.state.cluster_assign)
+                        df_with_cl["cluster_name"] = df_with_cl["cluster_id"].map(self.state.cluster_names)
+                        df_with_cl.to_excel(w, sheet_name="01b_Data_With_Clusters", index=False)
+                        df_with_cl.to_excel(w, sheet_name="raw_with_cluster", index=False)
+                    except Exception:
+                        pass
                 if self.state.recode_df is not None:
                     self.state.recode_df.to_excel(w, sheet_name="02_RECODE", index=False)
 
@@ -3769,6 +4085,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     cl_df.columns = ["id", "cluster_id"]
                     cl_df["cluster_name"] = cl_df["cluster_id"].map(self.state.cluster_names).fillna("")
                     cl_df.to_excel(w, sheet_name="13_Demand_Clusters", index=False)
+
+                    # Add per-cluster sheets with segment details
+                    for cid in sorted(cl_df["cluster_id"].unique()):
+                        detail_df = self._cluster_detail_rows(int(cid))
+                        if detail_df is not None:
+                            detail_export = detail_df.copy()
+                            if "n" in detail_export.columns:
+                                detail_export["cluster_total_n"] = detail_export["n"].sum()
+                            else:
+                                detail_export["cluster_total_n"] = len(detail_export)
+                            sheet_name = f"Cluster_{int(cid)}"
+                            detail_export.to_excel(w, sheet_name=sheet_name[:31], index=False)
 
                 # [v8.1] Export variable types
                 if self.state.var_types:
