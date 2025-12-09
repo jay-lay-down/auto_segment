@@ -239,6 +239,8 @@ class AppState:
     dt_full_path_info: Optional[pd.DataFrame] = None
     dt_full_condition_freq: Optional[pd.DataFrame] = None
     dt_full_selected: Tuple[Optional[str], Optional[str]] = (None, None)
+    dt_full_split_view: Optional[pd.DataFrame] = None  # formatted split summary for the All Splits table
+    dt_full_split_pivot: Optional[pd.DataFrame] = None  # pivot: rows=split condition, cols=dep, val=improve
 
     # Demand Space Data
     demand_mode: str = "Segments-as-points"
@@ -2474,9 +2476,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         pred_layout.addWidget(self.lst_dt_predictors, 1)
         layout.addWidget(pred_box)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-
-        # A) Pivot (Main View)
+        # Importance + Pivot (Main View)
         w1 = QtWidgets.QWidget()
         l1 = QtWidgets.QVBoxLayout(w1)
         l1.addWidget(QtWidgets.QLabel("Predictor Importance (sum of improve_rel, cumulative %)"))
@@ -2496,17 +2496,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         rec_layout.addStretch(1)
         l1.addLayout(rec_layout)
 
-        # B) Best Split (Detail View)
-        w2 = QtWidgets.QWidget()
-        l2 = QtWidgets.QVBoxLayout(w2)
-        l2.addWidget(QtWidgets.QLabel("Best Split Detail (Root Node) - Reference"))
-        self.tbl_dt_bestsplit = DataFrameTable(float_decimals=2)
-        l2.addWidget(self.tbl_dt_bestsplit, 1)
-
-        splitter.addWidget(w1)
-        splitter.addWidget(w2)
-        splitter.setSizes([520, 240])
-        layout.addWidget(splitter, 1)
+        layout.addWidget(w1, 1)
 
     def _filter_dt_pred_list(self):
         term = self.txt_dt_pred_filter.text().strip().lower()
@@ -2612,7 +2602,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             self.tbl_dt_importance.set_df(importance_summary)
             self.tbl_dt_pivot.set_df(pivot_reset)
-            self.tbl_dt_bestsplit.set_df(best_df)
+            if hasattr(self, "tbl_dt_bestsplit_result") and self.tbl_dt_bestsplit_result is not None:
+                self.tbl_dt_bestsplit_result.set_df(best_df)
 
             self.state.dt_improve_pivot = pivot_reset
             self.state.dt_split_best = best_df
@@ -2815,6 +2806,42 @@ class IntegratedApp(QtWidgets.QMainWindow):
         splitter.setSizes([280, 520])
         layout.addWidget(splitter, 1)
 
+        # [v8.2] Show best split table here (moved from Setting tab)
+        best_box = QtWidgets.QGroupBox("Best Split Detail (Root Node) - Reference")
+        blb = QtWidgets.QVBoxLayout(best_box)
+        self.tbl_dt_bestsplit_result = DataFrameTable(float_decimals=2)
+        blb.addWidget(self.tbl_dt_bestsplit_result)
+        layout.addWidget(best_box, 1)
+
+        # Show all splits from the built tree at once
+        all_box = QtWidgets.QGroupBox("All Splits (Full Tree)")
+        bl_all = QtWidgets.QVBoxLayout(all_box)
+        filt_row = QtWidgets.QHBoxLayout()
+        filt_row.addWidget(QtWidgets.QLabel("Target Filter:"))
+        self.cmb_dt_all_dep = QtWidgets.QComboBox()
+        self.cmb_dt_all_dep.currentIndexChanged.connect(self._refresh_dt_all_splits_table)
+        filt_row.addWidget(self.cmb_dt_all_dep, 2)
+        filt_row.addStretch(1)
+        bl_all.addLayout(filt_row)
+        self.tbl_dt_all_splits = DataFrameTable(float_decimals=2)
+        bl_all.addWidget(self.tbl_dt_all_splits)
+        layout.addWidget(all_box, 1)
+
+        # Pivot: Rows = split condition, Cols = target dep, Values = improve_rel
+        pivot_box = QtWidgets.QGroupBox("All Splits Pivot (Rows=Split, Cols=Target, Value=improve_rel)")
+        pv = QtWidgets.QVBoxLayout(pivot_box)
+        filt_p = QtWidgets.QHBoxLayout()
+        filt_p.addWidget(QtWidgets.QLabel("조건 필터:"))
+        self.txt_dt_split_pivot_filter = QtWidgets.QLineEdit()
+        self.txt_dt_split_pivot_filter.setPlaceholderText("예: 장소|이동")
+        self.txt_dt_split_pivot_filter.textChanged.connect(self._refresh_dt_split_pivot_table)
+        filt_p.addWidget(self.txt_dt_split_pivot_filter, 3)
+        filt_p.addStretch(1)
+        pv.addLayout(filt_p)
+        self.tbl_dt_split_pivot = DataFrameTable(float_decimals=3)
+        pv.addWidget(self.tbl_dt_split_pivot, 1)
+        layout.addWidget(pivot_box, 1)
+
     def _compute_full_tree_internal(self, dep: str, ind: str):
         df = self.state.df
         if df is None:
@@ -2855,6 +2882,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.dt_full_path_info = path_info
         self.state.dt_full_condition_freq = cond_freq
         self.state.dt_full_selected = (dep, ind)
+        self.state.dt_full_split_view = None
+        self.state.dt_full_split_pivot = None
 
         return task, nodes_df, split_groups, path_info, cond_freq
 
@@ -2881,6 +2910,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if self.cmb_split_select.count() > 0:
                 self.cmb_split_select.setCurrentIndex(0)
                 self._split_update_detail()
+
+            if hasattr(self, "tbl_dt_all_splits") and self.tbl_dt_all_splits is not None:
+                self._build_all_splits_view(split_groups)
+                self._refresh_dt_all_splits_table()
 
             self._set_status(f"Tree Built: dep={dep}, ind={ind} (task={task})")
         except Exception as e:
@@ -2976,6 +3009,93 @@ class IntegratedApp(QtWidgets.QMainWindow):
         except Exception as e:
             self.state.last_error = str(e)
             show_error(self, "Split Detail Error", e)
+
+    # ------------------------------------------------------------------
+    # DT Results: All-splits table helper
+    # ------------------------------------------------------------------
+    def _build_all_splits_view(self, split_groups: pd.DataFrame):
+        if split_groups is None or split_groups.empty:
+            self.state.dt_full_split_view = pd.DataFrame()
+            self.state.dt_full_split_pivot = pd.DataFrame()
+            self._refresh_dt_split_pivot_table()
+            return
+
+        view = split_groups.copy()
+        view["split_label"] = view.apply(
+            lambda r: f"{r['dep']}: {r['left_group']} / {r['right_group']}", axis=1
+        )
+        cols = [
+            "split_label", "improve_rel", "improve_abs", "n_node",
+            "split_num", "dep", "ind", "split_type", "cutpoint",
+            "left_group", "right_group"
+        ]
+        view = view[[c for c in cols if c in view.columns]].copy()
+        self.state.dt_full_split_view = view
+
+        # Pivot of improve_rel by split condition (row) × dep (col)
+        pivot_src = view.copy()
+        pivot_src["split_condition"] = pivot_src["split_label"]
+        pivot = pivot_src.pivot_table(
+            index="split_condition",
+            columns="dep",
+            values="improve_rel",
+            aggfunc="max",
+        )
+        pivot = pivot.sort_index()
+        self.state.dt_full_split_pivot = pivot
+        self._refresh_dt_split_pivot_table()
+
+        if hasattr(self, "cmb_dt_all_dep"):
+            self.cmb_dt_all_dep.blockSignals(True)
+            self.cmb_dt_all_dep.clear()
+            self.cmb_dt_all_dep.addItem("(All Targets)")
+            for dep in view["dep"].dropna().unique().tolist():
+                self.cmb_dt_all_dep.addItem(str(dep))
+            self.cmb_dt_all_dep.blockSignals(False)
+            self.cmb_dt_all_dep.setCurrentIndex(0)
+
+    def _refresh_dt_all_splits_table(self):
+        if not hasattr(self, "tbl_dt_all_splits") or self.tbl_dt_all_splits is None:
+            return
+
+        df_view = self.state.dt_full_split_view
+        if df_view is None or df_view.empty:
+            self.tbl_dt_all_splits.set_df(pd.DataFrame())
+            return
+
+        dep_sel = None
+        if hasattr(self, "cmb_dt_all_dep") and self.cmb_dt_all_dep.count() > 0:
+            dep_sel = self.cmb_dt_all_dep.currentText()
+            if dep_sel and dep_sel.startswith("(All"):
+                dep_sel = None
+
+        if dep_sel:
+            sub = df_view[df_view["dep"].astype(str) == dep_sel]
+        else:
+            sub = df_view
+
+        self.tbl_dt_all_splits.set_df(sub)
+
+    def _refresh_dt_split_pivot_table(self):
+        tbl = getattr(self, "tbl_dt_split_pivot", None)
+        if tbl is None:
+            return
+
+        pivot = self.state.dt_full_split_pivot
+        if pivot is None or pivot.empty:
+            tbl.set_df(pd.DataFrame())
+            return
+
+        term = ""
+        if hasattr(self, "txt_dt_split_pivot_filter") and self.txt_dt_split_pivot_filter is not None:
+            term = self.txt_dt_split_pivot_filter.text().strip().lower()
+
+        view = pivot
+        if term:
+            mask = pivot.index.to_series().str.lower().str.contains(term)
+            view = pivot[mask]
+
+        tbl.set_df(view)
 
     # -------------------------------------------------------------------------
     # Tab 6: Group & Compose
@@ -3366,7 +3486,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_demand_segcols.setEnabled(seg_mode)
         self.txt_demand_seg_sep.setEnabled(seg_mode)
-        self.lst_demand_targets.setEnabled(seg_mode)
+        # Targets are used in both segments-as-points and variables-as-points (multi-target pivot)
+        self.lst_demand_targets.setEnabled(True)
         self.spin_demand_min_n.setEnabled(seg_mode)
         self.chk_demand_use_factors.setEnabled(seg_mode)
         self.spin_demand_factor_k.setEnabled(seg_mode)
@@ -3513,35 +3634,55 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             else:
                 cols = self._selected_checked_items(self.lst_demand_vars)
-                if len(cols) < 3:
-                    raise RuntimeError("Select at least 3 variables.")
-                Vz, labels = self._variables_as_matrix(cols)
+                targets = self._selected_checked_items(self.lst_demand_targets)
+                if len(cols) < 2:
+                    raise RuntimeError("변수를 2개 이상 선택해 주세요.")
+                if not targets:
+                    raise RuntimeError("타깃 변수를 1개 이상 선택해 주세요. (Variables-as-points도 타깃×변수 피벗 기반)")
 
-                coord_name = ""
-                fallback_note = ""
-                if mode.startswith("PCA") and Vz.shape[0] >= 2:
-                    pca = PCA(n_components=2, random_state=42)
-                    xy = pca.fit_transform(Vz)
-                    coord_name = "PCA(variables)"
+                prof, feat_cols = self._build_variable_profiles(cols, targets)
+                X = prof[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                n_points, n_features = X.shape
+                if n_points < 2:
+                    raise RuntimeError("변수 포인트가 1개뿐입니다. 최소 2개 이상이어야 합니다.")
+
+                dist_condensed = pdist(X.values, metric="euclidean")
+                if np.allclose(dist_condensed, 0):
+                    xy = np.zeros((n_points, 2))
+                    coord_name = "MDS(target×variable) (모든 거리가 0)"
                 else:
-                    if mode.startswith("PCA") and Vz.shape[0] < 2:
-                        fallback_note = " (선택한 변수 수가 2개 미만이라 MDS로 자동 전환되었습니다.)"
-                    C = np.corrcoef(Vz)
-                    D = 1.0 - C
-                    D = np.clip(D, 0.0, 2.0)
-                    mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42, n_init=2, max_iter=300)
-                    xy = mds.fit_transform(D)
-                    coord_name = "MDS(1-corr,variables)" + fallback_note
+                    dist_square = squareform(dist_condensed)
+                    coord_name = "MDS(target×variable)"
+                    if mode.startswith("PCA") and n_features >= 2:
+                        pca = PCA(n_components=2, random_state=42)
+                        xy = pca.fit_transform(X.values)
+                        coord_name = "PCA(target×variable 분포)"
+                    else:
+                        mds = MDS(
+                            n_components=2,
+                            dissimilarity="precomputed",
+                            random_state=42,
+                            n_init=4,
+                            max_iter=500,
+                        )
+                        xy = mds.fit_transform(dist_square)
 
                 k = max(2, min(k, xy.shape[0]))
-                cl = _cluster_labels(xy)
+                if cluster_method.startswith("Hierarchical"):
+                    Z = linkage(dist_condensed if len(dist_condensed) else np.array([0.0]), method="complete")
+                    cl = fcluster(Z, t=k, criterion="maxclust")
+                else:
+                    km = KMeans(n_clusters=k, n_init=10, random_state=42)
+                    cl = km.fit_predict(X.values) + 1
 
-                ids = labels
+                ids = prof.index.astype(str).tolist()
+                labels = ids[:]
                 xy_df = pd.DataFrame({
                     "id": ids,
                     "label": labels,
                     "x": xy[:, 0],
                     "y": xy[:, 1],
+                    "n": prof["n"].values,
                     "cluster_id": cl,
                 })
                 cl_s = pd.Series(cl, index=ids)
@@ -3551,6 +3692,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.cluster_assign = cl_s
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = None
+                self.state.demand_targets = targets
+                self.state.demand_features_used = feat_cols
+                self.state.demand_seg_components = None
                 self.state.manual_dirty = False
 
                 args = (ids, labels, xy, cl, self.state.cluster_names)
@@ -3559,7 +3703,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self._update_cluster_summary()
                 self._update_profiler()
 
-                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}.")
+                tgt_txt = ", ".join(targets)
+                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}, targets=[{tgt_txt}].")
                 self._set_status("Demand Space (Vars) Analysis Completed.")
 
         except Exception as e:
@@ -3588,7 +3733,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
     ):
         df = self.state.df.copy()
 
-        df["_SEG_LABEL_"] = df[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+        for col in feat_cols:
+            series = df[col]
+            if pd.api.types.is_numeric_dtype(series):
+                numeric_parts.append(pd.to_numeric(series, errors="coerce"))
+                feature_names.append(col)
+            else:
+                dummies = pd.get_dummies(series.astype(str), prefix=col)
+                numeric_parts.append(dummies)
+                feature_names.extend(list(dummies.columns))
 
         cnt = df["_SEG_LABEL_"].value_counts()
         if cnt.empty:
@@ -3638,6 +3791,55 @@ class IntegratedApp(QtWidgets.QMainWindow):
         feature_cols = [c for c in seg_matrix.columns if c != "n"]
         labels_by_row = df["_SEG_LABEL_"].copy()
         return seg_matrix, feature_cols, labels_by_row
+
+    def _build_variable_profiles(self, var_cols: List[str], targets: List[str]):
+        df = self.state.df.copy()
+
+        if not targets:
+            raise RuntimeError("타깃 변수를 1개 이상 선택해 주세요.")
+        missing_tgt = [t for t in targets if t not in df.columns]
+        if missing_tgt:
+            raise RuntimeError(f"다음 타깃 변수가 데이터에 없습니다: {', '.join(missing_tgt)}")
+
+        missing_vars = [c for c in var_cols if c not in df.columns]
+        if missing_vars:
+            raise RuntimeError(f"다음 변수 컬럼이 없습니다: {', '.join(missing_vars)}")
+
+        long_df = df[targets + var_cols].copy()
+        long_df["_cnt"] = 1
+        melted = long_df.melt(id_vars=targets, value_vars=var_cols, var_name="_VAR_", value_name="_VAL_")
+        melted["_cnt"] = melted["_VAL_"].notna().astype(int)
+
+        pivot_norms: List[pd.DataFrame] = []
+        for tgt in targets:
+            pivot = (
+                melted.pivot_table(
+                    index=tgt,
+                    columns="_VAR_",
+                    values="_cnt",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .astype(float)
+            )
+            pivot = pivot.reindex(columns=var_cols, fill_value=0.0)
+            col_sum = pivot.sum(axis=0)
+            pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
+            pivot_norms.append(pivot_norm)
+
+        if not pivot_norms:
+            raise RuntimeError("피벗을 계산할 수 없습니다. 선택된 타깃/변수를 확인하세요.")
+
+        pivot_stack = pd.concat(pivot_norms, axis=0)
+        if pivot_stack.shape[1] < 2:
+            raise RuntimeError("변수 포인트가 1개뿐입니다. 최소 2개 이상이어야 합니다.")
+
+        var_matrix = pivot_stack.T
+        n_counts = melted.groupby("_VAR_")["_cnt"].sum().reindex(var_cols).fillna(0).astype(int)
+        var_matrix["n"] = n_counts.values
+
+        feature_cols = [c for c in var_matrix.columns if c != "n"]
+        return var_matrix, feature_cols
 
     def _current_segment_labels(self) -> Optional[pd.Series]:
         if self.state.df is None or not self.state.demand_seg_components:
