@@ -237,6 +237,7 @@ class AppState:
     dt_full_split_groups: Optional[pd.DataFrame] = None
     dt_full_split_branches: Optional[pd.DataFrame] = None
     dt_full_path_info: Optional[pd.DataFrame] = None
+    dt_full_split_paths: Optional[pd.DataFrame] = None
     dt_full_condition_freq: Optional[pd.DataFrame] = None
     dt_full_selected: Tuple[Optional[str], Optional[str]] = (None, None)
 
@@ -2141,7 +2142,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.dt_split_best = None
         self.state.dt_importance_summary = None
         self.state.dt_full_nodes = None
-        
+        self.state.dt_full_split_groups = None
+        self.state.dt_full_path_info = None
+        self.state.dt_full_split_branches = None
+        self.state.dt_full_split_paths = None
+
         if hasattr(self, "tbl_factor_loadings"):
             self.tbl_factor_loadings.set_df(None)
         if hasattr(self, "tbl_dt_pivot"):
@@ -2628,6 +2633,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.cmb_split_ind.clear()
             self.cmb_split_ind.addItems(ind_vars)
 
+            self._refresh_split_path_options()
+
             self._set_status("Decision Tree analysis completed.")
 
         except Exception as e:
@@ -2804,16 +2811,56 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         botw = QtWidgets.QWidget()
         bl = QtWidgets.QVBoxLayout(botw)
-        bl.addWidget(QtWidgets.QLabel("Split Detail:"))
+
+        detail_box = QtWidgets.QGroupBox("Split Detail")
+        dlay = QtWidgets.QVBoxLayout(detail_box)
         self.lbl_split_imp = QtWidgets.QLabel("No split selected.")
         self.lbl_split_imp.setWordWrap(True)
-        bl.addWidget(self.lbl_split_imp)
+        dlay.addWidget(self.lbl_split_imp)
         self.tbl_split_detail = DataFrameTable(float_decimals=2)
-        bl.addWidget(self.tbl_split_detail, 1)
+        dlay.addWidget(self.tbl_split_detail, 1)
+        bl.addWidget(detail_box, 2)
+
+        path_box = QtWidgets.QGroupBox("Split Path List by Variable")
+        play = QtWidgets.QVBoxLayout(path_box)
+
+        filter_row = QtWidgets.QHBoxLayout()
+        self.chk_path_filter = QtWidgets.QCheckBox("Filter to selected variables")
+        self.chk_path_filter.setChecked(True)
+        self.chk_path_filter.toggled.connect(self._update_split_path_table)
+        self.chk_path_multi = QtWidgets.QCheckBox("Multi-select")
+        self.chk_path_multi.toggled.connect(self._toggle_path_multi_mode)
+
+        self.cmb_path_var = QtWidgets.QComboBox()
+        self.cmb_path_var.currentIndexChanged.connect(self._update_split_path_table)
+
+        self.lst_path_vars = QtWidgets.QListWidget()
+        self.lst_path_vars.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.lst_path_vars.itemSelectionChanged.connect(self._update_split_path_table)
+        self.lst_path_vars.setVisible(False)
+
+        filter_row.addWidget(QtWidgets.QLabel("Variable"))
+        filter_row.addWidget(self.cmb_path_var, 2)
+        filter_row.addWidget(self.lst_path_vars, 2)
+        filter_row.addWidget(self.chk_path_multi)
+        filter_row.addWidget(self.chk_path_filter)
+        play.addLayout(filter_row)
+
+        self.tbl_split_paths = DataFrameTable(float_decimals=2)
+        play.addWidget(self.tbl_split_paths, 1)
+
+        path_hint = QtWidgets.QLabel("Select variables to see all split nodes and their paths for the full tree run.")
+        path_hint.setStyleSheet("color:#546e7a;")
+        play.addWidget(path_hint)
+
+        bl.addWidget(path_box, 3)
         splitter.addWidget(botw)
 
-        splitter.setSizes([280, 520])
+        splitter.setSizes([240, 680])
         layout.addWidget(splitter, 1)
+
+        self._refresh_split_path_options()
+        self._update_split_path_table()
 
     def _compute_full_tree_internal(self, dep: str, ind: str):
         df = self.state.df
@@ -2849,10 +2896,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
             force_categorical=force_cat
         )
 
+        split_paths = pd.DataFrame()
+        if not split_groups.empty and not nodes_df.empty:
+            split_paths = split_groups.merge(
+                nodes_df[["node_id", "condition"]], on="node_id", how="left"
+            )
+            split_paths = split_paths.rename(columns={"condition": "path_to_node"})
+
         self.state.dt_full_nodes = nodes_df
         self.state.dt_full_split_groups = split_groups
         self.state.dt_full_split_branches = branches
         self.state.dt_full_path_info = path_info
+        self.state.dt_full_split_paths = split_paths
         self.state.dt_full_condition_freq = cond_freq
         self.state.dt_full_selected = (dep, ind)
 
@@ -2881,6 +2936,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if self.cmb_split_select.count() > 0:
                 self.cmb_split_select.setCurrentIndex(0)
                 self._split_update_detail()
+
+            self._select_path_filter_variable(ind)
+            self._update_split_path_table()
 
             self._set_status(f"Tree Built: dep={dep}, ind={ind} (task={task})")
         except Exception as e:
@@ -2976,6 +3034,69 @@ class IntegratedApp(QtWidgets.QMainWindow):
         except Exception as e:
             self.state.last_error = str(e)
             show_error(self, "Split Detail Error", e)
+
+    def _refresh_split_path_options(self):
+        vars_available: List[str] = []
+        if getattr(self.state, "dt_importance_summary", None) is not None:
+            vars_available = self.state.dt_importance_summary.get("ind", pd.Series(dtype=str)).dropna().astype(str).tolist()
+        elif getattr(self.state, "dt_split_best", None) is not None:
+            vars_available = self.state.dt_split_best.get("ind", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
+        elif self.state.df is not None:
+            vars_available = list(self.state.df.columns)
+
+        vars_available = sorted(dict.fromkeys(vars_available))
+
+        self.cmb_path_var.blockSignals(True)
+        self.cmb_path_var.clear()
+        self.cmb_path_var.addItem("(All)")
+        self.cmb_path_var.addItems(vars_available)
+        self.cmb_path_var.blockSignals(False)
+
+        self.lst_path_vars.blockSignals(True)
+        self.lst_path_vars.clear()
+        for v in vars_available:
+            it = QtWidgets.QListWidgetItem(v)
+            self.lst_path_vars.addItem(it)
+        self.lst_path_vars.blockSignals(False)
+
+    def _toggle_path_multi_mode(self, checked: bool):
+        self.cmb_path_var.setVisible(not checked)
+        self.lst_path_vars.setVisible(checked)
+        self._update_split_path_table()
+
+    def _get_selected_path_vars(self) -> List[str]:
+        if not self.chk_path_filter.isChecked():
+            return []
+        if self.chk_path_multi.isChecked():
+            return [it.text() for it in self.lst_path_vars.selectedItems()]
+        sel = self.cmb_path_var.currentText().strip()
+        return [] if sel in ["", "(All)"] else [sel]
+
+    def _select_path_filter_variable(self, var: str):
+        if not var:
+            return
+        idx = self.cmb_path_var.findText(var)
+        if idx >= 0:
+            self.cmb_path_var.setCurrentIndex(idx)
+        for i in range(self.lst_path_vars.count()):
+            if self.lst_path_vars.item(i).text() == var:
+                self.lst_path_vars.setCurrentRow(i)
+                break
+
+    def _update_split_path_table(self):
+        paths_df = getattr(self.state, "dt_full_split_paths", None)
+        if paths_df is None or paths_df.empty:
+            paths_df = getattr(self.state, "dt_full_path_info", None)
+        if paths_df is None:
+            self.tbl_split_paths.set_df(None)
+            return
+
+        df_view = paths_df.copy()
+        selected_vars = self._get_selected_path_vars()
+        if selected_vars:
+            df_view = df_view[df_view["ind"].astype(str).isin(selected_vars)]
+
+        self.tbl_split_paths.set_df(df_view)
 
     # -------------------------------------------------------------------------
     # Tab 6: Group & Compose
@@ -3913,7 +4034,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lbl_export = QtWidgets.QLabel(
             "Export Results to Excel:\n"
             "Sheets: 01_Data, 02_RECODE, 03_Factor_Loadings, 04_Factor_Scores,\n"
-            "05_DT_ImprovePivot, 05_DT_Importance, 06_DT_BestSplit, 07_DT_Full_Nodes, ...\n"
+            "05_DT_ImprovePivot, 05_DT_Importance, 06_DT_BestSplit,\n"
+            "07_DT_Full_Nodes, 07_DT_Split_Groups, 07_DT_Path_Info, 07_DT_Variable_Paths,\n"
             "13_Demand_Clusters, 14_Variable_Types, 15_Raw_with_Clusters"
         )
         self.lbl_export.setWordWrap(True)
@@ -3975,6 +4097,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if self.state.dt_full_nodes is not None:
                     self.state.dt_full_nodes.to_excel(w, sheet_name="07_DT_Full_Nodes", index=False)
+                if self.state.dt_full_split_groups is not None:
+                    self.state.dt_full_split_groups.to_excel(w, sheet_name="07_DT_Split_Groups", index=False)
+                if self.state.dt_full_path_info is not None:
+                    self.state.dt_full_path_info.to_excel(w, sheet_name="07_DT_Path_Info", index=False)
+                if getattr(self.state, "dt_full_split_paths", None) is not None:
+                    self.state.dt_full_split_paths.to_excel(w, sheet_name="07_DT_Variable_Paths", index=False)
 
                 if self.state.demand_xy is not None:
                     self.state.demand_xy.to_excel(w, sheet_name="12_Demand_Coords", index=False)

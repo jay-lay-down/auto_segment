@@ -73,6 +73,16 @@ AI 어시스턴트 기능을 사용하려면 OpenAI API Key가 필요합니다.
 sk-로 시작하는 본인의 API 키를 입력합니다.
 질문을 입력하고 Send를 누르면 데이터 기반의 답변을 받을 수 있습니다.
 
+### 🔎 로컬 코드 RAG 어시스턴트
+프로젝트 전체 코드를 벡터로 인덱싱해 "어떤 파일에서 이 함수가 정의됐지?" 같은 질문에 바로 응답하는 CLI 챗봇입니다.
+
+1. 의존성 설치: `pip install -r requirements-rag.txt`
+2. OpenAI 키 설정: `export OPENAI_API_KEY="sk-..."` (또는 PowerShell에서 `$env:OPENAI_API_KEY="sk-..."`)
+3. 실행: `python build_code_rag.py --project-root . --rebuild`
+   - `chroma_db/` 폴더에 코드 벡터 인덱스가 저장되며, 이후에는 `--rebuild` 없이 빠르게 재사용할 수 있습니다.
+   - `--extensions` 옵션을 사용하면 `.py` 외 다른 확장자를 추가할 수 있습니다.
+4. 터미널 프롬프트에 질문을 입력해 코드 위치와 함께 답변을 받아보세요.
+
 ### 💡 활용 팁
 보통 [데이터 로드] → [PCA] (성향 파악) → [Compose] (인구통계 변수 조합) → [Demand Space] (Segments-as-points 모드) 순서로 진행하면 효율적입니다.
 Demand Space에서 자동 클러스터링된 결과가 마음에 들지 않으면, 마우스로 라벨을 드래그하여 직관적으로 그룹을 합치세요.
