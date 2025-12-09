@@ -430,10 +430,28 @@ def call_openai_api(
     return False, f"Failed after {max_retries} attempts. Last error: {last_error}"
 
 
+def _normalize_gemini_model(model: Optional[str]) -> str:
+    """Ensure Gemini model names align with deployable versions."""
+    name = (model or "").strip()
+    if not name:
+        return "gemini-1.5-flash-latest"
+
+    if name.startswith("models/"):
+        name = name.split("/", 1)[1]
+
+    alias = {
+        "gemini-1.5-flash": "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-001": "gemini-1.5-flash-001",
+        "gemini-pro": "gemini-pro",
+    }
+
+    return alias.get(name, name)
+
+
 def call_gemini_api(
     api_key: str,
     messages: List[dict],
-    model: str = "gemini-1.5-flash",
+    model: str = "gemini-1.5-flash-latest",
     max_retries: int = 4,
     initial_delay: float = 2.0,
     timeout: int = 30,
@@ -442,6 +460,7 @@ def call_gemini_api(
     if not api_key or not str(api_key).strip():
         return False, "API key is missing. Please enter a valid key."
 
+    model = _normalize_gemini_model(model)
     delay = float(initial_delay)
     last_error = ""
 
@@ -514,7 +533,7 @@ def call_ai_chat(
 ) -> Tuple[bool, str]:
     provider = (provider or "openai").lower()
     if provider == "gemini":
-        model = model or "gemini-1.5-flash"
+        model = _normalize_gemini_model(model or "gemini-1.5-flash-latest")
         return call_gemini_api(
             api_key,
             messages,
@@ -5128,7 +5147,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         key_row = QtWidgets.QHBoxLayout()
         self.cmb_ai_provider = QtWidgets.QComboBox()
         self.cmb_ai_provider.addItem("OpenAI (GPT-4o-mini)", "openai")
-        self.cmb_ai_provider.addItem("Gemini (1.5-flash)", "gemini")
+        self.cmb_ai_provider.addItem("Gemini (1.5-flash-latest)", "gemini")
 
         self.txt_openai_key = QtWidgets.QLineEdit()
         self.txt_openai_key.setPlaceholderText("Enter OpenAI API Key (sk-...) or leave empty to generate prompt only")
