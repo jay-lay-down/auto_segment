@@ -301,6 +301,15 @@ class AppState:
 # -----------------------------------------------------------------------------
 # [v8.1 NEW] API Call Helper with Retry Logic
 # -----------------------------------------------------------------------------
+def _flatten_messages(messages: List[dict]) -> str:
+    lines = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
 def call_openai_api(
     api_key: str,
     messages: List[dict],
@@ -419,6 +428,111 @@ def call_openai_api(
         )
 
     return False, f"Failed after {max_retries} attempts. Last error: {last_error}"
+
+
+def call_gemini_api(
+    api_key: str,
+    messages: List[dict],
+    model: str = "gemini-1.5-flash",
+    max_retries: int = 4,
+    initial_delay: float = 2.0,
+    timeout: int = 30,
+) -> Tuple[bool, str]:
+    """Calls Gemini Generative Language API with retry logic similar to OpenAI."""
+    if not api_key or not str(api_key).strip():
+        return False, "API key is missing. Please enter a valid key."
+
+    delay = float(initial_delay)
+    last_error = ""
+
+    for attempt in range(max_retries):
+        try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                f"?key={api_key}"
+            )
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": _flatten_messages(messages)}],
+                    }
+                ]
+            }
+            resp = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+
+            if resp.status_code == 429:
+                last_error = (
+                    f"Rate limit hit. Waiting {delay:.1f}s before retry "
+                    f"({attempt + 1}/{max_retries})"
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+                candidates = data.get("candidates") or []
+                first = candidates[0]
+                parts = first.get("content", {}).get("parts", [])
+                text = parts[0].get("text") if parts else None
+                if not text:
+                    raise KeyError("No text in Gemini response")
+            except (ValueError, KeyError, IndexError, AttributeError) as parse_err:
+                return False, f"Invalid response from Gemini: {parse_err}"
+            return True, text
+
+        except requests.exceptions.Timeout:
+            last_error = (
+                f"Request timeout after {timeout}s (Attempt {attempt + 1}/{max_retries})"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+        except requests.exceptions.RequestException as e:
+            last_error = f"Network error: {str(e)}"
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    msg = f"Failed after {max_retries} attempts. Last error: {last_error}"
+    return False, msg
+
+
+def call_ai_chat(
+    provider: str,
+    api_key: str,
+    messages: List[dict],
+    model: Optional[str] = None,
+    max_retries: int = 4,
+    initial_delay: float = 2.0,
+    timeout: int = 30,
+) -> Tuple[bool, str]:
+    provider = (provider or "openai").lower()
+    if provider == "gemini":
+        model = model or "gemini-1.5-flash"
+        return call_gemini_api(
+            api_key,
+            messages,
+            model=model,
+            max_retries=max_retries,
+            initial_delay=initial_delay,
+            timeout=timeout,
+        )
+
+    model = model or "gpt-4o-mini"
+    return call_openai_api(
+        api_key,
+        messages,
+        model=model,
+        max_retries=max_retries,
+        initial_delay=initial_delay,
+        timeout=timeout,
+    )
 
 # =============================================================================
 # app.py (Part 2/8)
@@ -2441,9 +2555,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "No Factors", "Run Factor Analysis first.")
             return
             
-        key = self.txt_openai_key.text().strip()
+        provider, key = self._get_ai_provider_and_key()
         if not key:
-            QtWidgets.QMessageBox.warning(self, "No Key", "Enter API Key in AI Tab.")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No Key",
+                "Enter API Key in AI Tab for the selected provider (OpenAI/Gemini).",
+            )
             return
 
         loadings = self.state.factor_loadings
@@ -2459,7 +2577,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             # [v8.1] Use new retry-enabled API call
             messages = [{"role": "user", "content": txt}]
-            success, result = call_openai_api(key, messages, max_retries=3, initial_delay=2.0)
+            success, result = call_ai_chat(
+                provider,
+                key,
+                messages,
+                max_retries=3,
+                initial_delay=2.0,
+            )
 
             if success:
                 applied = self._apply_ai_factor_names(result)
@@ -2553,6 +2677,23 @@ class IntegratedApp(QtWidgets.QMainWindow):
         disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
         disp = disp.reset_index().rename(columns={"index": "variable"})
         self.tbl_factor_loadings.set_df(disp)
+
+    def _get_ai_provider_and_key(self) -> Tuple[str, str]:
+        provider = "openai"
+        key = ""
+
+        if hasattr(self, "cmb_ai_provider"):
+            sel = self.cmb_ai_provider.currentData()
+            provider = sel or self.cmb_ai_provider.currentText() or "openai"
+
+        provider = str(provider).lower().strip() or "openai"
+
+        if provider == "gemini" and hasattr(self, "txt_gemini_key"):
+            key = self.txt_gemini_key.text().strip()
+        elif hasattr(self, "txt_openai_key"):
+            key = self.txt_openai_key.text().strip()
+
+        return provider, key
 
     # -------------------------------------------------------------------------
     # Tab 4: Decision Tree Setting
@@ -4981,15 +5122,28 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addWidget(QtWidgets.QLabel("<b>AI Assistant</b>: Ask questions about your current data/analysis."))
 
         # [v8.1] Enhanced API Key section with status
-        key_box = QtWidgets.QGroupBox("OpenAI API Configuration")
+        key_box = QtWidgets.QGroupBox("AI API Configuration (GPT / Gemini)")
         key_layout = QtWidgets.QVBoxLayout(key_box)
-        
+
         key_row = QtWidgets.QHBoxLayout()
+        self.cmb_ai_provider = QtWidgets.QComboBox()
+        self.cmb_ai_provider.addItem("OpenAI (GPT-4o-mini)", "openai")
+        self.cmb_ai_provider.addItem("Gemini (1.5-flash)", "gemini")
+
         self.txt_openai_key = QtWidgets.QLineEdit()
         self.txt_openai_key.setPlaceholderText("Enter OpenAI API Key (sk-...) or leave empty to generate prompt only")
         self.txt_openai_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        key_row.addWidget(QtWidgets.QLabel("API Key:"))
+
+        self.txt_gemini_key = QtWidgets.QLineEdit()
+        self.txt_gemini_key.setPlaceholderText("Enter Gemini API Key (AI Studio) or leave empty to generate prompt only")
+        self.txt_gemini_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+
+        key_row.addWidget(QtWidgets.QLabel("Provider:"))
+        key_row.addWidget(self.cmb_ai_provider)
+        key_row.addWidget(QtWidgets.QLabel("OpenAI Key:"))
         key_row.addWidget(self.txt_openai_key, 1)
+        key_row.addWidget(QtWidgets.QLabel("Gemini Key:"))
+        key_row.addWidget(self.txt_gemini_key, 1)
         key_layout.addLayout(key_row)
         
         # [v8.1] API status and retry info
@@ -5064,15 +5218,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.txt_chat_history.append(f"<b>User:</b> {query}")
         self.txt_user_query.clear()
 
-        api_key = self.txt_openai_key.text().strip()
+        provider, api_key = self._get_ai_provider_and_key()
+        provider_label = "Gemini" if provider == "gemini" else "ChatGPT"
         if not api_key:
-            self.txt_chat_history.append(f"<br><i>[System] No API Key provided. Copy this prompt to ChatGPT:</i><br>")
+            self.txt_chat_history.append(
+                f"<br><i>[System] No API Key provided. Copy this prompt to {provider_label}:</i><br>"
+            )
             self.txt_chat_history.append(f"<pre style='background:#f5f5f5; padding:10px;'>{full_prompt}</pre><br><hr>")
             return
 
         try:
             self.txt_chat_history.append("<i>... Thinking (with auto-retry on rate limit) ...</i>")
-            self.lbl_api_status.setText("<b style='color:orange;'>⏳ Sending request...</b>")
+            self.lbl_api_status.setText(
+                f"<b style='color:orange;'>⏳ Sending request via {provider_label}...</b>"
+            )
             QtWidgets.QApplication.processEvents()
 
             # [v8.1] Use new retry-enabled API call
@@ -5080,12 +5239,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 {"role": "system", "content": "You are a Data Analysis Assistant for market research."},
                 {"role": "user", "content": full_prompt}
             ]
-            success, result = call_openai_api(
-                api_key, 
-                messages, 
-                max_retries=3, 
+            success, result = call_ai_chat(
+                provider,
+                api_key,
+                messages,
+                max_retries=3,
                 initial_delay=2.0,
-                timeout=30
+                timeout=30,
             )
 
             if success:
