@@ -461,13 +461,14 @@ def call_gemini_api(
         return False, "API key is missing. Please enter a valid key."
 
     model = _normalize_gemini_model(model)
+    path_model = model if model.startswith("models/") else f"models/{model}"
     delay = float(initial_delay)
     last_error = ""
 
     for attempt in range(max_retries):
         try:
             url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                f"https://generativelanguage.googleapis.com/v1beta/{path_model}:generateContent"
                 f"?key={api_key}"
             )
             payload = {
@@ -507,6 +508,16 @@ def call_gemini_api(
                 return False, f"Invalid response from Gemini: {parse_err}"
             return True, text
 
+        except requests.exceptions.HTTPError as http_err:
+            status_code = getattr(getattr(http_err, "response", None), "status_code", None)
+            if status_code == 404:
+                msg = (
+                    "Model not found (404). Please verify the Gemini model name "
+                    "(e.g., gemini-1.5-flash-latest) and your API key's access."
+                )
+            else:
+                msg = f"HTTP error: {http_err}"
+            return False, msg
         except requests.exceptions.Timeout:
             last_error = (
                 f"Request timeout after {timeout}s (Attempt {attempt + 1}/{max_retries})"
