@@ -240,6 +240,8 @@ class AppState:
     dt_full_split_paths: Optional[pd.DataFrame] = None
     dt_full_condition_freq: Optional[pd.DataFrame] = None
     dt_full_selected: Tuple[Optional[str], Optional[str]] = (None, None)
+    dt_full_split_view: Optional[pd.DataFrame] = None  # formatted split summary for the All Splits table
+    dt_full_split_pivot: Optional[pd.DataFrame] = None  # pivot: rows=split condition, cols=dep, val=improve
 
     # Demand Space Data
     demand_mode: str = "Segments-as-points"
@@ -1821,6 +1823,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._build_tab_factor()
         self._build_tab_dt_setting()
         self._build_tab_dt_results()
+        self._build_tab_dt_editing()
         self._build_tab_grouping()
         self._build_tab_seg_setting()
         self._build_tab_seg_editing()
@@ -2540,9 +2543,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         pred_layout.addWidget(self.lst_dt_predictors, 1)
         layout.addWidget(pred_box)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-
-        # A) Pivot (Main View)
+        # Importance + Pivot (Main View)
         w1 = QtWidgets.QWidget()
         l1 = QtWidgets.QVBoxLayout(w1)
         l1.addWidget(QtWidgets.QLabel("Predictor Importance (sum of improve_rel, cumulative %)"))
@@ -2562,17 +2563,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         rec_layout.addStretch(1)
         l1.addLayout(rec_layout)
 
-        # B) Best Split (Detail View)
-        w2 = QtWidgets.QWidget()
-        l2 = QtWidgets.QVBoxLayout(w2)
-        l2.addWidget(QtWidgets.QLabel("Best Split Detail (Root Node) - Reference"))
-        self.tbl_dt_bestsplit = DataFrameTable(float_decimals=2)
-        l2.addWidget(self.tbl_dt_bestsplit, 1)
-
-        splitter.addWidget(w1)
-        splitter.addWidget(w2)
-        splitter.setSizes([520, 240])
-        layout.addWidget(splitter, 1)
+        layout.addWidget(w1, 1)
 
     def _filter_dt_pred_list(self):
         term = self.txt_dt_pred_filter.text().strip().lower()
@@ -2679,7 +2670,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             self.tbl_dt_importance.set_df(importance_summary)
             self.tbl_dt_pivot.set_df(pivot_reset)
-            self.tbl_dt_bestsplit.set_df(best_df)
+            if hasattr(self, "tbl_dt_bestsplit_result") and self.tbl_dt_bestsplit_result is not None:
+                self.tbl_dt_bestsplit_result.set_df(best_df)
 
             self.state.dt_improve_pivot = pivot_reset
             self.state.dt_split_best = best_df
@@ -2817,7 +2809,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.tbl_group_map.set_df(map_df)
             self.txt_group_newcol.setText(f"{ind_val}_seg")
 
-            self.tabs.setCurrentIndex(5)
+            self.tabs.setCurrentIndex(6)
             self._set_status(f"Recommendation for '{ind_val}' transferred to Group Tab.")
 
         except Exception as e:
@@ -2988,6 +2980,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.dt_full_split_paths = split_paths
         self.state.dt_full_condition_freq = cond_freq
         self.state.dt_full_selected = (dep, ind)
+        self.state.dt_full_split_view = None
+        self.state.dt_full_split_pivot = None
 
         return task, nodes_df, split_groups, path_info, cond_freq
 
@@ -3193,7 +3187,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._build_tab_dt_results()
 
     # -------------------------------------------------------------------------
-    # Tab 6: Group & Compose
+    # Tab 7: Group & Compose
     # -------------------------------------------------------------------------
     def _build_tab_grouping(self):
         tab = QtWidgets.QWidget()
@@ -3543,7 +3537,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Delete Error", e)
 
     # -------------------------------------------------------------------------
-    # Tab 7: Segmentation Setting (Demand Space)
+    # Tab 8: Segmentation Setting (Demand Space)
     # -------------------------------------------------------------------------
     def _build_tab_seg_setting(self):
         tab = QtWidgets.QWidget()
@@ -3668,7 +3662,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_demand_segcols.setEnabled(seg_mode)
         self.txt_demand_seg_sep.setEnabled(seg_mode)
-        self.lst_demand_targets.setEnabled(seg_mode)
+        # Targets are used in both segments-as-points and variables-as-points (multi-target pivot)
+        self.lst_demand_targets.setEnabled(True)
         self.spin_demand_min_n.setEnabled(seg_mode)
         self.chk_demand_use_factors.setEnabled(seg_mode)
         self.spin_demand_factor_k.setEnabled(seg_mode)
@@ -3703,7 +3698,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 # =============================================================================
 
     # -------------------------------------------------------------------------
-    # Tab 7 (cont): Demand Space Analysis Logic
+    # Tab 8 (cont): Demand Space Analysis Logic
     # -------------------------------------------------------------------------
     def _run_demand_space(self):
         try:
@@ -3815,35 +3810,55 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             else:
                 cols = self._selected_checked_items(self.lst_demand_vars)
-                if len(cols) < 3:
-                    raise RuntimeError("Select at least 3 variables.")
-                Vz, labels = self._variables_as_matrix(cols)
+                targets = self._selected_checked_items(self.lst_demand_targets)
+                if len(cols) < 2:
+                    raise RuntimeError("변수를 2개 이상 선택해 주세요.")
+                if not targets:
+                    raise RuntimeError("타깃 변수를 1개 이상 선택해 주세요. (Variables-as-points도 타깃×변수 피벗 기반)")
 
-                coord_name = ""
-                fallback_note = ""
-                if mode.startswith("PCA") and Vz.shape[0] >= 2:
-                    pca = PCA(n_components=2, random_state=42)
-                    xy = pca.fit_transform(Vz)
-                    coord_name = "PCA(variables)"
+                prof, feat_cols = self._build_variable_profiles(cols, targets)
+                X = prof[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                n_points, n_features = X.shape
+                if n_points < 2:
+                    raise RuntimeError("변수 포인트가 1개뿐입니다. 최소 2개 이상이어야 합니다.")
+
+                dist_condensed = pdist(X.values, metric="euclidean")
+                if np.allclose(dist_condensed, 0):
+                    xy = np.zeros((n_points, 2))
+                    coord_name = "MDS(target×variable) (모든 거리가 0)"
                 else:
-                    if mode.startswith("PCA") and Vz.shape[0] < 2:
-                        fallback_note = " (선택한 변수 수가 2개 미만이라 MDS로 자동 전환되었습니다.)"
-                    C = np.corrcoef(Vz)
-                    D = 1.0 - C
-                    D = np.clip(D, 0.0, 2.0)
-                    mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42, n_init=2, max_iter=300)
-                    xy = mds.fit_transform(D)
-                    coord_name = "MDS(1-corr,variables)" + fallback_note
+                    dist_square = squareform(dist_condensed)
+                    coord_name = "MDS(target×variable)"
+                    if mode.startswith("PCA") and n_features >= 2:
+                        pca = PCA(n_components=2, random_state=42)
+                        xy = pca.fit_transform(X.values)
+                        coord_name = "PCA(target×variable 분포)"
+                    else:
+                        mds = MDS(
+                            n_components=2,
+                            dissimilarity="precomputed",
+                            random_state=42,
+                            n_init=4,
+                            max_iter=500,
+                        )
+                        xy = mds.fit_transform(dist_square)
 
                 k = max(2, min(k, xy.shape[0]))
-                cl = _cluster_labels(xy)
+                if cluster_method.startswith("Hierarchical"):
+                    Z = linkage(dist_condensed if len(dist_condensed) else np.array([0.0]), method="complete")
+                    cl = fcluster(Z, t=k, criterion="maxclust")
+                else:
+                    km = KMeans(n_clusters=k, n_init=10, random_state=42)
+                    cl = km.fit_predict(X.values) + 1
 
-                ids = labels
+                ids = prof.index.astype(str).tolist()
+                labels = ids[:]
                 xy_df = pd.DataFrame({
                     "id": ids,
                     "label": labels,
                     "x": xy[:, 0],
                     "y": xy[:, 1],
+                    "n": prof["n"].values,
                     "cluster_id": cl,
                 })
                 cl_s = pd.Series(cl, index=ids)
@@ -3853,6 +3868,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.cluster_assign = cl_s
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = None
+                self.state.demand_targets = targets
+                self.state.demand_features_used = feat_cols
+                self.state.demand_seg_components = None
                 self.state.manual_dirty = False
 
                 args = (ids, labels, xy, cl, self.state.cluster_names)
@@ -3861,7 +3879,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self._update_cluster_summary()
                 self._update_profiler()
 
-                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}.")
+                tgt_txt = ", ".join(targets)
+                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}, targets=[{tgt_txt}].")
                 self._set_status("Demand Space (Vars) Analysis Completed.")
 
         except Exception as e:
@@ -3890,7 +3909,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
     ):
         df = self.state.df.copy()
 
-        df["_SEG_LABEL_"] = df[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+        for col in feat_cols:
+            series = df[col]
+            if pd.api.types.is_numeric_dtype(series):
+                numeric_parts.append(pd.to_numeric(series, errors="coerce"))
+                feature_names.append(col)
+            else:
+                dummies = pd.get_dummies(series.astype(str), prefix=col)
+                numeric_parts.append(dummies)
+                feature_names.extend(list(dummies.columns))
 
         cnt = df["_SEG_LABEL_"].value_counts()
         if cnt.empty:
@@ -3942,6 +3969,55 @@ class IntegratedApp(QtWidgets.QMainWindow):
         labels_by_row = df["_SEG_LABEL_"].copy()
         return seg_matrix, feat_cols, labels_by_row
 
+    def _build_variable_profiles(self, var_cols: List[str], targets: List[str]):
+        df = self.state.df.copy()
+
+        if not targets:
+            raise RuntimeError("타깃 변수를 1개 이상 선택해 주세요.")
+        missing_tgt = [t for t in targets if t not in df.columns]
+        if missing_tgt:
+            raise RuntimeError(f"다음 타깃 변수가 데이터에 없습니다: {', '.join(missing_tgt)}")
+
+        missing_vars = [c for c in var_cols if c not in df.columns]
+        if missing_vars:
+            raise RuntimeError(f"다음 변수 컬럼이 없습니다: {', '.join(missing_vars)}")
+
+        long_df = df[targets + var_cols].copy()
+        long_df["_cnt"] = 1
+        melted = long_df.melt(id_vars=targets, value_vars=var_cols, var_name="_VAR_", value_name="_VAL_")
+        melted["_cnt"] = melted["_VAL_"].notna().astype(int)
+
+        pivot_norms: List[pd.DataFrame] = []
+        for tgt in targets:
+            pivot = (
+                melted.pivot_table(
+                    index=tgt,
+                    columns="_VAR_",
+                    values="_cnt",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .astype(float)
+            )
+            pivot = pivot.reindex(columns=var_cols, fill_value=0.0)
+            col_sum = pivot.sum(axis=0)
+            pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
+            pivot_norms.append(pivot_norm)
+
+        if not pivot_norms:
+            raise RuntimeError("피벗을 계산할 수 없습니다. 선택된 타깃/변수를 확인하세요.")
+
+        pivot_stack = pd.concat(pivot_norms, axis=0)
+        if pivot_stack.shape[1] < 2:
+            raise RuntimeError("변수 포인트가 1개뿐입니다. 최소 2개 이상이어야 합니다.")
+
+        var_matrix = pivot_stack.T
+        n_counts = melted.groupby("_VAR_")["_cnt"].sum().reindex(var_cols).fillna(0).astype(int)
+        var_matrix["n"] = n_counts.values
+
+        feature_cols = [c for c in var_matrix.columns if c != "n"]
+        return var_matrix, feature_cols
+
     def _current_segment_labels(self) -> Optional[pd.Series]:
         if self.state.df is None or not self.state.demand_seg_components:
             return None
@@ -3964,7 +4040,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         return Vz, cols
 
     # -------------------------------------------------------------------------
-    # Tab 8: Segmentation Editing
+    # Tab 9: Segmentation Editing
     # -------------------------------------------------------------------------
     def _build_tab_seg_editing(self):
         tab = QtWidgets.QWidget()
@@ -4206,7 +4282,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Rename Error", e)
 
     # -------------------------------------------------------------------------
-    # Tab 9: Export
+    # Tab 10: Export
     # -------------------------------------------------------------------------
     def _build_tab_export(self):
         tab = QtWidgets.QWidget()
@@ -4319,7 +4395,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Export Error", e)
 
     # -------------------------------------------------------------------------
-    # Tab 10: AI Assistant (RAG Chatbot) with Retry Logic
+    # Tab 11: AI Assistant (RAG Chatbot) with Retry Logic
     # -------------------------------------------------------------------------
     def _build_tab_rag(self):
         tab = QtWidgets.QWidget()
