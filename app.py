@@ -3733,7 +3733,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
     ):
         df = self.state.df.copy()
 
-        df["_SEG_LABEL_"] = df[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+        for col in feat_cols:
+            series = df[col]
+            if pd.api.types.is_numeric_dtype(series):
+                numeric_parts.append(pd.to_numeric(series, errors="coerce"))
+                feature_names.append(col)
+            else:
+                dummies = pd.get_dummies(series.astype(str), prefix=col)
+                numeric_parts.append(dummies)
+                feature_names.extend(list(dummies.columns))
 
         cnt = df["_SEG_LABEL_"].value_counts()
         if cnt.empty:
