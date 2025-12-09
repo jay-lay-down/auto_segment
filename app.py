@@ -3245,6 +3245,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         return [] if sel in ["", "(All)"] else [sel]
 
     def _select_path_filter_variable(self, var: str):
+        if not hasattr(self, "cmb_path_var") or not hasattr(self, "lst_path_vars"):
+            return
         if not var:
             return
         idx = self.cmb_path_var.findText(var)
