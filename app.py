@@ -1911,9 +1911,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 it.setBackground(QtGui.QColor("#fff3e0"))
             self.lst_dt_predictors.addItem(it)
 
-        self.cmb_dep_extra.clear()
-        self.cmb_dep_extra.addItem("(None)")
-        self.cmb_dep_extra.addItems(cols)
+        self.lst_dep_extra.clear()
+        for c in cols:
+            it = QtWidgets.QListWidgetItem(c)
+            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            it.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            self.lst_dep_extra.addItem(it)
 
         self.cmb_dt_full_dep.clear()
         self.cmb_dt_full_dep.addItems(cols)
@@ -2465,17 +2468,41 @@ class IntegratedApp(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         self.chk_use_all_factors = QtWidgets.QCheckBox("Use all Factors (Factor1..k) as Targets")
         self.chk_use_all_factors.setChecked(True)
-        self.cmb_dep_extra = QtWidgets.QComboBox()
         self.btn_run_tree = QtWidgets.QPushButton("Run Decision Tree Analysis")
         style_button(self.btn_run_tree, level=2)
         self.btn_run_tree.clicked.connect(self._run_decision_tree_outputs)
 
         row.addWidget(self.chk_use_all_factors)
-        row.addSpacing(14)
-        row.addWidget(QtWidgets.QLabel("Extra Target (Optional):"))
-        row.addWidget(self.cmb_dep_extra)
+        row.addStretch(1)
         row.addWidget(self.btn_run_tree)
         layout.addLayout(row)
+
+        extra_box = QtWidgets.QGroupBox("Extra Targets (Optional, multi-select)")
+        extra_layout = QtWidgets.QVBoxLayout(extra_box)
+        extra_layout.addWidget(QtWidgets.QLabel("Check one or more existing columns to treat as additional targets."))
+
+        extra_row = QtWidgets.QHBoxLayout()
+        self.lst_dep_extra = QtWidgets.QListWidget()
+        self.lst_dep_extra.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.lst_dep_extra.setMaximumHeight(90)
+        extra_row.addWidget(self.lst_dep_extra, 1)
+
+        self.btn_dep_extra_check_all = QtWidgets.QPushButton("Check All")
+        style_button(self.btn_dep_extra_check_all, level=1)
+        self.btn_dep_extra_uncheck_all = QtWidgets.QPushButton("Uncheck All")
+        style_button(self.btn_dep_extra_uncheck_all, level=1)
+
+        self.btn_dep_extra_check_all.clicked.connect(lambda: self._set_all_checks(self.lst_dep_extra, True))
+        self.btn_dep_extra_uncheck_all.clicked.connect(lambda: self._set_all_checks(self.lst_dep_extra, False))
+
+        btn_col = QtWidgets.QVBoxLayout()
+        btn_col.addWidget(self.btn_dep_extra_check_all)
+        btn_col.addWidget(self.btn_dep_extra_uncheck_all)
+        btn_col.addStretch(1)
+
+        extra_row.addLayout(btn_col)
+        extra_layout.addLayout(extra_row)
+        layout.addWidget(extra_box)
 
         # Controls: Predictors (Whitelist)
         pred_box = QtWidgets.QGroupBox("Select Predictors (Independent Variables)")
@@ -2566,9 +2593,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if self.chk_use_all_factors.isChecked() and fac_cols:
                 deps.extend(fac_cols)
 
-            extra = self.cmb_dep_extra.currentText().strip()
-            if extra and extra != "(None)" and extra not in deps:
-                deps.append(extra)
+            extras = self._selected_checked_items(self.lst_dep_extra)
+            for extra in extras:
+                if extra not in deps:
+                    deps.append(extra)
 
             if not deps:
                 raise RuntimeError("No dependent targets selected. Run Factor Analysis first or select extra dep.")
