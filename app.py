@@ -226,6 +226,7 @@ class AppState:
     factor_scores: Optional[pd.DataFrame] = None
     factor_loadings: Optional[pd.DataFrame] = None
     factor_mode: str = "PCA"
+    factor_ai_names: Dict[str, str] = field(default_factory=dict)
 
     # Decision tree outputs (Setting Tab)
     dt_improve_pivot: Optional[pd.DataFrame] = None
@@ -1881,6 +1882,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 out.append(it.text())
         return out
 
+    def _checked_or_selected_items(self, widget: QtWidgets.QListWidget) -> List[str]:
+        """Returns checked items, or falls back to selected items if none are checked."""
+
+        checked = self._selected_checked_items(widget)
+        if checked:
+            return checked
+        return [it.text() for it in widget.selectedItems()]
+
     def _set_checked_for_selected(self, widget: QtWidgets.QListWidget, checked: bool):
         st = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
         for it in widget.selectedItems():
@@ -2393,13 +2402,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             loadings = pd.DataFrame(components.T, index=cols, columns=score_cols)
 
-            disp = loadings.copy()
-            disp["_maxabs_"] = disp.abs().max(axis=1)
-            disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
-            disp = disp.reset_index().rename(columns={"index": "variable"})
-
             self.lbl_factor_info.setText(info_text)
-            self.tbl_factor_loadings.set_df(disp)
 
             self.state.df = df
             self.state.factor_model = model
@@ -2407,6 +2410,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.factor_scores = scores_df
             self.state.factor_loadings = loadings
             self.state.factor_mode = mode_name
+
+            self._render_factor_loadings_table()
 
             self.tbl_preview.set_df(df)
             self._refresh_all_column_lists()
@@ -2443,14 +2448,97 @@ class IntegratedApp(QtWidgets.QMainWindow):
             success, result = call_openai_api(key, messages, max_retries=3, initial_delay=2.0)
 
             if success:
-                QtWidgets.QMessageBox.information(self, "AI Suggestion", result)
-                self._set_status("AI Naming Done.")
+                applied = self._apply_ai_factor_names(result)
+                if applied:
+                    self._set_status("AI Naming Applied.")
+                else:
+                    self._set_status("AI Naming returned no usable mapping.")
             else:
                 QtWidgets.QMessageBox.warning(self, "AI Error", result)
                 self._set_status("AI Naming Failed.")
 
         except Exception as e:
             show_error(self, "AI Error", e)
+
+    def _apply_ai_factor_names(self, ai_text: str) -> bool:
+        """Parse AI output, apply to RECODE table, and refresh factor loadings view."""
+        try:
+            suggestions = json.loads(ai_text)
+        except Exception:
+            QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
+            return False
+
+        if not isinstance(suggestions, dict):
+            QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
+            return False
+
+        available_cols = set()
+        if self.state.factor_scores is not None:
+            available_cols.update(map(str, self.state.factor_scores.columns))
+        if self.state.factor_loadings is not None:
+            available_cols.update(map(str, self.state.factor_loadings.columns))
+
+        applied = {
+            str(col): str(name).strip()
+            for col, name in suggestions.items()
+            if str(col) in available_cols and str(name).strip()
+        }
+
+        if not applied:
+            QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
+            return False
+
+        self.state.factor_ai_names.update(applied)
+        self._render_factor_loadings_table()
+        self._update_recode_with_ai_names(applied)
+
+        msg = json.dumps(applied, ensure_ascii=False, indent=2)
+        QtWidgets.QMessageBox.information(self, "AI Suggestion Applied", f"적용된 이름:\n{msg}")
+        return True
+
+    def _update_recode_with_ai_names(self, ai_map: Dict[str, str]):
+        if not ai_map:
+            return
+
+        rows = []
+        for col, name in ai_map.items():
+            rows.append({"QUESTION": str(col), "CODE": str(col), "NAME": str(name)})
+
+        current = normalize_recode_df(self.state.recode_df)
+        if current is None or current.empty:
+            recode = pd.DataFrame(rows)
+        else:
+            recode = current.copy()
+            for row in rows:
+                mask = (
+                    recode["QUESTION"].astype(str) == row["QUESTION"]
+                ) & (recode["CODE"].astype(str) == row["CODE"])
+                if mask.any():
+                    recode.loc[mask, "NAME"] = row["NAME"]
+                else:
+                    recode = pd.concat([recode, pd.DataFrame([row])], ignore_index=True)
+
+        self.state.recode_df = normalize_recode_df(recode)
+        self._update_recode_tab()
+
+    def _render_factor_loadings_table(self):
+        if self.state.factor_loadings is None:
+            self.tbl_factor_loadings.set_df(None)
+            return
+
+        disp = self.state.factor_loadings.copy()
+        rename_map = {
+            col: f"{self.state.factor_ai_names[col]} ({col})"
+            for col in disp.columns
+            if col in self.state.factor_ai_names and self.state.factor_ai_names[col]
+        }
+        if rename_map:
+            disp = disp.rename(columns=rename_map)
+
+        disp["_maxabs_"] = disp.abs().max(axis=1)
+        disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
+        disp = disp.reset_index().rename(columns={"index": "variable"})
+        self.tbl_factor_loadings.set_df(disp)
 
     # -------------------------------------------------------------------------
     # Tab 4: Decision Tree Setting
@@ -2590,7 +2678,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if self.chk_use_all_factors.isChecked() and fac_cols:
                 deps.extend(fac_cols)
 
-            extras = self._selected_checked_items(self.lst_dep_extra)
+            extras = self._checked_or_selected_items(self.lst_dep_extra)
             for extra in extras:
                 if extra not in deps:
                     deps.append(extra)
@@ -2598,7 +2686,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if not deps:
                 raise RuntimeError("No dependent targets selected. Run Factor Analysis first or select extra dep.")
 
-            ind_vars = self._selected_checked_items(self.lst_dt_predictors)
+            ind_vars = self._checked_or_selected_items(self.lst_dt_predictors)
             ind_vars = [c for c in ind_vars if c not in deps and c != "resp_id"]
 
             if len(ind_vars) == 0:
@@ -3724,14 +3812,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 return labels + 1
 
             if seg_mode:
-                seg_cols = self._selected_checked_items(self.lst_demand_segcols)
+                seg_cols = self._checked_or_selected_items(self.lst_demand_segcols)
                 if len(seg_cols) < 1:
                     raise RuntimeError("Select at least 1 *_seg column.")
                 sep = self.txt_demand_seg_sep.text().strip() or "|"
 
                 use_factors = bool(self.chk_demand_use_factors.isChecked())
                 fac_k = int(self.spin_demand_factor_k.value())
-                targets = self._selected_checked_items(self.lst_demand_targets)
+                targets = self._checked_or_selected_items(self.lst_demand_targets)
                 min_n = int(self.spin_demand_min_n.value())
 
                 prof, feat_cols, labels_by_row = self._build_segment_profiles(
@@ -3815,8 +3903,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self._set_status("Demand Space Analysis Completed.")
 
             else:
-                cols = self._selected_checked_items(self.lst_demand_vars)
-                targets = self._selected_checked_items(self.lst_demand_targets)
+                cols = self._checked_or_selected_items(self.lst_demand_vars)
+                targets = self._checked_or_selected_items(self.lst_demand_targets)
                 if len(cols) < 2:
                     raise RuntimeError("변수를 2개 이상 선택해 주세요.")
                 if not targets:
@@ -3913,17 +4001,19 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _build_segment_profiles(
         self, seg_cols: List[str], sep: str, use_factors: bool, fac_k: int, targets: List[str], min_n: int
     ):
-        df = self.state.df.copy()
+        df_all = self.state.df.copy()
 
-        for col in feat_cols:
-            series = df[col]
-            if pd.api.types.is_numeric_dtype(series):
-                numeric_parts.append(pd.to_numeric(series, errors="coerce"))
-                feature_names.append(col)
-            else:
-                dummies = pd.get_dummies(series.astype(str), prefix=col)
-                numeric_parts.append(dummies)
-                feature_names.extend(list(dummies.columns))
+        missing_seg_cols = [c for c in seg_cols if c not in df_all.columns]
+        if missing_seg_cols:
+            raise RuntimeError(f"다음 세그먼트 컬럼이 없습니다: {', '.join(missing_seg_cols)}")
+
+        seg_labels_full = df_all[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+        df_all["_SEG_LABEL_"] = seg_labels_full
+
+        min_n = max(1, int(min_n))
+        seg_counts_all = df_all["_SEG_LABEL_"].value_counts()
+        keep_labels = seg_counts_all[seg_counts_all >= min_n].index
+        df = df_all[df_all["_SEG_LABEL_"].isin(keep_labels)].copy()
 
         cnt = df["_SEG_LABEL_"].value_counts()
         if cnt.empty:
@@ -3972,7 +4062,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         # Align naming with caller (`feat_cols`) to avoid NameError confusion
         feat_cols = [c for c in seg_matrix.columns if c != "n"]
-        labels_by_row = df["_SEG_LABEL_"].copy()
+        labels_by_row = seg_labels_full.copy()
         return seg_matrix, feat_cols, labels_by_row
 
     def _build_variable_profiles(self, var_cols: List[str], targets: List[str]):
