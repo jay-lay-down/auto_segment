@@ -1819,6 +1819,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._build_tab_factor()
         self._build_tab_dt_setting()
         self._build_tab_dt_results()
+        self._build_tab_dt_editing()
         self._build_tab_grouping()
         self._build_tab_seg_setting()
         self._build_tab_seg_editing()
@@ -2727,7 +2728,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.tbl_group_map.set_df(map_df)
             self.txt_group_newcol.setText(f"{ind_val}_seg")
 
-            self.tabs.setCurrentIndex(5)
+            self.tabs.setCurrentIndex(6)
             self._set_status(f"Recommendation for '{ind_val}' transferred to Group Tab.")
 
         except Exception as e:
@@ -2813,6 +2814,22 @@ class IntegratedApp(QtWidgets.QMainWindow):
         blb.addWidget(self.tbl_dt_bestsplit_result)
         layout.addWidget(best_box, 1)
 
+    # -------------------------------------------------------------------------
+    # Tab 6: Decision Tree Editing (Full Splits & Pivot View)
+    # -------------------------------------------------------------------------
+    def _build_tab_dt_editing(self):
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "Decision Tree Editing")
+
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        info = QtWidgets.QLabel(
+            "Review 모든 split 개선도와 타깃×분할 조건 피벗을 한눈에 확인/필터링합니다.\n"
+            "Full Tree를 실행하면 아래 표가 갱신되며, 필터로 특정 타깃·조건을 좁혀 볼 수 있습니다."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
         # Show all splits from the built tree at once
         all_box = QtWidgets.QGroupBox("All Splits (Full Tree)")
         bl_all = QtWidgets.QVBoxLayout(all_box)
@@ -2841,6 +2858,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.tbl_dt_split_pivot = DataFrameTable(float_decimals=3)
         pv.addWidget(self.tbl_dt_split_pivot, 1)
         layout.addWidget(pivot_box, 1)
+
+        # View / Filter helper box for future edits
+        edit_box = QtWidgets.QGroupBox("View / Filter Controls")
+        eb = QtWidgets.QVBoxLayout(edit_box)
+        eb.addWidget(QtWidgets.QLabel("필요한 타깃/분할 조건을 선택·필터링해 개선도 표를 좁혀 볼 수 있습니다."))
+        layout.addWidget(edit_box)
 
     def _compute_full_tree_internal(self, dep: str, ind: str):
         df = self.state.df
@@ -3098,7 +3121,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         tbl.set_df(view)
 
     # -------------------------------------------------------------------------
-    # Tab 6: Group & Compose
+    # Tab 7: Group & Compose
     # -------------------------------------------------------------------------
     def _build_tab_grouping(self):
         tab = QtWidgets.QWidget()
@@ -3361,7 +3384,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Compose Error", e)
 
     # -------------------------------------------------------------------------
-    # Tab 7: Segmentation Setting (Demand Space)
+    # Tab 8: Segmentation Setting (Demand Space)
     # -------------------------------------------------------------------------
     def _build_tab_seg_setting(self):
         tab = QtWidgets.QWidget()
@@ -3522,7 +3545,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 # =============================================================================
 
     # -------------------------------------------------------------------------
-    # Tab 7 (cont): Demand Space Analysis Logic
+    # Tab 8 (cont): Demand Space Analysis Logic
     # -------------------------------------------------------------------------
     def _run_demand_space(self):
         try:
@@ -3863,7 +3886,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         return Vz, cols
 
     # -------------------------------------------------------------------------
-    # Tab 8: Segmentation Editing
+    # Tab 9: Segmentation Editing
     # -------------------------------------------------------------------------
     def _build_tab_seg_editing(self):
         tab = QtWidgets.QWidget()
@@ -4105,7 +4128,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Rename Error", e)
 
     # -------------------------------------------------------------------------
-    # Tab 9: Export
+    # Tab 10: Export
     # -------------------------------------------------------------------------
     def _build_tab_export(self):
         tab = QtWidgets.QWidget()
@@ -4211,7 +4234,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Export Error", e)
 
     # -------------------------------------------------------------------------
-    # Tab 10: AI Assistant (RAG Chatbot) with Retry Logic
+    # Tab 11: AI Assistant (RAG Chatbot) with Retry Logic
     # -------------------------------------------------------------------------
     def _build_tab_rag(self):
         tab = QtWidgets.QWidget()
