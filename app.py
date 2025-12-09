@@ -243,6 +243,9 @@ class AppState:
     dt_full_selected: Tuple[Optional[str], Optional[str]] = (None, None)
     dt_full_split_view: Optional[pd.DataFrame] = None  # formatted split summary for the All Splits table
     dt_full_split_pivot: Optional[pd.DataFrame] = None  # pivot: rows=split condition, cols=dep, val=improve
+    dt_selected_deps: Optional[List[str]] = None
+    dt_selected_inds: Optional[List[str]] = None
+    dt_edit_group_map: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
     # Demand Space Data
     demand_mode: str = "Segments-as-points"
@@ -1989,6 +1992,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, c)
                 self.lst_delete_cols.addItem(item)
 
+        self._refresh_dt_edit_var_options()
+
     # -------------------------------------------------------------------------
     # [v8.1] Variable Type Manager
     # -------------------------------------------------------------------------
@@ -2026,6 +2031,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if not hasattr(self.state, "dt_importance_summary"):
                     self.state.dt_importance_summary = None
+                if not hasattr(self.state, "dt_selected_deps"):
+                    self.state.dt_selected_deps = None
+                if not hasattr(self.state, "dt_selected_inds"):
+                    self.state.dt_selected_inds = None
+                if not hasattr(self.state, "dt_edit_group_map"):
+                    self.state.dt_edit_group_map = {}
 
                 if self.state.df is not None:
                     self.tbl_preview.set_df(self.state.df)
@@ -2690,7 +2701,22 @@ class IntegratedApp(QtWidgets.QMainWindow):
             ind_vars = [c for c in ind_vars if c not in deps and c != "resp_id"]
 
             if len(ind_vars) == 0:
-                raise RuntimeError("No independent variables selected. Please check predictors.")
+                # If user didn't check/select, fall back to all categorical predictors (seg/demographic)
+                fallback = [
+                    c for c in df.columns
+                    if c not in deps and c != "resp_id" and self.state.is_categorical(c, df[c])
+                ]
+
+                if not fallback:
+                    raise RuntimeError(
+                        "No independent variables selected. "
+                        "Check predictors or mark categorical columns in Variable Type Manager."
+                    )
+
+                ind_vars = fallback
+                self._set_status(
+                    "No predictors selected → auto-using categorical columns as pivots."
+                )
 
             best_rows = []
             pivot = pd.DataFrame(index=ind_vars, columns=deps, dtype=float)
@@ -2770,6 +2796,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.dt_improve_pivot = pivot_reset
             self.state.dt_split_best = best_df
             self.state.dt_importance_summary = importance_summary
+            self.state.dt_selected_deps = deps
+            self.state.dt_selected_inds = ind_vars
 
             self.cmb_dt_full_dep.clear()
             self.cmb_dt_full_dep.addItems(deps)
@@ -2782,11 +2810,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.cmb_split_ind.addItems(ind_vars)
 
             self._refresh_split_path_options()
+            self._refresh_dt_edit_var_options()
 
             if self.tbl_dt_pivot.rowCount() > 0:
                 self.tbl_dt_pivot.selectRow(0)
 
-            self._set_status("Decision Tree analysis completed.")
+            used_msg = (
+                f"Targets: {len(deps)} | Predictors (rows): {len(ind_vars)}"
+            )
+            self._set_status(f"Decision Tree analysis completed. {used_msg}")
 
         except Exception as e:
             self.state.last_error = str(e)
@@ -2983,48 +3015,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
         dlay.addWidget(self.lbl_split_imp)
         self.tbl_split_detail = DataFrameTable(float_decimals=2)
         dlay.addWidget(self.tbl_split_detail, 1)
-        bl.addWidget(detail_box, 2)
-
-        path_box = QtWidgets.QGroupBox("Split Path List by Variable")
-        play = QtWidgets.QVBoxLayout(path_box)
-
-        filter_row = QtWidgets.QHBoxLayout()
-        self.chk_path_filter = QtWidgets.QCheckBox("Filter to selected variables")
-        self.chk_path_filter.setChecked(True)
-        self.chk_path_filter.toggled.connect(self._update_split_path_table)
-        self.chk_path_multi = QtWidgets.QCheckBox("Multi-select")
-        self.chk_path_multi.toggled.connect(self._toggle_path_multi_mode)
-
-        self.cmb_path_var = QtWidgets.QComboBox()
-        self.cmb_path_var.currentIndexChanged.connect(self._update_split_path_table)
-
-        self.lst_path_vars = QtWidgets.QListWidget()
-        self.lst_path_vars.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.lst_path_vars.itemSelectionChanged.connect(self._update_split_path_table)
-        self.lst_path_vars.setVisible(False)
-
-        filter_row.addWidget(QtWidgets.QLabel("Variable"))
-        filter_row.addWidget(self.cmb_path_var, 2)
-        filter_row.addWidget(self.lst_path_vars, 2)
-        filter_row.addWidget(self.chk_path_multi)
-        filter_row.addWidget(self.chk_path_filter)
-        play.addLayout(filter_row)
-
-        self.tbl_split_paths = DataFrameTable(float_decimals=2)
-        play.addWidget(self.tbl_split_paths, 1)
-
-        path_hint = QtWidgets.QLabel("Select variables to see all split nodes and their paths for the full tree run.")
-        path_hint.setStyleSheet("color:#546e7a;")
-        play.addWidget(path_hint)
-
-        bl.addWidget(path_box, 3)
+        bl.addWidget(detail_box, 1)
+        note = QtWidgets.QLabel(
+            "Split-level path summaries have moved to the new Decision Tree Editing tab."
+        )
+        note.setStyleSheet("color:#546e7a;")
+        bl.addWidget(note)
         splitter.addWidget(botw)
 
-        splitter.setSizes([240, 680])
+        splitter.setSizes([260, 660])
         layout.addWidget(splitter, 1)
 
         self._refresh_split_path_options()
-        self._update_split_path_table()
 
     def _compute_full_tree_internal(self, dep: str, ind: str):
         df = self.state.df
@@ -3103,8 +3105,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.cmb_split_select.setCurrentIndex(0)
                 self._split_update_detail()
 
-            self._select_path_filter_variable(ind)
-            self._update_split_path_table()
+            if hasattr(self, "_select_path_filter_variable"):
+                self._select_path_filter_variable(ind)
+            if hasattr(self, "_update_split_path_table"):
+                self._update_split_path_table()
 
             self._set_status(f"Tree Built: dep={dep}, ind={ind} (task={task})")
         except Exception as e:
@@ -3202,6 +3206,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Split Detail Error", e)
 
     def _refresh_split_path_options(self):
+        if not hasattr(self, "cmb_path_var") or not hasattr(self, "lst_path_vars"):
+            return
         vars_available: List[str] = []
         if getattr(self.state, "dt_importance_summary", None) is not None:
             vars_available = self.state.dt_importance_summary.get("ind", pd.Series(dtype=str)).dropna().astype(str).tolist()
@@ -3250,6 +3256,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 break
 
     def _update_split_path_table(self):
+        if not hasattr(self, "tbl_split_paths"):
+            return
         paths_df = getattr(self.state, "dt_full_split_paths", None)
         if paths_df is None or paths_df.empty:
             paths_df = getattr(self.state, "dt_full_path_info", None)
@@ -3268,17 +3276,293 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # Optional compatibility: Tab 5 (Legacy) Decision Tree Editing alias
     # -------------------------------------------------------------------------
     def _build_tab_dt_editing(self):
-        """
-        Backward-compatible alias for historical tab builder name.
+        if getattr(self, "_dt_editing_built", False):
+            return
+        self._dt_editing_built = True
 
-        Some entry points referenced ``_build_tab_dt_editing`` even though the
-        Decision Tree UI was consolidated into ``_build_tab_dt_results``. This
-        shim ensures those calls no longer raise ``AttributeError`` while reusing
-        the current results tab layout.
-        """
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "Decision Tree Editing")
 
-        # Ensure the Decision Tree Results tab exists without duplicating it.
-        self._build_tab_dt_results()
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        info = QtWidgets.QLabel(
+            "의사결정나무 결과를 기준으로 구분변수별 피벗/그룹핑을 직접 편집합니다.<br>"
+            "• 위의 콤보박스에서 구분변수를 선택하면 좌측 열에 하위 요인(범주)이 나열됩니다.<br>"
+            "• 상단 분석에서 선택했던 모든 목적변수가 가로 축으로 표시되고, 최적 분할 시 어디에 속했는지(left/right)를 보여줍니다.<br>"
+            "• 아래에서 범주를 선택해 라벨을 합치고 저장하면 *_seg 컬럼으로 바로 생성됩니다."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        filter_row = QtWidgets.QHBoxLayout()
+        self.cmb_dt_edit_var = QtWidgets.QComboBox()
+        self.cmb_dt_edit_var.currentIndexChanged.connect(self._load_dt_edit_grid)
+        filter_row.addWidget(QtWidgets.QLabel("구분변수 선택"))
+        filter_row.addWidget(self.cmb_dt_edit_var, 3)
+
+        self.lbl_dt_edit_targets = QtWidgets.QLabel("(목적변수: 분석 실행 후 자동 채움)")
+        self.lbl_dt_edit_targets.setStyleSheet("color:#546e7a;")
+        filter_row.addWidget(self.lbl_dt_edit_targets, 2)
+        layout.addLayout(filter_row)
+
+        self.tbl_dt_edit_grid = DataFrameTable(editable=True, float_decimals=2, max_col_width=260)
+        layout.addWidget(self.tbl_dt_edit_grid, 1)
+
+        merge_row = QtWidgets.QHBoxLayout()
+        self.txt_dt_edit_merge_label = QtWidgets.QLineEdit("Merged")
+        self.btn_dt_edit_merge = QtWidgets.QPushButton("선택 범주 묶기 (라벨 적용)")
+        style_button(self.btn_dt_edit_merge, level=1)
+        self.btn_dt_edit_merge.clicked.connect(self._dt_edit_merge_selected)
+        self.btn_dt_edit_reset = QtWidgets.QPushButton("원본 라벨로 초기화")
+        style_button(self.btn_dt_edit_reset, level=1)
+        self.btn_dt_edit_reset.clicked.connect(self._reset_dt_edit_groups)
+
+        merge_row.addWidget(QtWidgets.QLabel("새 그룹 라벨"))
+        merge_row.addWidget(self.txt_dt_edit_merge_label, 2)
+        merge_row.addWidget(self.btn_dt_edit_merge)
+        merge_row.addWidget(self.btn_dt_edit_reset)
+        merge_row.addStretch(1)
+        layout.addLayout(merge_row)
+
+        apply_row = QtWidgets.QHBoxLayout()
+        self.txt_dt_edit_newcol = QtWidgets.QLineEdit("")
+        self.txt_dt_edit_newcol.setPlaceholderText("예: gender_dt_seg")
+        self.btn_dt_edit_apply = QtWidgets.QPushButton("그룹핑 저장 → 새 *_seg 생성")
+        style_button(self.btn_dt_edit_apply, level=2)
+        self.btn_dt_edit_apply.clicked.connect(self._apply_dt_edit_grouping)
+
+        apply_row.addWidget(QtWidgets.QLabel("새 컬럼 이름"))
+        apply_row.addWidget(self.txt_dt_edit_newcol, 3)
+        apply_row.addWidget(self.btn_dt_edit_apply)
+        layout.addLayout(apply_row)
+
+        self._refresh_dt_edit_var_options()
+        self._load_dt_edit_grid()
+
+    def _refresh_dt_edit_var_options(self):
+        if not hasattr(self, "cmb_dt_edit_var"):
+            return
+
+        current = self.cmb_dt_edit_var.currentText()
+        df = self.state.df
+        vars_available: List[str] = []
+
+        if self.state.dt_split_best is not None and not self.state.dt_split_best.empty:
+            vars_available = (
+                self.state.dt_split_best.get("ind", pd.Series(dtype=str))
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+        elif self.state.dt_selected_inds:
+            vars_available = list(self.state.dt_selected_inds)
+        elif df is not None:
+            vars_available = [c for c in df.columns if self.state.is_categorical(c)]
+
+        if df is not None:
+            vars_available = [v for v in vars_available if v in df.columns]
+
+        vars_available = sorted(dict.fromkeys(vars_available))
+
+        self.cmb_dt_edit_var.blockSignals(True)
+        self.cmb_dt_edit_var.clear()
+        self.cmb_dt_edit_var.addItems(vars_available)
+        if current:
+            idx = self.cmb_dt_edit_var.findText(current)
+            if idx >= 0:
+                self.cmb_dt_edit_var.setCurrentIndex(idx)
+        self.cmb_dt_edit_var.blockSignals(False)
+
+    def _parse_items_list(self, val: Any) -> List[str]:
+        if val is None:
+            return []
+        if isinstance(val, (list, tuple, set, np.ndarray, pd.Series)):
+            return [str(v) for v in val]
+        try:
+            parsed = ast.literal_eval(str(val))
+            if isinstance(parsed, (list, tuple, set, np.ndarray, pd.Series)):
+                return [str(v) for v in parsed]
+        except Exception:
+            pass
+        txt = str(val)
+        if txt in ["", "None", "nan"]:
+            return []
+        return [txt]
+
+    def _get_dt_edit_targets(self) -> List[str]:
+        if self.state.dt_selected_deps:
+            return list(self.state.dt_selected_deps)
+        if self.state.dt_split_best is not None and not self.state.dt_split_best.empty:
+            return (
+                self.state.dt_split_best.get("dep", pd.Series(dtype=str))
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+        df = self.state.df
+        if df is None:
+            return []
+        fac_cols = [c for c in df.columns if str(c).startswith("Factor")]
+        return fac_cols
+
+    def _load_dt_edit_grid(self):
+        if not hasattr(self, "tbl_dt_edit_grid"):
+            return
+
+        df = self.state.df
+        var = self.cmb_dt_edit_var.currentText().strip() if hasattr(self, "cmb_dt_edit_var") else ""
+        targets = self._get_dt_edit_targets()
+
+        self.lbl_dt_edit_targets.setText(
+            "목적변수: " + (", ".join(targets) if targets else "(분석 실행 필요)")
+        )
+
+        if df is None or not var:
+            self.tbl_dt_edit_grid.set_df(None)
+            return
+
+        cats = (
+            pd.Series(df[var].dropna().unique())
+            .astype(str)
+            .sort_values()
+            .tolist()
+        )
+
+        split_info: Dict[str, Dict[str, set]] = {}
+        if self.state.dt_split_best is not None and not self.state.dt_split_best.empty:
+            sub = self.state.dt_split_best[self.state.dt_split_best["ind"] == var]
+            for dep in targets:
+                cand = sub[sub["dep"] == dep]
+                if cand.empty:
+                    continue
+                row = cand.loc[cand["improve_rel"].idxmax()]
+                if not str(row.get("split_type", "")).startswith("categorical"):
+                    continue
+                left_set = set(self._parse_items_list(row.get("left_items")))
+                right_set = set(self._parse_items_list(row.get("right_items")))
+                split_info[dep] = {"left": left_set, "right": right_set}
+
+        user_map = self.state.dt_edit_group_map.get(var, {})
+        rows = []
+        for cat in cats:
+            row = {"level": cat}
+            for dep in targets:
+                info = split_info.get(dep)
+                if not info:
+                    row[dep] = ""
+                    continue
+                if cat in info.get("left", set()):
+                    row[dep] = "Left"
+                elif info.get("right"):
+                    row[dep] = "Right" if cat in info.get("right", set()) else "Right(Else)"
+                elif info.get("left"):
+                    row[dep] = "Right(Else)"
+                else:
+                    row[dep] = ""
+            row["custom_group"] = user_map.get(cat, cat)
+            rows.append(row)
+
+        view = pd.DataFrame(rows)
+        cols = ["level"] + targets + ["custom_group"] if targets else ["level", "custom_group"]
+        view = view[cols]
+
+        if not var:
+            self.txt_dt_edit_newcol.setPlaceholderText("예: gender_dt_seg")
+        else:
+            suggestion = f"{var}_dt_seg"
+            if not self.txt_dt_edit_newcol.text().strip():
+                self.txt_dt_edit_newcol.setText(suggestion if suggestion.endswith("_seg") else suggestion + "_seg")
+
+        self.tbl_dt_edit_grid.set_df(view)
+
+    def _extract_dt_edit_df(self) -> pd.DataFrame:
+        table = self.tbl_dt_edit_grid
+        cols = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+        data = []
+        for r in range(table.rowCount()):
+            row = {}
+            for c, col_name in enumerate(cols):
+                item = table.item(r, c)
+                row[col_name] = item.text() if item is not None else ""
+            data.append(row)
+        return pd.DataFrame(data)
+
+    def _dt_edit_merge_selected(self):
+        try:
+            label = self.txt_dt_edit_merge_label.text().strip()
+            if not label:
+                raise RuntimeError("라벨을 입력하세요.")
+            sel = self.tbl_dt_edit_grid.selectedItems()
+            if not sel:
+                raise RuntimeError("묶을 범주 행을 선택하세요.")
+
+            rows_idx = sorted(set([it.row() for it in sel]))
+            df_current = self._extract_dt_edit_df()
+            for r in rows_idx:
+                if "custom_group" in df_current.columns and r < len(df_current):
+                    df_current.at[r, "custom_group"] = label
+
+            var = self.cmb_dt_edit_var.currentText().strip()
+            if var:
+                self.state.dt_edit_group_map[var] = {
+                    row["level"]: row.get("custom_group", row.get("level", ""))
+                    for _, row in df_current.iterrows()
+                    if str(row.get("level", "")) != ""
+                }
+
+            self.tbl_dt_edit_grid.set_df(df_current)
+            self._set_status("선택한 범주가 새 라벨로 묶였습니다.")
+        except Exception as e:
+            show_error(self, "Grouping Error", e)
+
+    def _reset_dt_edit_groups(self):
+        try:
+            var = self.cmb_dt_edit_var.currentText().strip()
+            if var in self.state.dt_edit_group_map:
+                self.state.dt_edit_group_map.pop(var, None)
+            self._load_dt_edit_grid()
+            self._set_status("라벨이 원본 값으로 초기화되었습니다.")
+        except Exception as e:
+            show_error(self, "Reset Error", e)
+
+    def _apply_dt_edit_grouping(self):
+        try:
+            self._ensure_df()
+            df = self.state.df
+            var = self.cmb_dt_edit_var.currentText().strip()
+            if not var:
+                raise RuntimeError("구분변수를 선택하세요.")
+
+            table_df = self._extract_dt_edit_df()
+            if table_df.empty:
+                raise RuntimeError("그룹핑할 항목이 없습니다.")
+
+            newcol = self.txt_dt_edit_newcol.text().strip()
+            if not newcol:
+                newcol = f"{var}_dt_seg"
+            if not newcol.endswith("_seg"):
+                newcol = newcol + "_seg"
+
+            mapping = {}
+            for _, row in table_df.iterrows():
+                key = str(row.get("level", ""))
+                if key == "":
+                    continue
+                val = str(row.get("custom_group", key)).strip()
+                mapping[key] = val if val else key
+
+            s = df[var].astype(str)
+            df[newcol] = s.map(mapping).fillna(s)
+
+            self.state.df = df
+            self.state.dt_edit_group_map[var] = mapping
+            self.tbl_preview.set_df(df)
+            self._refresh_all_column_lists()
+            self._set_status(f"새 그룹 컬럼 생성: {newcol}")
+        except Exception as e:
+            show_error(self, "Save Grouping Error", e)
 
     # -------------------------------------------------------------------------
     # Tab 7: Group & Compose
