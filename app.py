@@ -3330,17 +3330,25 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.dt_label_alias.clear()
         self._update_dt_editing_views()
 
-    def _refresh_dt_editing_sources(self):
+    def _get_dt_pivot_view(self) -> Optional[pd.DataFrame]:
         pivot = self.state.dt_improve_pivot
+        if pivot is None or pivot.empty:
+            return None
+        if "ind" in pivot.columns:
+            return pivot.set_index("ind")
+        return pivot
+
+    def _refresh_dt_editing_sources(self):
+        pivot_view = self._get_dt_pivot_view()
         self.lst_dt_edit_pred.blockSignals(True)
         self.lst_dt_edit_dep.blockSignals(True)
         self.lst_dt_edit_pred.clear()
         self.lst_dt_edit_dep.clear()
 
-        if pivot is not None and not pivot.empty:
-            for idx in pivot.index:
+        if pivot_view is not None:
+            for idx in pivot_view.index:
                 self.lst_dt_edit_pred.addItem(str(idx))
-            for col in pivot.columns:
+            for col in pivot_view.columns:
                 self.lst_dt_edit_dep.addItem(str(col))
 
             self._select_all_items(self.lst_dt_edit_pred, True)
@@ -3351,10 +3359,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._update_dt_editing_views()
 
     def _update_dt_editing_views(self):
-        pivot = self.state.dt_improve_pivot
+        pivot_view = self._get_dt_pivot_view()
         best = self.state.dt_split_best
 
-        if pivot is None or pivot.empty:
+        if pivot_view is None:
             self.tbl_dt_edit_pivot.set_df(None)
             self.tbl_dt_edit_bestsplit.set_df(None)
             self.lbl_dt_edit_summary.setText("Pivot not ready. Run Decision Tree first.")
@@ -3362,17 +3370,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         rows = self._selected_items(self.lst_dt_edit_pred)
         cols = self._selected_items(self.lst_dt_edit_dep)
-        view = pivot.copy()
+        view = pivot_view.copy()
         if rows:
             view = view.loc[[r for r in rows if r in view.index]]
         if cols:
             view = view[[c for c in cols if c in view.columns]]
 
         alias = self.state.dt_label_alias
-        view = view.copy()
-        view.index = [alias.get(idx, idx) for idx in view.index]
-        view.columns = [alias.get(c, c) for c in view.columns]
-        self.tbl_dt_edit_pivot.set_df(view)
+        view_alias = view.copy()
+        view_alias.index = [alias.get(idx, idx) for idx in view_alias.index]
+        view_alias.columns = [alias.get(c, c) for c in view_alias.columns]
+        display_df = view_alias.reset_index().rename(columns={"index": "ind"})
+        self.tbl_dt_edit_pivot.set_df(display_df)
 
         if best is not None and not best.empty:
             bview = best.copy()
@@ -3390,8 +3399,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         else:
             self.tbl_dt_edit_bestsplit.set_df(None)
 
-        total_rows = len(pivot.index)
-        total_cols = len(pivot.columns)
+        total_rows = len(pivot_view.index)
+        total_cols = len(pivot_view.columns)
         msg = f"Showing {len(view.index)}/{total_rows} predictors, {len(view.columns)}/{total_cols} targets."
         if alias:
             msg += f"  Aliases applied: {len(alias)}"
