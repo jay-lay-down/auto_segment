@@ -4049,6 +4049,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
         seg_matrix = pivot_stack.T
         seg_matrix["n"] = seg_matrix.index.map(cnt.get).fillna(0).astype(int)
 
+        # Initialize feature list early so it always exists, even if factor logic is skipped
+        feat_cols = [c for c in seg_matrix.columns if c != "n"]
+
         # Optional PCA/Factor profile mean features (align with R flow: target×seg pivot + PCA profile)
         if use_factors and self.state.factor_scores is not None:
             fac_cols = [c for c in self.state.factor_scores.columns if str(c).startswith("Factor")]
@@ -4059,9 +4062,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 fac_mean = fac_df.groupby("_SEG_LABEL_")[fac_cols].mean()
                 seg_matrix = seg_matrix.join(fac_mean, how="left")
                 seg_matrix[fac_cols] = seg_matrix[fac_cols].fillna(0.0)
-
-        # Align naming with caller (`feat_cols`) to avoid NameError confusion
-        feat_cols = [c for c in seg_matrix.columns if c != "n"]
+                feat_cols = [c for c in seg_matrix.columns if c != "n"]
         labels_by_row = seg_labels_full.copy()
         return seg_matrix, feat_cols, labels_by_row
 
