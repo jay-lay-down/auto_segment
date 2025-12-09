@@ -232,6 +232,9 @@ class AppState:
     dt_split_best: Optional[pd.DataFrame] = None
     dt_importance_summary: Optional[pd.DataFrame] = None
 
+    # Decision tree editing/view overrides
+    dt_label_alias: Dict[str, str] = field(default_factory=dict)
+
     # Decision tree full Analysis (Results Tab)
     dt_full_nodes: Optional[pd.DataFrame] = None
     dt_full_split_groups: Optional[pd.DataFrame] = None
@@ -1822,6 +1825,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._build_tab_recode()
         self._build_tab_factor()
         self._build_tab_dt_setting()
+        self._build_tab_dt_editing()
         self._build_tab_dt_results()
         self._build_tab_dt_editing()
         self._build_tab_grouping()
@@ -2011,6 +2015,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if not hasattr(self.state, "dt_importance_summary"):
                     self.state.dt_importance_summary = None
+                if not hasattr(self.state, "dt_label_alias"):
+                    self.state.dt_label_alias = {}
 
                 if self.state.df is not None:
                     self.tbl_preview.set_df(self.state.df)
@@ -2026,6 +2032,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     self.tbl_dt_pivot.set_df(self.state.dt_improve_pivot)
                 if getattr(self.state, "dt_importance_summary", None) is not None:
                     self.tbl_dt_importance.set_df(self.state.dt_importance_summary)
+
+                self._refresh_dt_editing_sources()
 
                 self.statusBar().showMessage(f"Project loaded from {path}")
             except Exception as e:
@@ -2169,6 +2177,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.dt_improve_pivot = None
         self.state.dt_split_best = None
         self.state.dt_importance_summary = None
+        self.state.dt_label_alias = {}
         self.state.dt_full_nodes = None
         self.state.dt_full_split_groups = None
         self.state.dt_full_path_info = None
@@ -2189,6 +2198,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.tree_viz.set_tree_data(pd.DataFrame())
         if hasattr(self, "lbl_split_imp"):
             self.lbl_split_imp.setText("No split selected.")
+        if hasattr(self, "tbl_dt_edit_pivot"):
+            self.tbl_dt_edit_pivot.set_df(None)
+        if hasattr(self, "tbl_dt_edit_bestsplit"):
+            self.tbl_dt_edit_bestsplit.set_df(None)
+        if hasattr(self, "lbl_dt_edit_summary"):
+            self.lbl_dt_edit_summary.setText("Pivot not ready. Run Decision Tree first.")
+        if hasattr(self, "lst_dt_edit_pred"):
+            self.lst_dt_edit_pred.clear()
+        if hasattr(self, "lst_dt_edit_dep"):
+            self.lst_dt_edit_dep.clear()
 
     def _reset_downstream_state(self):
         self._clear_factor_results()
@@ -2676,6 +2695,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.dt_improve_pivot = pivot_reset
             self.state.dt_split_best = best_df
             self.state.dt_importance_summary = importance_summary
+
+            self._refresh_dt_editing_sources()
 
             self.cmb_dt_full_dep.clear()
             self.cmb_dt_full_dep.addItems(deps)
@@ -3171,20 +3192,213 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.tbl_split_paths.set_df(df_view)
 
     # -------------------------------------------------------------------------
-    # Optional compatibility: Tab 5 (Legacy) Decision Tree Editing alias
+    # Tab 5: Decision Tree Editing (Pivot View & Label Tweaks)
     # -------------------------------------------------------------------------
     def _build_tab_dt_editing(self):
-        """
-        Backward-compatible alias for historical tab builder name.
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "Decision Tree Editing")
 
-        Some entry points referenced ``_build_tab_dt_editing`` even though the
-        Decision Tree UI was consolidated into ``_build_tab_dt_results``. This
-        shim ensures those calls no longer raise ``AttributeError`` while reusing
-        the current results tab layout.
-        """
+        layout = QtWidgets.QVBoxLayout(tab)
 
-        # Ensure the Decision Tree Results tab exists without duplicating it.
-        self._build_tab_dt_results()
+        info = QtWidgets.QLabel(
+            "<b>Decision Tree Editing</b><br>"
+            "- Re-open the pivot after running DT to review multiple targets.<br>"
+            "- Select predictors/targets to filter the pivot.<br>"
+            "- Enter a display alias to adjust how variables appear in the pivot/best split tables."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        ctrl = QtWidgets.QHBoxLayout()
+
+        pred_box = QtWidgets.QGroupBox("Pivot Rows (Predictors)")
+        pred_layout = QtWidgets.QVBoxLayout(pred_box)
+        self.lst_dt_edit_pred = QtWidgets.QListWidget()
+        self.lst_dt_edit_pred.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.lst_dt_edit_pred.itemSelectionChanged.connect(self._update_dt_editing_views)
+        pred_layout.addWidget(self.lst_dt_edit_pred)
+
+        pbtns = QtWidgets.QHBoxLayout()
+        self.btn_dt_edit_pred_all = QtWidgets.QPushButton("Select All")
+        self.btn_dt_edit_pred_none = QtWidgets.QPushButton("Clear")
+        self.btn_dt_edit_pred_all.clicked.connect(lambda: self._select_all_items(self.lst_dt_edit_pred, True))
+        self.btn_dt_edit_pred_none.clicked.connect(lambda: self._select_all_items(self.lst_dt_edit_pred, False))
+        pbtns.addWidget(self.btn_dt_edit_pred_all)
+        pbtns.addWidget(self.btn_dt_edit_pred_none)
+        pred_layout.addLayout(pbtns)
+
+        ctrl.addWidget(pred_box, 1)
+
+        dep_box = QtWidgets.QGroupBox("Pivot Columns (Targets)")
+        dep_layout = QtWidgets.QVBoxLayout(dep_box)
+        self.lst_dt_edit_dep = QtWidgets.QListWidget()
+        self.lst_dt_edit_dep.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.lst_dt_edit_dep.itemSelectionChanged.connect(self._update_dt_editing_views)
+        dep_layout.addWidget(self.lst_dt_edit_dep)
+
+        dbtns = QtWidgets.QHBoxLayout()
+        self.btn_dt_edit_dep_all = QtWidgets.QPushButton("Select All")
+        self.btn_dt_edit_dep_none = QtWidgets.QPushButton("Clear")
+        self.btn_dt_edit_dep_all.clicked.connect(lambda: self._select_all_items(self.lst_dt_edit_dep, True))
+        self.btn_dt_edit_dep_none.clicked.connect(lambda: self._select_all_items(self.lst_dt_edit_dep, False))
+        dbtns.addWidget(self.btn_dt_edit_dep_all)
+        dbtns.addWidget(self.btn_dt_edit_dep_none)
+        dep_layout.addLayout(dbtns)
+
+        ctrl.addWidget(dep_box, 1)
+
+        alias_box = QtWidgets.QGroupBox("Display Label (Alias)")
+        alias_layout = QtWidgets.QVBoxLayout(alias_box)
+        alias_layout.addWidget(QtWidgets.QLabel("선택된 변수의 보기 이름(표시용)을 바꾸고 싶다면 별칭을 입력하세요."))
+        self.txt_dt_label_alias = QtWidgets.QLineEdit()
+        self.txt_dt_label_alias.setPlaceholderText("예: Age -> 나이")
+        alias_layout.addWidget(self.txt_dt_label_alias)
+
+        abtns = QtWidgets.QHBoxLayout()
+        self.btn_dt_alias_apply = QtWidgets.QPushButton("Apply to Selection")
+        self.btn_dt_alias_reset_sel = QtWidgets.QPushButton("Reset Selection")
+        self.btn_dt_alias_reset_all = QtWidgets.QPushButton("Reset All")
+        self.btn_dt_alias_apply.clicked.connect(self._apply_dt_label_alias)
+        self.btn_dt_alias_reset_sel.clicked.connect(self._reset_dt_label_alias_selection)
+        self.btn_dt_alias_reset_all.clicked.connect(self._reset_dt_label_alias_all)
+        for b in [self.btn_dt_alias_apply, self.btn_dt_alias_reset_sel, self.btn_dt_alias_reset_all]:
+            style_button(b, level=1)
+        abtns.addWidget(self.btn_dt_alias_apply)
+        abtns.addWidget(self.btn_dt_alias_reset_sel)
+        abtns.addWidget(self.btn_dt_alias_reset_all)
+        alias_layout.addLayout(abtns)
+
+        ctrl.addWidget(alias_box, 1)
+
+        layout.addLayout(ctrl)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+
+        top = QtWidgets.QWidget()
+        top_layout = QtWidgets.QVBoxLayout(top)
+        top_layout.addWidget(QtWidgets.QLabel("Improvement Pivot (Filtered)"))
+        self.tbl_dt_edit_pivot = DataFrameTable(float_decimals=2)
+        top_layout.addWidget(self.tbl_dt_edit_pivot, 1)
+        self.lbl_dt_edit_summary = QtWidgets.QLabel("Pivot not ready. Run Decision Tree first.")
+        self.lbl_dt_edit_summary.setStyleSheet("color:#546e7a;")
+        top_layout.addWidget(self.lbl_dt_edit_summary)
+        splitter.addWidget(top)
+
+        bottom = QtWidgets.QWidget()
+        bot_layout = QtWidgets.QVBoxLayout(bottom)
+        bot_layout.addWidget(QtWidgets.QLabel("Best Split Detail (by predictor/target filter)"))
+        self.tbl_dt_edit_bestsplit = DataFrameTable(float_decimals=2)
+        bot_layout.addWidget(self.tbl_dt_edit_bestsplit, 1)
+        splitter.addWidget(bottom)
+
+        splitter.setSizes([420, 260])
+        layout.addWidget(splitter, 1)
+
+        # Initial fill
+        self._refresh_dt_editing_sources()
+
+    def _select_all_items(self, widget: QtWidgets.QListWidget, select: bool):
+        for i in range(widget.count()):
+            widget.item(i).setSelected(select)
+
+    def _selected_items(self, widget: QtWidgets.QListWidget) -> List[str]:
+        return [it.text() for it in widget.selectedItems()]
+
+    def _apply_dt_label_alias(self):
+        alias = self.txt_dt_label_alias.text().strip()
+        if not alias:
+            return
+        targets = self._selected_items(self.lst_dt_edit_dep) + self._selected_items(self.lst_dt_edit_pred)
+        for key in targets:
+            self.state.dt_label_alias[key] = alias
+        self._update_dt_editing_views()
+
+    def _reset_dt_label_alias_selection(self):
+        targets = self._selected_items(self.lst_dt_edit_dep) + self._selected_items(self.lst_dt_edit_pred)
+        for key in targets:
+            if key in self.state.dt_label_alias:
+                del self.state.dt_label_alias[key]
+        self._update_dt_editing_views()
+
+    def _reset_dt_label_alias_all(self):
+        self.state.dt_label_alias.clear()
+        self._update_dt_editing_views()
+
+    def _get_dt_pivot_view(self) -> Optional[pd.DataFrame]:
+        pivot = self.state.dt_improve_pivot
+        if pivot is None or pivot.empty:
+            return None
+        if "ind" in pivot.columns:
+            return pivot.set_index("ind")
+        return pivot
+
+    def _refresh_dt_editing_sources(self):
+        pivot_view = self._get_dt_pivot_view()
+        self.lst_dt_edit_pred.blockSignals(True)
+        self.lst_dt_edit_dep.blockSignals(True)
+        self.lst_dt_edit_pred.clear()
+        self.lst_dt_edit_dep.clear()
+
+        if pivot_view is not None:
+            for idx in pivot_view.index:
+                self.lst_dt_edit_pred.addItem(str(idx))
+            for col in pivot_view.columns:
+                self.lst_dt_edit_dep.addItem(str(col))
+
+            self._select_all_items(self.lst_dt_edit_pred, True)
+            self._select_all_items(self.lst_dt_edit_dep, True)
+        self.lst_dt_edit_pred.blockSignals(False)
+        self.lst_dt_edit_dep.blockSignals(False)
+
+        self._update_dt_editing_views()
+
+    def _update_dt_editing_views(self):
+        pivot_view = self._get_dt_pivot_view()
+        best = self.state.dt_split_best
+
+        if pivot_view is None:
+            self.tbl_dt_edit_pivot.set_df(None)
+            self.tbl_dt_edit_bestsplit.set_df(None)
+            self.lbl_dt_edit_summary.setText("Pivot not ready. Run Decision Tree first.")
+            return
+
+        rows = self._selected_items(self.lst_dt_edit_pred)
+        cols = self._selected_items(self.lst_dt_edit_dep)
+        view = pivot_view.copy()
+        if rows:
+            view = view.loc[[r for r in rows if r in view.index]]
+        if cols:
+            view = view[[c for c in cols if c in view.columns]]
+
+        alias = self.state.dt_label_alias
+        view_alias = view.copy()
+        view_alias.index = [alias.get(idx, idx) for idx in view_alias.index]
+        view_alias.columns = [alias.get(c, c) for c in view_alias.columns]
+        display_df = view_alias.reset_index().rename(columns={"index": "ind"})
+        self.tbl_dt_edit_pivot.set_df(display_df)
+
+        if best is not None and not best.empty:
+            bview = best.copy()
+            if rows:
+                bview = bview[bview["ind"].astype(str).isin(rows)]
+            if cols:
+                bview = bview[bview["dep"].astype(str).isin(cols)]
+            if not bview.empty:
+                bview = bview.copy()
+                bview["ind"] = bview["ind"].apply(lambda x: alias.get(x, x))
+                bview["dep"] = bview["dep"].apply(lambda x: alias.get(x, x))
+                self.tbl_dt_edit_bestsplit.set_df(bview)
+            else:
+                self.tbl_dt_edit_bestsplit.set_df(None)
+        else:
+            self.tbl_dt_edit_bestsplit.set_df(None)
+
+        total_rows = len(pivot_view.index)
+        total_cols = len(pivot_view.columns)
+        msg = f"Showing {len(view.index)}/{total_rows} predictors, {len(view.columns)}/{total_cols} targets."
+        if alias:
+            msg += f"  Aliases applied: {len(alias)}"
+        self.lbl_dt_edit_summary.setText(msg)
 
     # -------------------------------------------------------------------------
     # Tab 7: Group & Compose
@@ -3968,55 +4182,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
         feat_cols = [c for c in seg_matrix.columns if c != "n"]
         labels_by_row = df["_SEG_LABEL_"].copy()
         return seg_matrix, feat_cols, labels_by_row
-
-    def _build_variable_profiles(self, var_cols: List[str], targets: List[str]):
-        df = self.state.df.copy()
-
-        if not targets:
-            raise RuntimeError("타깃 변수를 1개 이상 선택해 주세요.")
-        missing_tgt = [t for t in targets if t not in df.columns]
-        if missing_tgt:
-            raise RuntimeError(f"다음 타깃 변수가 데이터에 없습니다: {', '.join(missing_tgt)}")
-
-        missing_vars = [c for c in var_cols if c not in df.columns]
-        if missing_vars:
-            raise RuntimeError(f"다음 변수 컬럼이 없습니다: {', '.join(missing_vars)}")
-
-        long_df = df[targets + var_cols].copy()
-        long_df["_cnt"] = 1
-        melted = long_df.melt(id_vars=targets, value_vars=var_cols, var_name="_VAR_", value_name="_VAL_")
-        melted["_cnt"] = melted["_VAL_"].notna().astype(int)
-
-        pivot_norms: List[pd.DataFrame] = []
-        for tgt in targets:
-            pivot = (
-                melted.pivot_table(
-                    index=tgt,
-                    columns="_VAR_",
-                    values="_cnt",
-                    aggfunc="sum",
-                    fill_value=0,
-                )
-                .astype(float)
-            )
-            pivot = pivot.reindex(columns=var_cols, fill_value=0.0)
-            col_sum = pivot.sum(axis=0)
-            pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
-            pivot_norms.append(pivot_norm)
-
-        if not pivot_norms:
-            raise RuntimeError("피벗을 계산할 수 없습니다. 선택된 타깃/변수를 확인하세요.")
-
-        pivot_stack = pd.concat(pivot_norms, axis=0)
-        if pivot_stack.shape[1] < 2:
-            raise RuntimeError("변수 포인트가 1개뿐입니다. 최소 2개 이상이어야 합니다.")
-
-        var_matrix = pivot_stack.T
-        n_counts = melted.groupby("_VAR_")["_cnt"].sum().reindex(var_cols).fillna(0).astype(int)
-        var_matrix["n"] = n_counts.values
-
-        feature_cols = [c for c in var_matrix.columns if c != "n"]
-        return var_matrix, feature_cols
 
     def _current_segment_labels(self) -> Optional[pd.Series]:
         if self.state.df is None or not self.state.demand_seg_components:
