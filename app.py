@@ -3964,9 +3964,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 seg_matrix = seg_matrix.join(fac_mean, how="left")
                 seg_matrix[fac_cols] = seg_matrix[fac_cols].fillna(0.0)
 
-        feature_cols = [c for c in seg_matrix.columns if c != "n"]
+        # Align naming with caller (`feat_cols`) to avoid NameError confusion
+        feat_cols = [c for c in seg_matrix.columns if c != "n"]
         labels_by_row = df["_SEG_LABEL_"].copy()
-        return seg_matrix, feature_cols, labels_by_row
+        return seg_matrix, feat_cols, labels_by_row
 
     def _build_variable_profiles(self, var_cols: List[str], targets: List[str]):
         df = self.state.df.copy()
