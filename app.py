@@ -313,6 +313,9 @@ def call_openai_api(
         - If success: result is the AI response content
         - If failure: result is the error message
     """
+    if not api_key or not str(api_key).strip():
+        return False, "API key is missing. Please enter a valid key."
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -356,8 +359,11 @@ def call_openai_api(
                 continue
 
             resp.raise_for_status()
-            data = resp.json()
-            answer = data["choices"][0]["message"]["content"]
+            try:
+                data = resp.json()
+                answer = data["choices"][0]["message"]["content"]
+            except (ValueError, KeyError, TypeError) as parse_err:
+                return False, f"Invalid response from server: {parse_err}"
             return True, answer
 
         except requests.exceptions.Timeout:
