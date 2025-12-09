@@ -226,6 +226,7 @@ class AppState:
     factor_scores: Optional[pd.DataFrame] = None
     factor_loadings: Optional[pd.DataFrame] = None
     factor_mode: str = "PCA"
+    factor_ai_names: Dict[str, str] = field(default_factory=dict)
 
     # Decision tree outputs (Setting Tab)
     dt_improve_pivot: Optional[pd.DataFrame] = None
@@ -242,6 +243,10 @@ class AppState:
     dt_full_selected: Tuple[Optional[str], Optional[str]] = (None, None)
     dt_full_split_view: Optional[pd.DataFrame] = None  # formatted split summary for the All Splits table
     dt_full_split_pivot: Optional[pd.DataFrame] = None  # pivot: rows=split condition, cols=dep, val=improve
+    dt_selected_deps: Optional[List[str]] = None
+    dt_selected_inds: Optional[List[str]] = None
+    dt_edit_group_map: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    dt_edit_view_mode: str = "split"  # "split" (좌/우+개선도) or "combo" (모든 조합 개선도)
 
     # Demand Space Data
     demand_mode: str = "Segments-as-points"
@@ -296,6 +301,15 @@ class AppState:
 # -----------------------------------------------------------------------------
 # [v8.1 NEW] API Call Helper with Retry Logic
 # -----------------------------------------------------------------------------
+def _flatten_messages(messages: List[dict]) -> str:
+    lines = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
 def call_openai_api(
     api_key: str,
     messages: List[dict],
@@ -313,6 +327,9 @@ def call_openai_api(
         - If success: result is the AI response content
         - If failure: result is the error message
     """
+    if not api_key or not str(api_key).strip():
+        return False, "API key is missing. Please enter a valid key."
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -356,8 +373,11 @@ def call_openai_api(
                 continue
 
             resp.raise_for_status()
-            data = resp.json()
-            answer = data["choices"][0]["message"]["content"]
+            try:
+                data = resp.json()
+                answer = data["choices"][0]["message"]["content"]
+            except (ValueError, KeyError, TypeError) as parse_err:
+                return False, f"Invalid response from server: {parse_err}"
             return True, answer
 
         except requests.exceptions.Timeout:
@@ -408,6 +428,130 @@ def call_openai_api(
         )
 
     return False, f"Failed after {max_retries} attempts. Last error: {last_error}"
+
+
+def _normalize_gemini_model(model: Optional[str]) -> str:
+    """Ensure Gemini model names align with deployable versions."""
+    name = (model or "").strip()
+    if not name:
+        return "gemini-1.5-flash-latest"
+
+    if name.startswith("models/"):
+        name = name.split("/", 1)[1]
+
+    alias = {
+        "gemini-1.5-flash": "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-001": "gemini-1.5-flash-001",
+        "gemini-pro": "gemini-pro",
+    }
+
+    return alias.get(name, name)
+
+
+def call_gemini_api(
+    api_key: str,
+    messages: List[dict],
+    model: str = "gemini-1.5-flash-latest",
+    max_retries: int = 4,
+    initial_delay: float = 2.0,
+    timeout: int = 30,
+) -> Tuple[bool, str]:
+    """Calls Gemini Generative Language API with retry logic similar to OpenAI."""
+    if not api_key or not str(api_key).strip():
+        return False, "API key is missing. Please enter a valid key."
+
+    model = _normalize_gemini_model(model)
+    delay = float(initial_delay)
+    last_error = ""
+
+    for attempt in range(max_retries):
+        try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                f"?key={api_key}"
+            )
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": _flatten_messages(messages)}],
+                    }
+                ]
+            }
+            resp = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+
+            if resp.status_code == 429:
+                last_error = (
+                    f"Rate limit hit. Waiting {delay:.1f}s before retry "
+                    f"({attempt + 1}/{max_retries})"
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+                candidates = data.get("candidates") or []
+                first = candidates[0]
+                parts = first.get("content", {}).get("parts", [])
+                text = parts[0].get("text") if parts else None
+                if not text:
+                    raise KeyError("No text in Gemini response")
+            except (ValueError, KeyError, IndexError, AttributeError) as parse_err:
+                return False, f"Invalid response from Gemini: {parse_err}"
+            return True, text
+
+        except requests.exceptions.Timeout:
+            last_error = (
+                f"Request timeout after {timeout}s (Attempt {attempt + 1}/{max_retries})"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+        except requests.exceptions.RequestException as e:
+            last_error = f"Network error: {str(e)}"
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    msg = f"Failed after {max_retries} attempts. Last error: {last_error}"
+    return False, msg
+
+
+def call_ai_chat(
+    provider: str,
+    api_key: str,
+    messages: List[dict],
+    model: Optional[str] = None,
+    max_retries: int = 4,
+    initial_delay: float = 2.0,
+    timeout: int = 30,
+) -> Tuple[bool, str]:
+    provider = (provider or "openai").lower()
+    if provider == "gemini":
+        model = _normalize_gemini_model(model or "gemini-1.5-flash-latest")
+        return call_gemini_api(
+            api_key,
+            messages,
+            model=model,
+            max_retries=max_retries,
+            initial_delay=initial_delay,
+            timeout=timeout,
+        )
+
+    model = model or "gpt-4o-mini"
+    return call_openai_api(
+        api_key,
+        messages,
+        model=model,
+        max_retries=max_retries,
+        initial_delay=initial_delay,
+        timeout=timeout,
+    )
 
 # =============================================================================
 # app.py (Part 2/8)
@@ -1875,6 +2019,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 out.append(it.text())
         return out
 
+    def _checked_or_selected_items(self, widget: QtWidgets.QListWidget) -> List[str]:
+        """Returns checked items, or falls back to selected items if none are checked."""
+
+        checked = self._selected_checked_items(widget)
+        if checked:
+            return checked
+        return [it.text() for it in widget.selectedItems()]
+
     def _set_checked_for_selected(self, widget: QtWidgets.QListWidget, checked: bool):
         st = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
         for it in widget.selectedItems():
@@ -1974,6 +2126,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, c)
                 self.lst_delete_cols.addItem(item)
 
+        self._refresh_dt_edit_var_options()
+
     # -------------------------------------------------------------------------
     # [v8.1] Variable Type Manager
     # -------------------------------------------------------------------------
@@ -2011,6 +2165,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if not hasattr(self.state, "dt_importance_summary"):
                     self.state.dt_importance_summary = None
+                if not hasattr(self.state, "dt_selected_deps"):
+                    self.state.dt_selected_deps = None
+                if not hasattr(self.state, "dt_selected_inds"):
+                    self.state.dt_selected_inds = None
+                if not hasattr(self.state, "dt_edit_group_map"):
+                    self.state.dt_edit_group_map = {}
+                if not hasattr(self.state, "dt_edit_view_mode"):
+                    self.state.dt_edit_view_mode = "split"
 
                 if self.state.df is not None:
                     self.tbl_preview.set_df(self.state.df)
@@ -2387,13 +2549,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             loadings = pd.DataFrame(components.T, index=cols, columns=score_cols)
 
-            disp = loadings.copy()
-            disp["_maxabs_"] = disp.abs().max(axis=1)
-            disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
-            disp = disp.reset_index().rename(columns={"index": "variable"})
-
             self.lbl_factor_info.setText(info_text)
-            self.tbl_factor_loadings.set_df(disp)
 
             self.state.df = df
             self.state.factor_model = model
@@ -2401,6 +2557,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.factor_scores = scores_df
             self.state.factor_loadings = loadings
             self.state.factor_mode = mode_name
+
+            self._render_factor_loadings_table()
 
             self.tbl_preview.set_df(df)
             self._refresh_all_column_lists()
@@ -2416,9 +2574,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "No Factors", "Run Factor Analysis first.")
             return
             
-        key = self.txt_openai_key.text().strip()
+        provider, key = self._get_ai_provider_and_key()
         if not key:
-            QtWidgets.QMessageBox.warning(self, "No Key", "Enter API Key in AI Tab.")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No Key",
+                "Enter API Key in AI Tab for the selected provider (OpenAI/Gemini).",
+            )
             return
 
         loadings = self.state.factor_loadings
@@ -2434,17 +2596,123 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             # [v8.1] Use new retry-enabled API call
             messages = [{"role": "user", "content": txt}]
-            success, result = call_openai_api(key, messages, max_retries=3, initial_delay=2.0)
+            success, result = call_ai_chat(
+                provider,
+                key,
+                messages,
+                max_retries=3,
+                initial_delay=2.0,
+            )
 
             if success:
-                QtWidgets.QMessageBox.information(self, "AI Suggestion", result)
-                self._set_status("AI Naming Done.")
+                applied = self._apply_ai_factor_names(result)
+                if applied:
+                    self._set_status("AI Naming Applied.")
+                else:
+                    self._set_status("AI Naming returned no usable mapping.")
             else:
                 QtWidgets.QMessageBox.warning(self, "AI Error", result)
                 self._set_status("AI Naming Failed.")
 
         except Exception as e:
             show_error(self, "AI Error", e)
+
+    def _apply_ai_factor_names(self, ai_text: str) -> bool:
+        """Parse AI output, apply to RECODE table, and refresh factor loadings view."""
+        try:
+            suggestions = json.loads(ai_text)
+        except Exception:
+            QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
+            return False
+
+        if not isinstance(suggestions, dict):
+            QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
+            return False
+
+        available_cols = set()
+        if self.state.factor_scores is not None:
+            available_cols.update(map(str, self.state.factor_scores.columns))
+        if self.state.factor_loadings is not None:
+            available_cols.update(map(str, self.state.factor_loadings.columns))
+
+        applied = {
+            str(col): str(name).strip()
+            for col, name in suggestions.items()
+            if str(col) in available_cols and str(name).strip()
+        }
+
+        if not applied:
+            QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
+            return False
+
+        self.state.factor_ai_names.update(applied)
+        self._render_factor_loadings_table()
+        self._update_recode_with_ai_names(applied)
+
+        msg = json.dumps(applied, ensure_ascii=False, indent=2)
+        QtWidgets.QMessageBox.information(self, "AI Suggestion Applied", f"적용된 이름:\n{msg}")
+        return True
+
+    def _update_recode_with_ai_names(self, ai_map: Dict[str, str]):
+        if not ai_map:
+            return
+
+        rows = []
+        for col, name in ai_map.items():
+            rows.append({"QUESTION": str(col), "CODE": str(col), "NAME": str(name)})
+
+        current = normalize_recode_df(self.state.recode_df)
+        if current is None or current.empty:
+            recode = pd.DataFrame(rows)
+        else:
+            recode = current.copy()
+            for row in rows:
+                mask = (
+                    recode["QUESTION"].astype(str) == row["QUESTION"]
+                ) & (recode["CODE"].astype(str) == row["CODE"])
+                if mask.any():
+                    recode.loc[mask, "NAME"] = row["NAME"]
+                else:
+                    recode = pd.concat([recode, pd.DataFrame([row])], ignore_index=True)
+
+        self.state.recode_df = normalize_recode_df(recode)
+        self._update_recode_tab()
+
+    def _render_factor_loadings_table(self):
+        if self.state.factor_loadings is None:
+            self.tbl_factor_loadings.set_df(None)
+            return
+
+        disp = self.state.factor_loadings.copy()
+        rename_map = {
+            col: f"{self.state.factor_ai_names[col]} ({col})"
+            for col in disp.columns
+            if col in self.state.factor_ai_names and self.state.factor_ai_names[col]
+        }
+        if rename_map:
+            disp = disp.rename(columns=rename_map)
+
+        disp["_maxabs_"] = disp.abs().max(axis=1)
+        disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
+        disp = disp.reset_index().rename(columns={"index": "variable"})
+        self.tbl_factor_loadings.set_df(disp)
+
+    def _get_ai_provider_and_key(self) -> Tuple[str, str]:
+        provider = "openai"
+        key = ""
+
+        if hasattr(self, "cmb_ai_provider"):
+            sel = self.cmb_ai_provider.currentData()
+            provider = sel or self.cmb_ai_provider.currentText() or "openai"
+
+        provider = str(provider).lower().strip() or "openai"
+
+        if provider == "gemini" and hasattr(self, "txt_gemini_key"):
+            key = self.txt_gemini_key.text().strip()
+        elif hasattr(self, "txt_openai_key"):
+            key = self.txt_openai_key.text().strip()
+
+        return provider, key
 
     # -------------------------------------------------------------------------
     # Tab 4: Decision Tree Setting
@@ -2584,7 +2852,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if self.chk_use_all_factors.isChecked() and fac_cols:
                 deps.extend(fac_cols)
 
-            extras = self._selected_checked_items(self.lst_dep_extra)
+            extras = self._checked_or_selected_items(self.lst_dep_extra)
             for extra in extras:
                 if extra not in deps:
                     deps.append(extra)
@@ -2592,11 +2860,26 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if not deps:
                 raise RuntimeError("No dependent targets selected. Run Factor Analysis first or select extra dep.")
 
-            ind_vars = self._selected_checked_items(self.lst_dt_predictors)
+            ind_vars = self._checked_or_selected_items(self.lst_dt_predictors)
             ind_vars = [c for c in ind_vars if c not in deps and c != "resp_id"]
 
             if len(ind_vars) == 0:
-                raise RuntimeError("No independent variables selected. Please check predictors.")
+                # If user didn't check/select, fall back to all categorical predictors (seg/demographic)
+                fallback = [
+                    c for c in df.columns
+                    if c not in deps and c != "resp_id" and self.state.is_categorical(c, df[c])
+                ]
+
+                if not fallback:
+                    raise RuntimeError(
+                        "No independent variables selected. "
+                        "Check predictors or mark categorical columns in Variable Type Manager."
+                    )
+
+                ind_vars = fallback
+                self._set_status(
+                    "No predictors selected → auto-using categorical columns as pivots."
+                )
 
             best_rows = []
             pivot = pd.DataFrame(index=ind_vars, columns=deps, dtype=float)
@@ -2676,6 +2959,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.dt_improve_pivot = pivot_reset
             self.state.dt_split_best = best_df
             self.state.dt_importance_summary = importance_summary
+            self.state.dt_selected_deps = deps
+            self.state.dt_selected_inds = ind_vars
 
             self.cmb_dt_full_dep.clear()
             self.cmb_dt_full_dep.addItems(deps)
@@ -2688,11 +2973,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.cmb_split_ind.addItems(ind_vars)
 
             self._refresh_split_path_options()
+            self._refresh_dt_edit_var_options()
 
             if self.tbl_dt_pivot.rowCount() > 0:
                 self.tbl_dt_pivot.selectRow(0)
 
-            self._set_status("Decision Tree analysis completed.")
+            used_msg = (
+                f"Targets: {len(deps)} | Predictors (rows): {len(ind_vars)}"
+            )
+            self._set_status(f"Decision Tree analysis completed. {used_msg}")
 
         except Exception as e:
             self.state.last_error = str(e)
@@ -2889,48 +3178,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
         dlay.addWidget(self.lbl_split_imp)
         self.tbl_split_detail = DataFrameTable(float_decimals=2)
         dlay.addWidget(self.tbl_split_detail, 1)
-        bl.addWidget(detail_box, 2)
-
-        path_box = QtWidgets.QGroupBox("Split Path List by Variable")
-        play = QtWidgets.QVBoxLayout(path_box)
-
-        filter_row = QtWidgets.QHBoxLayout()
-        self.chk_path_filter = QtWidgets.QCheckBox("Filter to selected variables")
-        self.chk_path_filter.setChecked(True)
-        self.chk_path_filter.toggled.connect(self._update_split_path_table)
-        self.chk_path_multi = QtWidgets.QCheckBox("Multi-select")
-        self.chk_path_multi.toggled.connect(self._toggle_path_multi_mode)
-
-        self.cmb_path_var = QtWidgets.QComboBox()
-        self.cmb_path_var.currentIndexChanged.connect(self._update_split_path_table)
-
-        self.lst_path_vars = QtWidgets.QListWidget()
-        self.lst_path_vars.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.lst_path_vars.itemSelectionChanged.connect(self._update_split_path_table)
-        self.lst_path_vars.setVisible(False)
-
-        filter_row.addWidget(QtWidgets.QLabel("Variable"))
-        filter_row.addWidget(self.cmb_path_var, 2)
-        filter_row.addWidget(self.lst_path_vars, 2)
-        filter_row.addWidget(self.chk_path_multi)
-        filter_row.addWidget(self.chk_path_filter)
-        play.addLayout(filter_row)
-
-        self.tbl_split_paths = DataFrameTable(float_decimals=2)
-        play.addWidget(self.tbl_split_paths, 1)
-
-        path_hint = QtWidgets.QLabel("Select variables to see all split nodes and their paths for the full tree run.")
-        path_hint.setStyleSheet("color:#546e7a;")
-        play.addWidget(path_hint)
-
-        bl.addWidget(path_box, 3)
+        bl.addWidget(detail_box, 1)
+        note = QtWidgets.QLabel(
+            "Split-level path summaries have moved to the new Decision Tree Editing tab."
+        )
+        note.setStyleSheet("color:#546e7a;")
+        bl.addWidget(note)
         splitter.addWidget(botw)
 
-        splitter.setSizes([240, 680])
+        splitter.setSizes([260, 660])
         layout.addWidget(splitter, 1)
 
         self._refresh_split_path_options()
-        self._update_split_path_table()
 
     def _compute_full_tree_internal(self, dep: str, ind: str):
         df = self.state.df
@@ -3009,8 +3268,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.cmb_split_select.setCurrentIndex(0)
                 self._split_update_detail()
 
-            self._select_path_filter_variable(ind)
-            self._update_split_path_table()
+            if hasattr(self, "_select_path_filter_variable"):
+                self._select_path_filter_variable(ind)
+            if hasattr(self, "_update_split_path_table"):
+                self._update_split_path_table()
 
             self._set_status(f"Tree Built: dep={dep}, ind={ind} (task={task})")
         except Exception as e:
@@ -3108,6 +3369,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Split Detail Error", e)
 
     def _refresh_split_path_options(self):
+        if not hasattr(self, "cmb_path_var") or not hasattr(self, "lst_path_vars"):
+            return
         vars_available: List[str] = []
         if getattr(self.state, "dt_importance_summary", None) is not None:
             vars_available = self.state.dt_importance_summary.get("ind", pd.Series(dtype=str)).dropna().astype(str).tolist()
@@ -3145,6 +3408,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         return [] if sel in ["", "(All)"] else [sel]
 
     def _select_path_filter_variable(self, var: str):
+        if not hasattr(self, "cmb_path_var") or not hasattr(self, "lst_path_vars"):
+            return
         if not var:
             return
         idx = self.cmb_path_var.findText(var)
@@ -3156,6 +3421,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 break
 
     def _update_split_path_table(self):
+        if not hasattr(self, "tbl_split_paths"):
+            return
         paths_df = getattr(self.state, "dt_full_split_paths", None)
         if paths_df is None or paths_df.empty:
             paths_df = getattr(self.state, "dt_full_path_info", None)
@@ -3174,17 +3441,483 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # Optional compatibility: Tab 5 (Legacy) Decision Tree Editing alias
     # -------------------------------------------------------------------------
     def _build_tab_dt_editing(self):
-        """
-        Backward-compatible alias for historical tab builder name.
+        if getattr(self, "_dt_editing_built", False):
+            return
+        self._dt_editing_built = True
 
-        Some entry points referenced ``_build_tab_dt_editing`` even though the
-        Decision Tree UI was consolidated into ``_build_tab_dt_results``. This
-        shim ensures those calls no longer raise ``AttributeError`` while reusing
-        the current results tab layout.
-        """
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "Decision Tree Editing")
 
-        # Ensure the Decision Tree Results tab exists without duplicating it.
-        self._build_tab_dt_results()
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        info = QtWidgets.QLabel(
+            "의사결정나무 결과를 기준으로 구분변수별 피벗/그룹핑을 직접 편집합니다.<br>"
+            "• 위의 콤보박스에서 구분변수를 선택하면 좌측 열에 하위 요인(범주)이 나열됩니다.<br>"
+            "• 상단 분석에서 선택했던 모든 목적변수가 가로 축으로 표시되고, 최적 분할 시 어디에 속했는지(left/right)를 보여줍니다.<br>"
+            "• 아래에서 범주를 선택해 라벨을 합치고 저장하면 *_seg 컬럼으로 바로 생성됩니다."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        filter_row = QtWidgets.QHBoxLayout()
+        self.cmb_dt_edit_var = QtWidgets.QComboBox()
+        self.cmb_dt_edit_var.currentIndexChanged.connect(self._load_dt_edit_grid)
+        filter_row.addWidget(QtWidgets.QLabel("구분변수 선택"))
+        filter_row.addWidget(self.cmb_dt_edit_var, 3)
+
+        self.lbl_dt_edit_targets = QtWidgets.QLabel("(목적변수: 분석 실행 후 자동 채움)")
+        self.lbl_dt_edit_targets.setStyleSheet("color:#546e7a;")
+        filter_row.addWidget(self.lbl_dt_edit_targets, 2)
+        layout.addLayout(filter_row)
+
+        view_row = QtWidgets.QHBoxLayout()
+        self.cmb_dt_edit_view_mode = QtWidgets.QComboBox()
+        self.cmb_dt_edit_view_mode.addItem("안 1) 좌/우 + 개선도 요약", "split")
+        self.cmb_dt_edit_view_mode.addItem("안 2) 모든 조합 + 개선도", "combo")
+        self.cmb_dt_edit_view_mode.currentIndexChanged.connect(self._on_dt_edit_view_changed)
+        view_row.addWidget(QtWidgets.QLabel("보기 전환"))
+        view_row.addWidget(self.cmb_dt_edit_view_mode, 2)
+        view_row.addStretch(1)
+        layout.addLayout(view_row)
+
+        self.tbl_dt_edit_grid = DataFrameTable(editable=True, float_decimals=2, max_col_width=260)
+        self.tbl_dt_edit_combo = DataFrameTable(editable=False, float_decimals=3, max_col_width=260)
+        self.dt_edit_view_stack = QtWidgets.QStackedWidget()
+        self.dt_edit_view_stack.addWidget(self.tbl_dt_edit_grid)
+        self.dt_edit_view_stack.addWidget(self.tbl_dt_edit_combo)
+        layout.addWidget(self.dt_edit_view_stack, 1)
+
+        summary_box = QtWidgets.QGroupBox("목적변수별 개선도 요약 (선택 구분변수)")
+        summary_layout = QtWidgets.QVBoxLayout(summary_box)
+        self.tbl_dt_edit_summary = DataFrameTable(editable=False, float_decimals=3, max_col_width=260)
+        summary_layout.addWidget(self.tbl_dt_edit_summary)
+        layout.addWidget(summary_box)
+
+        merge_row = QtWidgets.QHBoxLayout()
+        self.txt_dt_edit_merge_label = QtWidgets.QLineEdit("Merged")
+        self.btn_dt_edit_merge = QtWidgets.QPushButton("선택 범주 묶기 (라벨 적용)")
+        style_button(self.btn_dt_edit_merge, level=1)
+        self.btn_dt_edit_merge.clicked.connect(self._dt_edit_merge_selected)
+        self.btn_dt_edit_reset = QtWidgets.QPushButton("원본 라벨로 초기화")
+        style_button(self.btn_dt_edit_reset, level=1)
+        self.btn_dt_edit_reset.clicked.connect(self._reset_dt_edit_groups)
+
+        merge_row.addWidget(QtWidgets.QLabel("새 그룹 라벨"))
+        merge_row.addWidget(self.txt_dt_edit_merge_label, 2)
+        merge_row.addWidget(self.btn_dt_edit_merge)
+        merge_row.addWidget(self.btn_dt_edit_reset)
+        merge_row.addStretch(1)
+        layout.addLayout(merge_row)
+
+        apply_row = QtWidgets.QHBoxLayout()
+        self.txt_dt_edit_newcol = QtWidgets.QLineEdit("")
+        self.txt_dt_edit_newcol.setPlaceholderText("예: gender_dt_seg")
+        self.btn_dt_edit_apply = QtWidgets.QPushButton("그룹핑 저장 → 새 *_seg 생성")
+        style_button(self.btn_dt_edit_apply, level=2)
+        self.btn_dt_edit_apply.clicked.connect(self._apply_dt_edit_grouping)
+
+        apply_row.addWidget(QtWidgets.QLabel("새 컬럼 이름"))
+        apply_row.addWidget(self.txt_dt_edit_newcol, 3)
+        apply_row.addWidget(self.btn_dt_edit_apply)
+        layout.addLayout(apply_row)
+
+        self._refresh_dt_edit_var_options()
+        self._switch_dt_edit_view_mode()
+        self._load_dt_edit_grid()
+
+    def _refresh_dt_edit_var_options(self):
+        if not hasattr(self, "cmb_dt_edit_var"):
+            return
+
+        current = self.cmb_dt_edit_var.currentText()
+        df = self.state.df
+        vars_available: List[str] = []
+
+        if self.state.dt_split_best is not None and not self.state.dt_split_best.empty:
+            vars_available = (
+                self.state.dt_split_best.get("ind", pd.Series(dtype=str))
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+        elif self.state.dt_selected_inds:
+            vars_available = list(self.state.dt_selected_inds)
+        elif df is not None:
+            vars_available = [c for c in df.columns if self.state.is_categorical(c)]
+
+        if df is not None:
+            vars_available = [v for v in vars_available if v in df.columns]
+
+        vars_available = sorted(dict.fromkeys(vars_available))
+
+        self.cmb_dt_edit_var.blockSignals(True)
+        self.cmb_dt_edit_var.clear()
+        self.cmb_dt_edit_var.addItems(vars_available)
+        if current:
+            idx = self.cmb_dt_edit_var.findText(current)
+            if idx >= 0:
+                self.cmb_dt_edit_var.setCurrentIndex(idx)
+        self.cmb_dt_edit_var.blockSignals(False)
+
+    def _switch_dt_edit_view_mode(self) -> str:
+        """Sets the Decision Tree Editing view mode (안1 vs 안2) and toggles controls."""
+        mode = getattr(self.state, "dt_edit_view_mode", "split") or "split"
+        if hasattr(self, "cmb_dt_edit_view_mode"):
+            data = self.cmb_dt_edit_view_mode.currentData()
+            mode = data if data in ["split", "combo"] else mode
+            idx = self.cmb_dt_edit_view_mode.findData(mode)
+            if idx >= 0 and self.cmb_dt_edit_view_mode.currentIndex() != idx:
+                self.cmb_dt_edit_view_mode.blockSignals(True)
+                self.cmb_dt_edit_view_mode.setCurrentIndex(idx)
+                self.cmb_dt_edit_view_mode.blockSignals(False)
+
+        self.state.dt_edit_view_mode = mode
+
+        if hasattr(self, "dt_edit_view_stack"):
+            self.dt_edit_view_stack.setCurrentIndex(0 if mode == "split" else 1)
+
+        can_edit = mode == "split"
+        for btn_name in ["btn_dt_edit_merge", "btn_dt_edit_reset", "btn_dt_edit_apply"]:
+            if hasattr(self, btn_name):
+                btn = getattr(self, btn_name)
+                btn.setEnabled(can_edit)
+
+        return mode
+
+    def _on_dt_edit_view_changed(self):
+        self._switch_dt_edit_view_mode()
+        self._load_dt_edit_grid()
+
+    def _parse_items_list(self, val: Any) -> List[str]:
+        if val is None:
+            return []
+        if isinstance(val, (list, tuple, set, np.ndarray, pd.Series)):
+            return [str(v) for v in val]
+        try:
+            parsed = ast.literal_eval(str(val))
+            if isinstance(parsed, (list, tuple, set, np.ndarray, pd.Series)):
+                return [str(v) for v in parsed]
+        except Exception:
+            pass
+        txt = str(val)
+        if txt in ["", "None", "nan"]:
+            return []
+        return [txt]
+
+    def _get_dt_edit_targets(self) -> List[str]:
+        if self.state.dt_selected_deps:
+            return list(self.state.dt_selected_deps)
+        if self.state.dt_split_best is not None and not self.state.dt_split_best.empty:
+            return (
+                self.state.dt_split_best.get("dep", pd.Series(dtype=str))
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+        df = self.state.df
+        if df is None:
+            return []
+        fac_cols = [c for c in df.columns if str(c).startswith("Factor")]
+        return fac_cols
+
+    def _compute_dt_candidate_splits(self, var: str, dep: str) -> List[dict]:
+        df = self.state.df
+        if df is None or var not in df.columns or dep not in df.columns:
+            return []
+
+        y = df[dep]
+        x = df[var]
+
+        is_factor = str(dep).startswith("Factor") or str(dep).startswith("PCA")
+        if is_factor:
+            task = "reg"
+        elif self.state.is_categorical(dep):
+            task = "class"
+        else:
+            task = "reg"
+
+        force_cat = None
+        vtype = self.state.get_var_type(var)
+        if vtype == VAR_TYPE_CATEGORICAL:
+            force_cat = True
+        elif vtype == VAR_TYPE_NUMERIC:
+            force_cat = False
+
+        _, rows = univariate_best_split(y, x, task=task, force_categorical=force_cat)
+        for r in rows:
+            r["dep"] = dep
+            r["ind"] = var
+        return rows
+
+    def _format_split_combo_desc(self, row: dict) -> str:
+        stype = str(row.get("split_type", ""))
+        if stype.startswith("categorical"):
+            left_items = self._parse_items_list(row.get("left_items"))
+            right_items = self._parse_items_list(row.get("right_items"))
+            if not right_items and left_items:
+                right_items = ["(Else)"]
+            left_txt = ",".join(left_items) if left_items else str(row.get("left_group", ""))
+            right_txt = ",".join(right_items) if right_items else str(row.get("right_group", ""))
+            return f"L:{left_txt} | R:{right_txt}"
+
+        cp = row.get("cutpoint")
+        cp_txt = fmt_float(cp, 3) if isinstance(cp, (int, float)) else str(cp)
+        return f"<= {cp_txt} | > {cp_txt}"
+
+    def _build_dt_combo_view_df(self, var: str, targets: List[str]) -> pd.DataFrame:
+        combo_map: Dict[str, dict] = {}
+        max_rows = 300
+
+        for dep in targets:
+            candidates = self._compute_dt_candidate_splits(var, dep)
+            for row in candidates:
+                key = self._format_split_combo_desc(row)
+                rec = combo_map.setdefault(
+                    key,
+                    {
+                        "split_desc": key,
+                        "split_type": row.get("split_type", ""),
+                        "left_n": row.get("n_left", np.nan),
+                        "right_n": row.get("n_right", np.nan),
+                    },
+                )
+                rec[dep] = row.get("improve_rel", np.nan)
+
+        if not combo_map:
+            return pd.DataFrame()
+
+        df_view = pd.DataFrame(combo_map.values())
+        if len(df_view) > max_rows:
+            df_view["max_improve"] = df_view[targets].max(axis=1)
+            df_view = df_view.sort_values("max_improve", ascending=False).head(max_rows)
+            df_view = df_view.drop(columns=["max_improve"])
+
+        cols = ["split_desc", "split_type", "left_n", "right_n"] + targets
+        cols = [c for c in cols if c in df_view.columns]
+        return df_view[cols]
+
+    def _build_dt_edit_summary_df(self, var: str, targets: List[str]) -> pd.DataFrame:
+        summary_rows = []
+        best_df = getattr(self.state, "dt_split_best", None)
+        has_best = best_df is not None and not best_df.empty
+
+        for dep in targets:
+            row = None
+            if has_best:
+                cand = best_df[(best_df["ind"] == var) & (best_df["dep"] == dep)]
+                if not cand.empty:
+                    row = cand.loc[cand["improve_rel"].idxmax()]
+
+            if row is None:
+                candidates = self._compute_dt_candidate_splits(var, dep)
+                if candidates:
+                    row = max(candidates, key=lambda r: r.get("improve_rel", -np.inf))
+
+            if row is None:
+                continue
+
+            summary_rows.append(
+                {
+                    "dep": dep,
+                    "split_type": row.get("split_type", ""),
+                    "left_group": row.get("left_group", ""),
+                    "right_group": row.get("right_group", ""),
+                    "improve_rel": row.get("improve_rel", np.nan),
+                    "n_left": row.get("n_left", np.nan),
+                    "n_right": row.get("n_right", np.nan),
+                }
+            )
+
+        if not summary_rows:
+            return pd.DataFrame()
+
+        return pd.DataFrame(summary_rows).sort_values("improve_rel", ascending=False)
+
+    def _build_dt_edit_split_view_df(self, df: pd.DataFrame, var: str, targets: List[str]) -> pd.DataFrame:
+        cats = (
+            pd.Series(df[var].dropna().unique())
+            .astype(str)
+            .sort_values()
+            .tolist()
+        )
+
+        split_info: Dict[str, Dict[str, set]] = {}
+        if self.state.dt_split_best is not None and not self.state.dt_split_best.empty:
+            sub = self.state.dt_split_best[self.state.dt_split_best["ind"] == var]
+            for dep in targets:
+                cand = sub[sub["dep"] == dep]
+                if cand.empty:
+                    continue
+                row = cand.loc[cand["improve_rel"].idxmax()]
+                if not str(row.get("split_type", "")).startswith("categorical"):
+                    continue
+                left_set = set(self._parse_items_list(row.get("left_items")))
+                right_set = set(self._parse_items_list(row.get("right_items")))
+                split_info[dep] = {"left": left_set, "right": right_set}
+
+        user_map = self.state.dt_edit_group_map.get(var, {})
+        rows = []
+        for cat in cats:
+            row = {"level": cat}
+            for dep in targets:
+                info = split_info.get(dep)
+                if not info:
+                    row[dep] = ""
+                    continue
+                if cat in info.get("left", set()):
+                    row[dep] = "Left"
+                elif info.get("right"):
+                    row[dep] = "Right" if cat in info.get("right", set()) else "Right(Else)"
+                elif info.get("left"):
+                    row[dep] = "Right(Else)"
+                else:
+                    row[dep] = ""
+            row["custom_group"] = user_map.get(cat, cat)
+            rows.append(row)
+
+        view = pd.DataFrame(rows)
+        cols = ["level"] + targets + ["custom_group"] if targets else ["level", "custom_group"]
+        view = view[cols]
+        return view
+
+    def _load_dt_edit_grid(self):
+        if not hasattr(self, "tbl_dt_edit_grid"):
+            return
+
+        df = self.state.df
+        var = self.cmb_dt_edit_var.currentText().strip() if hasattr(self, "cmb_dt_edit_var") else ""
+        targets = self._get_dt_edit_targets()
+
+        self.lbl_dt_edit_targets.setText(
+            "목적변수: " + (", ".join(targets) if targets else "(분석 실행 필요)")
+        )
+
+        mode = self._switch_dt_edit_view_mode()
+
+        if df is None or not var:
+            self.tbl_dt_edit_grid.set_df(None)
+            if hasattr(self, "tbl_dt_edit_combo"):
+                self.tbl_dt_edit_combo.set_df(None)
+            if hasattr(self, "tbl_dt_edit_summary"):
+                self.tbl_dt_edit_summary.set_df(None)
+            return
+
+        if not var:
+            self.txt_dt_edit_newcol.setPlaceholderText("예: gender_dt_seg")
+        else:
+            suggestion = f"{var}_dt_seg"
+            if not self.txt_dt_edit_newcol.text().strip():
+                self.txt_dt_edit_newcol.setText(suggestion if suggestion.endswith("_seg") else suggestion + "_seg")
+
+        summary_df = self._build_dt_edit_summary_df(var, targets)
+        if hasattr(self, "tbl_dt_edit_summary"):
+            self.tbl_dt_edit_summary.set_df(summary_df if not summary_df.empty else None)
+
+        if mode == "combo":
+            combo_df = self._build_dt_combo_view_df(var, targets) if targets else pd.DataFrame()
+            if hasattr(self, "tbl_dt_edit_combo"):
+                self.tbl_dt_edit_combo.set_df(combo_df if not combo_df.empty else None)
+            self.tbl_dt_edit_grid.set_df(None)
+        else:
+            split_df = self._build_dt_edit_split_view_df(df, var, targets)
+            self.tbl_dt_edit_grid.set_df(split_df if not split_df.empty else None)
+            if hasattr(self, "tbl_dt_edit_combo"):
+                self.tbl_dt_edit_combo.set_df(None)
+
+    def _extract_dt_edit_df(self) -> pd.DataFrame:
+        table = self.tbl_dt_edit_grid
+        cols = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+        data = []
+        for r in range(table.rowCount()):
+            row = {}
+            for c, col_name in enumerate(cols):
+                item = table.item(r, c)
+                row[col_name] = item.text() if item is not None else ""
+            data.append(row)
+        return pd.DataFrame(data)
+
+    def _dt_edit_merge_selected(self):
+        try:
+            if getattr(self.state, "dt_edit_view_mode", "split") != "split":
+                raise RuntimeError("좌/우 보기에서만 범주 라벨을 묶을 수 있습니다. 보기 전환을 '안 1'로 변경하세요.")
+            label = self.txt_dt_edit_merge_label.text().strip()
+            if not label:
+                raise RuntimeError("라벨을 입력하세요.")
+            sel = self.tbl_dt_edit_grid.selectedItems()
+            if not sel:
+                raise RuntimeError("묶을 범주 행을 선택하세요.")
+
+            rows_idx = sorted(set([it.row() for it in sel]))
+            df_current = self._extract_dt_edit_df()
+            for r in rows_idx:
+                if "custom_group" in df_current.columns and r < len(df_current):
+                    df_current.at[r, "custom_group"] = label
+
+            var = self.cmb_dt_edit_var.currentText().strip()
+            if var:
+                self.state.dt_edit_group_map[var] = {
+                    row["level"]: row.get("custom_group", row.get("level", ""))
+                    for _, row in df_current.iterrows()
+                    if str(row.get("level", "")) != ""
+                }
+
+            self.tbl_dt_edit_grid.set_df(df_current)
+            self._set_status("선택한 범주가 새 라벨로 묶였습니다.")
+        except Exception as e:
+            show_error(self, "Grouping Error", e)
+
+    def _reset_dt_edit_groups(self):
+        try:
+            if getattr(self.state, "dt_edit_view_mode", "split") != "split":
+                raise RuntimeError("좌/우 보기에서만 라벨을 초기화할 수 있습니다. 보기 전환을 '안 1'로 변경하세요.")
+            var = self.cmb_dt_edit_var.currentText().strip()
+            if var in self.state.dt_edit_group_map:
+                self.state.dt_edit_group_map.pop(var, None)
+            self._load_dt_edit_grid()
+            self._set_status("라벨이 원본 값으로 초기화되었습니다.")
+        except Exception as e:
+            show_error(self, "Reset Error", e)
+
+    def _apply_dt_edit_grouping(self):
+        try:
+            if getattr(self.state, "dt_edit_view_mode", "split") != "split":
+                raise RuntimeError("조합 보기에서는 저장할 수 없습니다. 보기 전환을 '안 1'로 변경하세요.")
+            self._ensure_df()
+            df = self.state.df
+            var = self.cmb_dt_edit_var.currentText().strip()
+            if not var:
+                raise RuntimeError("구분변수를 선택하세요.")
+
+            table_df = self._extract_dt_edit_df()
+            if table_df.empty:
+                raise RuntimeError("그룹핑할 항목이 없습니다.")
+
+            newcol = self.txt_dt_edit_newcol.text().strip()
+            if not newcol:
+                newcol = f"{var}_dt_seg"
+            if not newcol.endswith("_seg"):
+                newcol = newcol + "_seg"
+
+            mapping = {}
+            for _, row in table_df.iterrows():
+                key = str(row.get("level", ""))
+                if key == "":
+                    continue
+                val = str(row.get("custom_group", key)).strip()
+                mapping[key] = val if val else key
+
+            s = df[var].astype(str)
+            df[newcol] = s.map(mapping).fillna(s)
+
+            self.state.df = df
+            self.state.dt_edit_group_map[var] = mapping
+            self.tbl_preview.set_df(df)
+            self._refresh_all_column_lists()
+            self._set_status(f"새 그룹 컬럼 생성: {newcol}")
+        except Exception as e:
+            show_error(self, "Save Grouping Error", e)
 
     # -------------------------------------------------------------------------
     # Tab 7: Group & Compose
@@ -3718,14 +4451,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 return labels + 1
 
             if seg_mode:
-                seg_cols = self._selected_checked_items(self.lst_demand_segcols)
+                seg_cols = self._checked_or_selected_items(self.lst_demand_segcols)
                 if len(seg_cols) < 1:
                     raise RuntimeError("Select at least 1 *_seg column.")
                 sep = self.txt_demand_seg_sep.text().strip() or "|"
 
                 use_factors = bool(self.chk_demand_use_factors.isChecked())
                 fac_k = int(self.spin_demand_factor_k.value())
-                targets = self._selected_checked_items(self.lst_demand_targets)
+                targets = self._checked_or_selected_items(self.lst_demand_targets)
                 min_n = int(self.spin_demand_min_n.value())
 
                 prof, feat_cols, labels_by_row = self._build_segment_profiles(
@@ -3809,8 +4542,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self._set_status("Demand Space Analysis Completed.")
 
             else:
-                cols = self._selected_checked_items(self.lst_demand_vars)
-                targets = self._selected_checked_items(self.lst_demand_targets)
+                cols = self._checked_or_selected_items(self.lst_demand_vars)
+                targets = self._checked_or_selected_items(self.lst_demand_targets)
                 if len(cols) < 2:
                     raise RuntimeError("변수를 2개 이상 선택해 주세요.")
                 if not targets:
@@ -3907,17 +4640,19 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _build_segment_profiles(
         self, seg_cols: List[str], sep: str, use_factors: bool, fac_k: int, targets: List[str], min_n: int
     ):
-        df = self.state.df.copy()
+        df_all = self.state.df.copy()
 
-        for col in feat_cols:
-            series = df[col]
-            if pd.api.types.is_numeric_dtype(series):
-                numeric_parts.append(pd.to_numeric(series, errors="coerce"))
-                feature_names.append(col)
-            else:
-                dummies = pd.get_dummies(series.astype(str), prefix=col)
-                numeric_parts.append(dummies)
-                feature_names.extend(list(dummies.columns))
+        missing_seg_cols = [c for c in seg_cols if c not in df_all.columns]
+        if missing_seg_cols:
+            raise RuntimeError(f"다음 세그먼트 컬럼이 없습니다: {', '.join(missing_seg_cols)}")
+
+        seg_labels_full = df_all[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+        df_all["_SEG_LABEL_"] = seg_labels_full
+
+        min_n = max(1, int(min_n))
+        seg_counts_all = df_all["_SEG_LABEL_"].value_counts()
+        keep_labels = seg_counts_all[seg_counts_all >= min_n].index
+        df = df_all[df_all["_SEG_LABEL_"].isin(keep_labels)].copy()
 
         cnt = df["_SEG_LABEL_"].value_counts()
         if cnt.empty:
@@ -3953,6 +4688,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
         seg_matrix = pivot_stack.T
         seg_matrix["n"] = seg_matrix.index.map(cnt.get).fillna(0).astype(int)
 
+        # Initialize feature list early so it always exists, even if factor logic is skipped
+        feat_cols = [c for c in seg_matrix.columns if c != "n"]
+
         # Optional PCA/Factor profile mean features (align with R flow: target×seg pivot + PCA profile)
         if use_factors and self.state.factor_scores is not None:
             fac_cols = [c for c in self.state.factor_scores.columns if str(c).startswith("Factor")]
@@ -3963,10 +4701,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 fac_mean = fac_df.groupby("_SEG_LABEL_")[fac_cols].mean()
                 seg_matrix = seg_matrix.join(fac_mean, how="left")
                 seg_matrix[fac_cols] = seg_matrix[fac_cols].fillna(0.0)
-
-        # Align naming with caller (`feat_cols`) to avoid NameError confusion
-        feat_cols = [c for c in seg_matrix.columns if c != "n"]
-        labels_by_row = df["_SEG_LABEL_"].copy()
+                feat_cols = [c for c in seg_matrix.columns if c != "n"]
+        labels_by_row = seg_labels_full.copy()
         return seg_matrix, feat_cols, labels_by_row
 
     def _build_variable_profiles(self, var_cols: List[str], targets: List[str]):
@@ -4405,15 +5141,28 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addWidget(QtWidgets.QLabel("<b>AI Assistant</b>: Ask questions about your current data/analysis."))
 
         # [v8.1] Enhanced API Key section with status
-        key_box = QtWidgets.QGroupBox("OpenAI API Configuration")
+        key_box = QtWidgets.QGroupBox("AI API Configuration (GPT / Gemini)")
         key_layout = QtWidgets.QVBoxLayout(key_box)
-        
+
         key_row = QtWidgets.QHBoxLayout()
+        self.cmb_ai_provider = QtWidgets.QComboBox()
+        self.cmb_ai_provider.addItem("OpenAI (GPT-4o-mini)", "openai")
+        self.cmb_ai_provider.addItem("Gemini (1.5-flash-latest)", "gemini")
+
         self.txt_openai_key = QtWidgets.QLineEdit()
         self.txt_openai_key.setPlaceholderText("Enter OpenAI API Key (sk-...) or leave empty to generate prompt only")
         self.txt_openai_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        key_row.addWidget(QtWidgets.QLabel("API Key:"))
+
+        self.txt_gemini_key = QtWidgets.QLineEdit()
+        self.txt_gemini_key.setPlaceholderText("Enter Gemini API Key (AI Studio) or leave empty to generate prompt only")
+        self.txt_gemini_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+
+        key_row.addWidget(QtWidgets.QLabel("Provider:"))
+        key_row.addWidget(self.cmb_ai_provider)
+        key_row.addWidget(QtWidgets.QLabel("OpenAI Key:"))
         key_row.addWidget(self.txt_openai_key, 1)
+        key_row.addWidget(QtWidgets.QLabel("Gemini Key:"))
+        key_row.addWidget(self.txt_gemini_key, 1)
         key_layout.addLayout(key_row)
         
         # [v8.1] API status and retry info
@@ -4488,15 +5237,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.txt_chat_history.append(f"<b>User:</b> {query}")
         self.txt_user_query.clear()
 
-        api_key = self.txt_openai_key.text().strip()
+        provider, api_key = self._get_ai_provider_and_key()
+        provider_label = "Gemini" if provider == "gemini" else "ChatGPT"
         if not api_key:
-            self.txt_chat_history.append(f"<br><i>[System] No API Key provided. Copy this prompt to ChatGPT:</i><br>")
+            self.txt_chat_history.append(
+                f"<br><i>[System] No API Key provided. Copy this prompt to {provider_label}:</i><br>"
+            )
             self.txt_chat_history.append(f"<pre style='background:#f5f5f5; padding:10px;'>{full_prompt}</pre><br><hr>")
             return
 
         try:
             self.txt_chat_history.append("<i>... Thinking (with auto-retry on rate limit) ...</i>")
-            self.lbl_api_status.setText("<b style='color:orange;'>⏳ Sending request...</b>")
+            self.lbl_api_status.setText(
+                f"<b style='color:orange;'>⏳ Sending request via {provider_label}...</b>"
+            )
             QtWidgets.QApplication.processEvents()
 
             # [v8.1] Use new retry-enabled API call
@@ -4504,12 +5258,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 {"role": "system", "content": "You are a Data Analysis Assistant for market research."},
                 {"role": "user", "content": full_prompt}
             ]
-            success, result = call_openai_api(
-                api_key, 
-                messages, 
-                max_retries=3, 
+            success, result = call_ai_chat(
+                provider,
+                api_key,
+                messages,
+                max_retries=3,
                 initial_delay=2.0,
-                timeout=30
+                timeout=30,
             )
 
             if success:
