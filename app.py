@@ -246,6 +246,7 @@ class AppState:
     dt_selected_deps: Optional[List[str]] = None
     dt_selected_inds: Optional[List[str]] = None
     dt_edit_group_map: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    dt_edit_view_mode: str = "split"  # "split" (좌/우+개선도) or "combo" (모든 조합 개선도)
 
     # Demand Space Data
     demand_mode: str = "Segments-as-points"
@@ -300,6 +301,15 @@ class AppState:
 # -----------------------------------------------------------------------------
 # [v8.1 NEW] API Call Helper with Retry Logic
 # -----------------------------------------------------------------------------
+def _flatten_messages(messages: List[dict]) -> str:
+    lines = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
 def call_openai_api(
     api_key: str,
     messages: List[dict],
@@ -418,6 +428,111 @@ def call_openai_api(
         )
 
     return False, f"Failed after {max_retries} attempts. Last error: {last_error}"
+
+
+def call_gemini_api(
+    api_key: str,
+    messages: List[dict],
+    model: str = "gemini-1.5-flash",
+    max_retries: int = 4,
+    initial_delay: float = 2.0,
+    timeout: int = 30,
+) -> Tuple[bool, str]:
+    """Calls Gemini Generative Language API with retry logic similar to OpenAI."""
+    if not api_key or not str(api_key).strip():
+        return False, "API key is missing. Please enter a valid key."
+
+    delay = float(initial_delay)
+    last_error = ""
+
+    for attempt in range(max_retries):
+        try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                f"?key={api_key}"
+            )
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": _flatten_messages(messages)}],
+                    }
+                ]
+            }
+            resp = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+
+            if resp.status_code == 429:
+                last_error = (
+                    f"Rate limit hit. Waiting {delay:.1f}s before retry "
+                    f"({attempt + 1}/{max_retries})"
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+                candidates = data.get("candidates") or []
+                first = candidates[0]
+                parts = first.get("content", {}).get("parts", [])
+                text = parts[0].get("text") if parts else None
+                if not text:
+                    raise KeyError("No text in Gemini response")
+            except (ValueError, KeyError, IndexError, AttributeError) as parse_err:
+                return False, f"Invalid response from Gemini: {parse_err}"
+            return True, text
+
+        except requests.exceptions.Timeout:
+            last_error = (
+                f"Request timeout after {timeout}s (Attempt {attempt + 1}/{max_retries})"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+        except requests.exceptions.RequestException as e:
+            last_error = f"Network error: {str(e)}"
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    msg = f"Failed after {max_retries} attempts. Last error: {last_error}"
+    return False, msg
+
+
+def call_ai_chat(
+    provider: str,
+    api_key: str,
+    messages: List[dict],
+    model: Optional[str] = None,
+    max_retries: int = 4,
+    initial_delay: float = 2.0,
+    timeout: int = 30,
+) -> Tuple[bool, str]:
+    provider = (provider or "openai").lower()
+    if provider == "gemini":
+        model = model or "gemini-1.5-flash"
+        return call_gemini_api(
+            api_key,
+            messages,
+            model=model,
+            max_retries=max_retries,
+            initial_delay=initial_delay,
+            timeout=timeout,
+        )
+
+    model = model or "gpt-4o-mini"
+    return call_openai_api(
+        api_key,
+        messages,
+        model=model,
+        max_retries=max_retries,
+        initial_delay=initial_delay,
+        timeout=timeout,
+    )
 
 # =============================================================================
 # app.py (Part 2/8)
@@ -2037,6 +2152,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     self.state.dt_selected_inds = None
                 if not hasattr(self.state, "dt_edit_group_map"):
                     self.state.dt_edit_group_map = {}
+                if not hasattr(self.state, "dt_edit_view_mode"):
+                    self.state.dt_edit_view_mode = "split"
 
                 if self.state.df is not None:
                     self.tbl_preview.set_df(self.state.df)
@@ -2438,9 +2555,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "No Factors", "Run Factor Analysis first.")
             return
             
-        key = self.txt_openai_key.text().strip()
+        provider, key = self._get_ai_provider_and_key()
         if not key:
-            QtWidgets.QMessageBox.warning(self, "No Key", "Enter API Key in AI Tab.")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No Key",
+                "Enter API Key in AI Tab for the selected provider (OpenAI/Gemini).",
+            )
             return
 
         loadings = self.state.factor_loadings
@@ -2456,7 +2577,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             # [v8.1] Use new retry-enabled API call
             messages = [{"role": "user", "content": txt}]
-            success, result = call_openai_api(key, messages, max_retries=3, initial_delay=2.0)
+            success, result = call_ai_chat(
+                provider,
+                key,
+                messages,
+                max_retries=3,
+                initial_delay=2.0,
+            )
 
             if success:
                 applied = self._apply_ai_factor_names(result)
@@ -2550,6 +2677,23 @@ class IntegratedApp(QtWidgets.QMainWindow):
         disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
         disp = disp.reset_index().rename(columns={"index": "variable"})
         self.tbl_factor_loadings.set_df(disp)
+
+    def _get_ai_provider_and_key(self) -> Tuple[str, str]:
+        provider = "openai"
+        key = ""
+
+        if hasattr(self, "cmb_ai_provider"):
+            sel = self.cmb_ai_provider.currentData()
+            provider = sel or self.cmb_ai_provider.currentText() or "openai"
+
+        provider = str(provider).lower().strip() or "openai"
+
+        if provider == "gemini" and hasattr(self, "txt_gemini_key"):
+            key = self.txt_gemini_key.text().strip()
+        elif hasattr(self, "txt_openai_key"):
+            key = self.txt_openai_key.text().strip()
+
+        return provider, key
 
     # -------------------------------------------------------------------------
     # Tab 4: Decision Tree Setting
@@ -3307,8 +3451,28 @@ class IntegratedApp(QtWidgets.QMainWindow):
         filter_row.addWidget(self.lbl_dt_edit_targets, 2)
         layout.addLayout(filter_row)
 
+        view_row = QtWidgets.QHBoxLayout()
+        self.cmb_dt_edit_view_mode = QtWidgets.QComboBox()
+        self.cmb_dt_edit_view_mode.addItem("안 1) 좌/우 + 개선도 요약", "split")
+        self.cmb_dt_edit_view_mode.addItem("안 2) 모든 조합 + 개선도", "combo")
+        self.cmb_dt_edit_view_mode.currentIndexChanged.connect(self._on_dt_edit_view_changed)
+        view_row.addWidget(QtWidgets.QLabel("보기 전환"))
+        view_row.addWidget(self.cmb_dt_edit_view_mode, 2)
+        view_row.addStretch(1)
+        layout.addLayout(view_row)
+
         self.tbl_dt_edit_grid = DataFrameTable(editable=True, float_decimals=2, max_col_width=260)
-        layout.addWidget(self.tbl_dt_edit_grid, 1)
+        self.tbl_dt_edit_combo = DataFrameTable(editable=False, float_decimals=3, max_col_width=260)
+        self.dt_edit_view_stack = QtWidgets.QStackedWidget()
+        self.dt_edit_view_stack.addWidget(self.tbl_dt_edit_grid)
+        self.dt_edit_view_stack.addWidget(self.tbl_dt_edit_combo)
+        layout.addWidget(self.dt_edit_view_stack, 1)
+
+        summary_box = QtWidgets.QGroupBox("목적변수별 개선도 요약 (선택 구분변수)")
+        summary_layout = QtWidgets.QVBoxLayout(summary_box)
+        self.tbl_dt_edit_summary = DataFrameTable(editable=False, float_decimals=3, max_col_width=260)
+        summary_layout.addWidget(self.tbl_dt_edit_summary)
+        layout.addWidget(summary_box)
 
         merge_row = QtWidgets.QHBoxLayout()
         self.txt_dt_edit_merge_label = QtWidgets.QLineEdit("Merged")
@@ -3339,6 +3503,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(apply_row)
 
         self._refresh_dt_edit_var_options()
+        self._switch_dt_edit_view_mode()
         self._load_dt_edit_grid()
 
     def _refresh_dt_edit_var_options(self):
@@ -3376,6 +3541,35 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.cmb_dt_edit_var.setCurrentIndex(idx)
         self.cmb_dt_edit_var.blockSignals(False)
 
+    def _switch_dt_edit_view_mode(self) -> str:
+        """Sets the Decision Tree Editing view mode (안1 vs 안2) and toggles controls."""
+        mode = getattr(self.state, "dt_edit_view_mode", "split") or "split"
+        if hasattr(self, "cmb_dt_edit_view_mode"):
+            data = self.cmb_dt_edit_view_mode.currentData()
+            mode = data if data in ["split", "combo"] else mode
+            idx = self.cmb_dt_edit_view_mode.findData(mode)
+            if idx >= 0 and self.cmb_dt_edit_view_mode.currentIndex() != idx:
+                self.cmb_dt_edit_view_mode.blockSignals(True)
+                self.cmb_dt_edit_view_mode.setCurrentIndex(idx)
+                self.cmb_dt_edit_view_mode.blockSignals(False)
+
+        self.state.dt_edit_view_mode = mode
+
+        if hasattr(self, "dt_edit_view_stack"):
+            self.dt_edit_view_stack.setCurrentIndex(0 if mode == "split" else 1)
+
+        can_edit = mode == "split"
+        for btn_name in ["btn_dt_edit_merge", "btn_dt_edit_reset", "btn_dt_edit_apply"]:
+            if hasattr(self, btn_name):
+                btn = getattr(self, btn_name)
+                btn.setEnabled(can_edit)
+
+        return mode
+
+    def _on_dt_edit_view_changed(self):
+        self._switch_dt_edit_view_mode()
+        self._load_dt_edit_grid()
+
     def _parse_items_list(self, val: Any) -> List[str]:
         if val is None:
             return []
@@ -3409,22 +3603,120 @@ class IntegratedApp(QtWidgets.QMainWindow):
         fac_cols = [c for c in df.columns if str(c).startswith("Factor")]
         return fac_cols
 
-    def _load_dt_edit_grid(self):
-        if not hasattr(self, "tbl_dt_edit_grid"):
-            return
-
+    def _compute_dt_candidate_splits(self, var: str, dep: str) -> List[dict]:
         df = self.state.df
-        var = self.cmb_dt_edit_var.currentText().strip() if hasattr(self, "cmb_dt_edit_var") else ""
-        targets = self._get_dt_edit_targets()
+        if df is None or var not in df.columns or dep not in df.columns:
+            return []
 
-        self.lbl_dt_edit_targets.setText(
-            "목적변수: " + (", ".join(targets) if targets else "(분석 실행 필요)")
-        )
+        y = df[dep]
+        x = df[var]
 
-        if df is None or not var:
-            self.tbl_dt_edit_grid.set_df(None)
-            return
+        is_factor = str(dep).startswith("Factor") or str(dep).startswith("PCA")
+        if is_factor:
+            task = "reg"
+        elif self.state.is_categorical(dep):
+            task = "class"
+        else:
+            task = "reg"
 
+        force_cat = None
+        vtype = self.state.get_var_type(var)
+        if vtype == VAR_TYPE_CATEGORICAL:
+            force_cat = True
+        elif vtype == VAR_TYPE_NUMERIC:
+            force_cat = False
+
+        _, rows = univariate_best_split(y, x, task=task, force_categorical=force_cat)
+        for r in rows:
+            r["dep"] = dep
+            r["ind"] = var
+        return rows
+
+    def _format_split_combo_desc(self, row: dict) -> str:
+        stype = str(row.get("split_type", ""))
+        if stype.startswith("categorical"):
+            left_items = self._parse_items_list(row.get("left_items"))
+            right_items = self._parse_items_list(row.get("right_items"))
+            if not right_items and left_items:
+                right_items = ["(Else)"]
+            left_txt = ",".join(left_items) if left_items else str(row.get("left_group", ""))
+            right_txt = ",".join(right_items) if right_items else str(row.get("right_group", ""))
+            return f"L:{left_txt} | R:{right_txt}"
+
+        cp = row.get("cutpoint")
+        cp_txt = fmt_float(cp, 3) if isinstance(cp, (int, float)) else str(cp)
+        return f"<= {cp_txt} | > {cp_txt}"
+
+    def _build_dt_combo_view_df(self, var: str, targets: List[str]) -> pd.DataFrame:
+        combo_map: Dict[str, dict] = {}
+        max_rows = 300
+
+        for dep in targets:
+            candidates = self._compute_dt_candidate_splits(var, dep)
+            for row in candidates:
+                key = self._format_split_combo_desc(row)
+                rec = combo_map.setdefault(
+                    key,
+                    {
+                        "split_desc": key,
+                        "split_type": row.get("split_type", ""),
+                        "left_n": row.get("n_left", np.nan),
+                        "right_n": row.get("n_right", np.nan),
+                    },
+                )
+                rec[dep] = row.get("improve_rel", np.nan)
+
+        if not combo_map:
+            return pd.DataFrame()
+
+        df_view = pd.DataFrame(combo_map.values())
+        if len(df_view) > max_rows:
+            df_view["max_improve"] = df_view[targets].max(axis=1)
+            df_view = df_view.sort_values("max_improve", ascending=False).head(max_rows)
+            df_view = df_view.drop(columns=["max_improve"])
+
+        cols = ["split_desc", "split_type", "left_n", "right_n"] + targets
+        cols = [c for c in cols if c in df_view.columns]
+        return df_view[cols]
+
+    def _build_dt_edit_summary_df(self, var: str, targets: List[str]) -> pd.DataFrame:
+        summary_rows = []
+        best_df = getattr(self.state, "dt_split_best", None)
+        has_best = best_df is not None and not best_df.empty
+
+        for dep in targets:
+            row = None
+            if has_best:
+                cand = best_df[(best_df["ind"] == var) & (best_df["dep"] == dep)]
+                if not cand.empty:
+                    row = cand.loc[cand["improve_rel"].idxmax()]
+
+            if row is None:
+                candidates = self._compute_dt_candidate_splits(var, dep)
+                if candidates:
+                    row = max(candidates, key=lambda r: r.get("improve_rel", -np.inf))
+
+            if row is None:
+                continue
+
+            summary_rows.append(
+                {
+                    "dep": dep,
+                    "split_type": row.get("split_type", ""),
+                    "left_group": row.get("left_group", ""),
+                    "right_group": row.get("right_group", ""),
+                    "improve_rel": row.get("improve_rel", np.nan),
+                    "n_left": row.get("n_left", np.nan),
+                    "n_right": row.get("n_right", np.nan),
+                }
+            )
+
+        if not summary_rows:
+            return pd.DataFrame()
+
+        return pd.DataFrame(summary_rows).sort_values("improve_rel", ascending=False)
+
+    def _build_dt_edit_split_view_df(self, df: pd.DataFrame, var: str, targets: List[str]) -> pd.DataFrame:
         cats = (
             pd.Series(df[var].dropna().unique())
             .astype(str)
@@ -3469,6 +3761,29 @@ class IntegratedApp(QtWidgets.QMainWindow):
         view = pd.DataFrame(rows)
         cols = ["level"] + targets + ["custom_group"] if targets else ["level", "custom_group"]
         view = view[cols]
+        return view
+
+    def _load_dt_edit_grid(self):
+        if not hasattr(self, "tbl_dt_edit_grid"):
+            return
+
+        df = self.state.df
+        var = self.cmb_dt_edit_var.currentText().strip() if hasattr(self, "cmb_dt_edit_var") else ""
+        targets = self._get_dt_edit_targets()
+
+        self.lbl_dt_edit_targets.setText(
+            "목적변수: " + (", ".join(targets) if targets else "(분석 실행 필요)")
+        )
+
+        mode = self._switch_dt_edit_view_mode()
+
+        if df is None or not var:
+            self.tbl_dt_edit_grid.set_df(None)
+            if hasattr(self, "tbl_dt_edit_combo"):
+                self.tbl_dt_edit_combo.set_df(None)
+            if hasattr(self, "tbl_dt_edit_summary"):
+                self.tbl_dt_edit_summary.set_df(None)
+            return
 
         if not var:
             self.txt_dt_edit_newcol.setPlaceholderText("예: gender_dt_seg")
@@ -3477,7 +3792,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if not self.txt_dt_edit_newcol.text().strip():
                 self.txt_dt_edit_newcol.setText(suggestion if suggestion.endswith("_seg") else suggestion + "_seg")
 
-        self.tbl_dt_edit_grid.set_df(view)
+        summary_df = self._build_dt_edit_summary_df(var, targets)
+        if hasattr(self, "tbl_dt_edit_summary"):
+            self.tbl_dt_edit_summary.set_df(summary_df if not summary_df.empty else None)
+
+        if mode == "combo":
+            combo_df = self._build_dt_combo_view_df(var, targets) if targets else pd.DataFrame()
+            if hasattr(self, "tbl_dt_edit_combo"):
+                self.tbl_dt_edit_combo.set_df(combo_df if not combo_df.empty else None)
+            self.tbl_dt_edit_grid.set_df(None)
+        else:
+            split_df = self._build_dt_edit_split_view_df(df, var, targets)
+            self.tbl_dt_edit_grid.set_df(split_df if not split_df.empty else None)
+            if hasattr(self, "tbl_dt_edit_combo"):
+                self.tbl_dt_edit_combo.set_df(None)
 
     def _extract_dt_edit_df(self) -> pd.DataFrame:
         table = self.tbl_dt_edit_grid
@@ -3493,6 +3821,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
     def _dt_edit_merge_selected(self):
         try:
+            if getattr(self.state, "dt_edit_view_mode", "split") != "split":
+                raise RuntimeError("좌/우 보기에서만 범주 라벨을 묶을 수 있습니다. 보기 전환을 '안 1'로 변경하세요.")
             label = self.txt_dt_edit_merge_label.text().strip()
             if not label:
                 raise RuntimeError("라벨을 입력하세요.")
@@ -3521,6 +3851,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
     def _reset_dt_edit_groups(self):
         try:
+            if getattr(self.state, "dt_edit_view_mode", "split") != "split":
+                raise RuntimeError("좌/우 보기에서만 라벨을 초기화할 수 있습니다. 보기 전환을 '안 1'로 변경하세요.")
             var = self.cmb_dt_edit_var.currentText().strip()
             if var in self.state.dt_edit_group_map:
                 self.state.dt_edit_group_map.pop(var, None)
@@ -3531,6 +3863,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
     def _apply_dt_edit_grouping(self):
         try:
+            if getattr(self.state, "dt_edit_view_mode", "split") != "split":
+                raise RuntimeError("조합 보기에서는 저장할 수 없습니다. 보기 전환을 '안 1'로 변경하세요.")
             self._ensure_df()
             df = self.state.df
             var = self.cmb_dt_edit_var.currentText().strip()
@@ -4788,15 +5122,28 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addWidget(QtWidgets.QLabel("<b>AI Assistant</b>: Ask questions about your current data/analysis."))
 
         # [v8.1] Enhanced API Key section with status
-        key_box = QtWidgets.QGroupBox("OpenAI API Configuration")
+        key_box = QtWidgets.QGroupBox("AI API Configuration (GPT / Gemini)")
         key_layout = QtWidgets.QVBoxLayout(key_box)
-        
+
         key_row = QtWidgets.QHBoxLayout()
+        self.cmb_ai_provider = QtWidgets.QComboBox()
+        self.cmb_ai_provider.addItem("OpenAI (GPT-4o-mini)", "openai")
+        self.cmb_ai_provider.addItem("Gemini (1.5-flash)", "gemini")
+
         self.txt_openai_key = QtWidgets.QLineEdit()
         self.txt_openai_key.setPlaceholderText("Enter OpenAI API Key (sk-...) or leave empty to generate prompt only")
         self.txt_openai_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        key_row.addWidget(QtWidgets.QLabel("API Key:"))
+
+        self.txt_gemini_key = QtWidgets.QLineEdit()
+        self.txt_gemini_key.setPlaceholderText("Enter Gemini API Key (AI Studio) or leave empty to generate prompt only")
+        self.txt_gemini_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+
+        key_row.addWidget(QtWidgets.QLabel("Provider:"))
+        key_row.addWidget(self.cmb_ai_provider)
+        key_row.addWidget(QtWidgets.QLabel("OpenAI Key:"))
         key_row.addWidget(self.txt_openai_key, 1)
+        key_row.addWidget(QtWidgets.QLabel("Gemini Key:"))
+        key_row.addWidget(self.txt_gemini_key, 1)
         key_layout.addLayout(key_row)
         
         # [v8.1] API status and retry info
@@ -4871,15 +5218,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.txt_chat_history.append(f"<b>User:</b> {query}")
         self.txt_user_query.clear()
 
-        api_key = self.txt_openai_key.text().strip()
+        provider, api_key = self._get_ai_provider_and_key()
+        provider_label = "Gemini" if provider == "gemini" else "ChatGPT"
         if not api_key:
-            self.txt_chat_history.append(f"<br><i>[System] No API Key provided. Copy this prompt to ChatGPT:</i><br>")
+            self.txt_chat_history.append(
+                f"<br><i>[System] No API Key provided. Copy this prompt to {provider_label}:</i><br>"
+            )
             self.txt_chat_history.append(f"<pre style='background:#f5f5f5; padding:10px;'>{full_prompt}</pre><br><hr>")
             return
 
         try:
             self.txt_chat_history.append("<i>... Thinking (with auto-retry on rate limit) ...</i>")
-            self.lbl_api_status.setText("<b style='color:orange;'>⏳ Sending request...</b>")
+            self.lbl_api_status.setText(
+                f"<b style='color:orange;'>⏳ Sending request via {provider_label}...</b>"
+            )
             QtWidgets.QApplication.processEvents()
 
             # [v8.1] Use new retry-enabled API call
@@ -4887,12 +5239,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 {"role": "system", "content": "You are a Data Analysis Assistant for market research."},
                 {"role": "user", "content": full_prompt}
             ]
-            success, result = call_openai_api(
-                api_key, 
-                messages, 
-                max_retries=3, 
+            success, result = call_ai_chat(
+                provider,
+                api_key,
+                messages,
+                max_retries=3,
                 initial_delay=2.0,
-                timeout=30
+                timeout=30,
             )
 
             if success:
