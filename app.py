@@ -461,13 +461,14 @@ def call_gemini_api(
         return False, "API key is missing. Please enter a valid key."
 
     model = _normalize_gemini_model(model)
+    path_model = model if model.startswith("models/") else f"models/{model}"
     delay = float(initial_delay)
     last_error = ""
 
     for attempt in range(max_retries):
         try:
             url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                f"https://generativelanguage.googleapis.com/v1beta/{path_model}:generateContent"
                 f"?key={api_key}"
             )
             payload = {
@@ -507,6 +508,16 @@ def call_gemini_api(
                 return False, f"Invalid response from Gemini: {parse_err}"
             return True, text
 
+        except requests.exceptions.HTTPError as http_err:
+            status_code = getattr(getattr(http_err, "response", None), "status_code", None)
+            if status_code == 404:
+                msg = (
+                    "Model not found (404). Please verify the Gemini model name "
+                    "(e.g., gemini-1.5-flash-latest) and your API key's access."
+                )
+            else:
+                msg = f"HTTP error: {http_err}"
+            return False, msg
         except requests.exceptions.Timeout:
             last_error = (
                 f"Request timeout after {timeout}s (Attempt {attempt + 1}/{max_retries})"
@@ -4791,7 +4802,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.radio_edit_points.setToolTip("Drag points to move/merge. Pan is locked.")
         self.radio_edit_view = QtWidgets.QRadioButton("View/Pan Mode")
         self.radio_edit_view.setToolTip("Drag background to pan. Editing is locked.")
-        self.radio_edit_view.setChecked(True)
+        # Default to Edit mode so drag-to-merge stays enabled on tab open
+        self.radio_edit_points.setChecked(True)
 
         self.radio_edit_points.toggled.connect(self._on_edit_mode_toggled)
         self.radio_edit_view.toggled.connect(self._on_edit_mode_toggled)
@@ -4950,6 +4962,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
         s = self.plot_edit.get_cluster_series()
         self.state.cluster_assign = s
+
+        # 1) Update the plot's backing dataframe with the new cluster ids
         if self.state.demand_xy is not None and "id" in self.state.demand_xy.columns:
             df = self.state.demand_xy.copy()
             mapped = df["id"].astype(str).map(s)
@@ -4957,8 +4971,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 mapped = mapped.fillna(df["cluster_id"])
             df["cluster_id"] = mapped.astype(int)
             self.state.demand_xy = df
+
+        # 2) When segments are the points, keep the segment→cluster map and base df in sync
         if self.state.demand_mode.startswith("Segments"):
             self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
+
+            seg_labels = self.state.demand_seg_labels or self._current_segment_labels()
+            if seg_labels is not None and self.state.df is not None:
+                cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
+                df = self.state.df.copy()
+                df["demand_seg_label"] = seg_labels.values
+                df["demand_cluster_id"] = seg_labels.astype(str).map(cl_map).fillna(-1).astype(int)
+                df["demand_cluster_name"] = df["demand_cluster_id"].map(self.state.cluster_names).fillna("")
+                self.state.df = df
+
         self.state.manual_dirty = True
         self._update_cluster_summary()
         self._update_profiler()
