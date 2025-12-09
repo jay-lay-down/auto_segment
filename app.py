@@ -249,6 +249,7 @@ class AppState:
     # Demand Space Profile Data
     demand_seg_profile: Optional[pd.DataFrame] = None
     demand_seg_components: Optional[List[str]] = None
+    demand_targets: Optional[List[str]] = None
     demand_features_used: Optional[List[str]] = None
     demand_seg_labels: Optional[pd.Series] = None
     demand_seg_sep: str = "|"
@@ -296,13 +297,14 @@ def call_openai_api(
     api_key: str,
     messages: List[dict],
     model: str = "gpt-4o-mini",
-    max_retries: int = 3,
+    max_retries: int = 4,
     initial_delay: float = 2.0,
-    timeout: int = 30
+    timeout: int = 30,
 ) -> Tuple[bool, str]:
     """
-    Calls OpenAI API with exponential backoff retry logic.
-    
+    Calls OpenAI API with exponential backoff retry logic and clearer
+    rate-limit handling.
+
     Returns:
         (success: bool, result: str)
         - If success: result is the AI response content
@@ -310,37 +312,44 @@ def call_openai_api(
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.7
-    }
+    payload = {"model": model, "messages": messages, "temperature": 0.7}
 
-    delay = initial_delay
+    delay = float(initial_delay)
     last_error = ""
+    suggested_wait = 0.0
 
     for attempt in range(max_retries):
+        resp: Optional[requests.Response] = None
         try:
             resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=timeout
+                timeout=timeout,
             )
 
             # Check for rate limit (429)
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
-                if retry_after:
-                    wait_time = float(retry_after)
-                else:
-                    wait_time = delay
-                
-                last_error = f"Rate limit hit. Waiting {wait_time:.1f}s... (Attempt {attempt + 1}/{max_retries})"
+                # Some gateways return reset hints
+                reset_hint = resp.headers.get("x-ratelimit-reset-requests")
+                wait_time = delay
+                for candidate in [retry_after, reset_hint]:
+                    try:
+                        if candidate:
+                            wait_time = max(wait_time, float(candidate))
+                    except Exception:
+                        pass
+
+                suggested_wait = max(suggested_wait, wait_time)
+                last_error = (
+                    f"Rate limit hit. Waiting {wait_time:.1f}s before retry "
+                    f"({attempt + 1}/{max_retries})"
+                )
                 time.sleep(wait_time)
-                delay *= 2  # Exponential backoff
+                delay = min(delay * 2, 60)
                 continue
 
             resp.raise_for_status()
@@ -349,15 +358,37 @@ def call_openai_api(
             return True, answer
 
         except requests.exceptions.Timeout:
-            last_error = f"Request timeout after {timeout}s (Attempt {attempt + 1}/{max_retries})"
+            last_error = (
+                f"Request timeout after {timeout}s (Attempt {attempt + 1}/{max_retries})"
+            )
+            suggested_wait = max(suggested_wait, delay)
             time.sleep(delay)
-            delay *= 2
+            delay = min(delay * 2, 60)
 
         except requests.exceptions.HTTPError as e:
+            # Use server-provided message if available
+            if resp is not None:
+                if resp.status_code == 401:
+                    return False, "Invalid API key or unauthorized. Please check your key."
+                if resp.status_code == 429:
+                    suggested_wait = max(suggested_wait, delay)
+                    last_error = "Rate limit exceeded. Please wait and try again."
+                    time.sleep(delay)
+                    delay = min(delay * 2, 60)
+                    continue
+                try:
+                    err_json = resp.json()
+                    msg = err_json.get("error", {}).get("message")
+                    if msg:
+                        return False, msg
+                except Exception:
+                    pass
+
             if "429" in str(e):
-                last_error = f"Rate limit exceeded. Please wait and try again."
+                last_error = "Rate limit exceeded. Please wait and try again."
+                suggested_wait = max(suggested_wait, delay)
                 time.sleep(delay)
-                delay *= 2
+                delay = min(delay * 2, 60)
             else:
                 return False, f"HTTP Error: {str(e)}"
 
@@ -366,6 +397,12 @@ def call_openai_api(
 
         except Exception as e:
             return False, f"Unexpected Error: {str(e)}"
+
+    if suggested_wait > 0:
+        return False, (
+            f"Rate limit hit repeatedly. Please wait about {suggested_wait:.0f}s "
+            "and try again."
+        )
 
     return False, f"Failed after {max_retries} attempts. Last error: {last_error}"
 
@@ -1910,9 +1947,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
             it.setCheckState(QtCore.Qt.CheckState.Unchecked)
             self.lst_demand_segcols.addItem(it)
 
-        self.cmb_demand_target.clear()
-        self.cmb_demand_target.addItem("(None)")
-        self.cmb_demand_target.addItems(cols)
+        self.lst_demand_targets.clear()
+        for c in cols:
+            it = QtWidgets.QListWidgetItem(c)
+            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            it.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            self.lst_demand_targets.addItem(it)
 
     # -------------------------------------------------------------------------
     # [v8.1] Variable Type Manager
@@ -3237,18 +3277,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lst_demand_segcols.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         seg_l.addWidget(self.lst_demand_segcols, 2)
 
+        seg_l.addWidget(QtWidgets.QLabel("Target Variables (multi-select):"))
+        self.lst_demand_targets = QtWidgets.QListWidget()
+        self.lst_demand_targets.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.lst_demand_targets.setMaximumHeight(120)
+        seg_l.addWidget(self.lst_demand_targets, 1)
+
         r = QtWidgets.QHBoxLayout()
         self.txt_demand_seg_sep = QtWidgets.QLineEdit("|")
         self.txt_demand_seg_sep.setMaximumWidth(60)
-        self.cmb_demand_target = QtWidgets.QComboBox()
         self.spin_demand_min_n = QtWidgets.QSpinBox()
         self.spin_demand_min_n.setRange(1, 999999)
         self.spin_demand_min_n.setValue(10)
         r.addWidget(QtWidgets.QLabel("Separator"))
         r.addWidget(self.txt_demand_seg_sep)
-        r.addSpacing(12)
-        r.addWidget(QtWidgets.QLabel("Target Variable"))
-        r.addWidget(self.cmb_demand_target, 2)
         r.addSpacing(12)
         r.addWidget(QtWidgets.QLabel("Min N"))
         r.addWidget(self.spin_demand_min_n)
@@ -3324,7 +3366,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_demand_segcols.setEnabled(seg_mode)
         self.txt_demand_seg_sep.setEnabled(seg_mode)
-        self.cmb_demand_target.setEnabled(seg_mode)
+        self.lst_demand_targets.setEnabled(seg_mode)
         self.spin_demand_min_n.setEnabled(seg_mode)
         self.chk_demand_use_factors.setEnabled(seg_mode)
         self.spin_demand_factor_k.setEnabled(seg_mode)
@@ -3386,13 +3428,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 use_factors = bool(self.chk_demand_use_factors.isChecked())
                 fac_k = int(self.spin_demand_factor_k.value())
-                target = self.cmb_demand_target.currentText().strip()
-                if target == "":
-                    target = "(None)"
+                targets = self._selected_checked_items(self.lst_demand_targets)
                 min_n = int(self.spin_demand_min_n.value())
 
                 prof, feat_cols, labels_by_row = self._build_segment_profiles(
-                    seg_cols, sep, use_factors, fac_k, target, min_n
+                    seg_cols, sep, use_factors, fac_k, targets, min_n
                 )
 
                 X = prof[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -3452,6 +3492,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
+                self.state.demand_targets = targets
                 self.state.demand_features_used = feat_cols
                 self.state.demand_seg_labels = labels_by_row
                 self.state.demand_seg_sep = sep
@@ -3464,7 +3505,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self._update_cluster_summary()
                 self._update_profiler()
 
-                self.lbl_demand_status.setText(f"Done: {coord_name}, segments={len(ids)}, k={k}.")
+                tgt_txt = ", ".join(targets) if targets else "(none)"
+                self.lbl_demand_status.setText(
+                    f"Done: {coord_name}, segments={len(ids)}, k={k}, targets=[{tgt_txt}]."
+                )
                 self._set_status("Demand Space Analysis Completed.")
 
             else:
@@ -3540,7 +3584,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         return merged, feature_names
 
     def _build_segment_profiles(
-        self, seg_cols: List[str], sep: str, use_factors: bool, fac_k: int, target: str, min_n: int
+        self, seg_cols: List[str], sep: str, use_factors: bool, fac_k: int, targets: List[str], min_n: int
     ):
         df = self.state.df.copy()
 
@@ -3550,23 +3594,34 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if cnt.empty:
             raise RuntimeError("No segments found for the selected *_seg columns.")
 
-        if target == "(None)" or target not in df.columns:
-            raise RuntimeError("Target 변수를 선택해 주세요. (Segments-as-points는 타깃×세그 분포 기반)")
+        if not targets:
+            raise RuntimeError("Target 변수를 1개 이상 선택해 주세요. (Segments-as-points는 타깃×세그 분포 기반)")
 
-        # Pivot: target rows x segment columns → normalize each segment column to sum=1
-        pivot = (
-            df.assign(_cnt=1)
-            .pivot_table(index=target, columns="_SEG_LABEL_", values="_cnt", aggfunc="sum", fill_value=0)
-            .astype(float)
-        )
+        missing = [t for t in targets if t not in df.columns]
+        if missing:
+            raise RuntimeError(f"다음 타깃 변수가 데이터에 없습니다: {', '.join(missing)}")
 
-        if pivot.shape[1] < 2:
+        seg_levels = cnt.index.tolist()
+        pivot_norms: List[pd.DataFrame] = []
+        for tgt in targets:
+            pivot = (
+                df.assign(_cnt=1)
+                .pivot_table(index=tgt, columns="_SEG_LABEL_", values="_cnt", aggfunc="sum", fill_value=0)
+                .astype(float)
+            )
+
+            # Align all segment columns to the full set
+            pivot = pivot.reindex(columns=seg_levels, fill_value=0.0)
+            col_sum = pivot.sum(axis=0)
+            pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
+            pivot_norms.append(pivot_norm)
+
+        pivot_stack = pd.concat(pivot_norms, axis=0)
+
+        if pivot_stack.shape[1] < 2:
             raise RuntimeError("세그먼트 조합이 1개뿐입니다. 최소 2개 이상이어야 합니다.")
 
-        col_sum = pivot.sum(axis=0)
-        pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
-
-        seg_matrix = pivot_norm.T
+        seg_matrix = pivot_stack.T
         seg_matrix["n"] = seg_matrix.index.map(cnt.get).fillna(0).astype(int)
 
         # Optional PCA/Factor profile mean features (align with R flow: target×seg pivot + PCA profile)
