@@ -253,6 +253,7 @@ class AppState:
     demand_xy: Optional[pd.DataFrame] = None
     cluster_assign: Optional[pd.Series] = None
     cluster_names: Dict[int, str] = field(default_factory=dict)
+    cluster_colors: Dict[int, str] = field(default_factory=dict)
 
     # Demand Space Profile Data
     demand_seg_profile: Optional[pd.DataFrame] = None
@@ -434,13 +435,14 @@ def _normalize_gemini_model(model: Optional[str]) -> str:
     """Ensure Gemini model names align with deployable versions."""
     name = (model or "").strip()
     if not name:
-        return "gemini-1.5-flash-latest"
+        return "gemini-1.5-flash"
 
     if name.startswith("models/"):
         name = name.split("/", 1)[1]
 
     alias = {
-        "gemini-1.5-flash": "gemini-1.5-flash-latest",
+        "gemini-1.5-flash": "gemini-1.5-flash",
+        "gemini-1.5-flash-latest": "gemini-1.5-flash",
         "gemini-1.5-flash-001": "gemini-1.5-flash-001",
         "gemini-pro": "gemini-pro",
     }
@@ -451,7 +453,7 @@ def _normalize_gemini_model(model: Optional[str]) -> str:
 def call_gemini_api(
     api_key: str,
     messages: List[dict],
-    model: str = "gemini-1.5-flash-latest",
+    model: str = "gemini-1.5-flash",
     max_retries: int = 4,
     initial_delay: float = 2.0,
     timeout: int = 30,
@@ -513,7 +515,7 @@ def call_gemini_api(
             if status_code == 404:
                 msg = (
                     "Model not found (404). Please verify the Gemini model name "
-                    "(e.g., gemini-1.5-flash-latest) and your API key's access."
+                    "(e.g., gemini-1.5-flash) and your API key's access."
                 )
             else:
                 msg = f"HTTP error: {http_err}"
@@ -544,7 +546,7 @@ def call_ai_chat(
 ) -> Tuple[bool, str]:
     provider = (provider or "openai").lower()
     if provider == "gemini":
-        model = _normalize_gemini_model(model or "gemini-1.5-flash-latest")
+        model = _normalize_gemini_model(model or "gemini-1.5-flash")
         return call_gemini_api(
             api_key,
             messages,
@@ -1514,6 +1516,7 @@ class DemandClusterPlot(pg.PlotWidget):
         self._xy: np.ndarray = np.zeros((0, 2), dtype=float)
         self._cluster: np.ndarray = np.zeros((0,), dtype=int)
         self._cluster_names: Dict[int, str] = {}
+        self._cluster_custom_colors: Dict[int, QtGui.QColor] = {}
 
         self._scatter = pg.ScatterPlotItem(size=11, pxMode=True)
         self.addItem(self._scatter)
@@ -1532,6 +1535,12 @@ class DemandClusterPlot(pg.PlotWidget):
 
         self._label_pos_override: Dict[int, Tuple[float, float]] = {}
 
+        # New cluster creation template (user-defined name/color via UI)
+        self._new_cluster_enabled: bool = False
+        self._new_cluster_name: str = ""
+        self._new_cluster_color: Optional[QtGui.QColor] = None
+        self._new_clusters_created: List[Tuple[int, str, QtGui.QColor]] = []
+
     def set_edit_mode_active(self, active: bool):
         self._edit_mode_active = active
 
@@ -1544,6 +1553,29 @@ class DemandClusterPlot(pg.PlotWidget):
     def set_show_all_point_labels(self, on: bool):
         self._show_all_point_labels = bool(on)
         self._draw_scatter()
+
+    def set_new_cluster_mode(self, on: bool):
+        self._new_cluster_enabled = bool(on)
+
+    def set_new_cluster_template(self, name: str, color: Optional[str]):
+        self._new_cluster_name = name or ""
+        if color:
+            try:
+                self._new_cluster_color = qcolor(str(color))
+            except Exception:
+                self._new_cluster_color = None
+        else:
+            self._new_cluster_color = None
+
+    def consume_new_clusters(self) -> List[Tuple[int, str, str]]:
+        items: List[Tuple[int, str, str]] = []
+        for cid, name, col in self._new_clusters_created:
+            try:
+                items.append((int(cid), name, QtGui.QColor(col).name()))
+            except Exception:
+                continue
+        self._new_clusters_created.clear()
+        return items
 
     def reset_label_positions(self):
         self._label_pos_override.clear()
@@ -1595,16 +1627,33 @@ class DemandClusterPlot(pg.PlotWidget):
             self._label_items[cid].setPos(float(p[0]), float(p[1]))
 
     def _cluster_color(self, cid: int, alpha=255) -> QtGui.QColor:
+        if int(cid) in self._cluster_custom_colors:
+            c = QtGui.QColor(self._cluster_custom_colors[int(cid)])
+            c.setAlpha(int(alpha))
+            return c
         base = self._hex[(int(cid) - 1) % len(self._hex)]
         return qcolor(base, alpha=alpha)
 
-    def set_data(self, ids: List[str], labels: List[str], xy: np.ndarray, clusters: np.ndarray,
-                 cluster_names: Optional[Dict[int, str]] = None):
+    def set_data(
+        self,
+        ids: List[str],
+        labels: List[str],
+        xy: np.ndarray,
+        clusters: np.ndarray,
+        cluster_names: Optional[Dict[int, str]] = None,
+        cluster_colors: Optional[Dict[int, str]] = None,
+    ):
         self._ids = list(map(str, ids))
         self._labels = list(map(lambda x: "" if x is None else str(x), labels))
         self._xy = np.asarray(xy, dtype=float)
         self._cluster = np.asarray(clusters, dtype=int)
         self._cluster_names = dict(cluster_names or {})
+        self._cluster_custom_colors = {}
+        for k, v in (cluster_colors or {}).items():
+            try:
+                self._cluster_custom_colors[int(k)] = qcolor(str(v))
+            except Exception:
+                continue
 
         self._selected.clear()
         self._dragging = False
@@ -1623,11 +1672,33 @@ class DemandClusterPlot(pg.PlotWidget):
     def get_cluster_series(self) -> pd.Series:
         return pd.Series(self._cluster.copy(), index=self._ids)
 
+    def get_cluster_names(self) -> Dict[int, str]:
+        return dict(self._cluster_names)
+
+    def get_cluster_colors(self) -> Dict[int, str]:
+        out: Dict[int, str] = {}
+        for k, v in self._cluster_custom_colors.items():
+            try:
+                out[int(k)] = QtGui.QColor(v).name()
+            except Exception:
+                continue
+        return out
+
     def get_xy_map(self) -> Dict[str, Tuple[float, float]]:
         return {self._ids[i]: (float(self._xy[i, 0]), float(self._xy[i, 1])) for i in range(len(self._ids))}
 
     def set_cluster_names(self, names: Dict[int, str]):
         self._cluster_names = dict(names or {})
+        self._draw_hulls_and_labels()
+
+    def set_cluster_colors(self, colors: Dict[int, str]):
+        self._cluster_custom_colors = {}
+        for k, v in (colors or {}).items():
+            try:
+                self._cluster_custom_colors[int(k)] = qcolor(str(v))
+            except Exception:
+                continue
+        self._draw_scatter()
         self._draw_hulls_and_labels()
 
     def remember_label_position(self, cid: int, pos_xy: Tuple[float, float]):
@@ -1758,8 +1829,19 @@ class DemandClusterPlot(pg.PlotWidget):
             out[cid] = (float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1])))
         return out
 
-    def _cluster_at_position(self, drop_xy: Tuple[float, float]) -> Optional[int]:
-        """Return cluster id under drop_xy, preferring hull containment then nearest centroid."""
+    def _cluster_scale(self) -> float:
+        if self._xy.shape[0] == 0:
+            return 0.0
+        dx = float(np.max(self._xy[:, 0]) - np.min(self._xy[:, 0])) if self._xy.size else 0.0
+        dy = float(np.max(self._xy[:, 1]) - np.min(self._xy[:, 1])) if self._xy.size else 0.0
+        return max(dx, dy)
+
+    def _cluster_at_position(self, drop_xy: Tuple[float, float], allow_far_new: bool = False) -> Optional[int]:
+        """
+        Return cluster id under drop_xy, preferring hull containment then nearest centroid.
+        When allow_far_new=True, drop positions far from any centroid will return None
+        to signal new-cluster creation.
+        """
         pt = QtCore.QPointF(drop_xy[0], drop_xy[1])
 
         # 1) If the drop point is inside a drawn hull, use that cluster.
@@ -1775,14 +1857,25 @@ class DemandClusterPlot(pg.PlotWidget):
         if not cent:
             return None
         d2 = {cid: (drop_xy[0] - c[0]) ** 2 + (drop_xy[1] - c[1]) ** 2 for cid, c in cent.items()}
-        return int(min(d2, key=d2.get))
+        nearest = int(min(d2, key=d2.get))
+        if allow_far_new:
+            min_dist = float(np.sqrt(d2[nearest]))
+            scale = self._cluster_scale()
+            thresh = max(0.18 * scale, 0.0)
+            if scale <= 0:
+                thresh = 0.0
+            if thresh > 0 and min_dist > thresh:
+                return None
+        return nearest
 
-    def _assign_selected_to_nearest_cluster(self, drop_xy: Tuple[float, float]):
-        dst = self._cluster_at_position(drop_xy)
+    def _assign_selected_to_cluster(self, dst: Optional[int]):
         if dst is None or not self._selected:
+            self._drag_temp_positions = None
+            self._drag_anchor_xy = None
+            self._draw_scatter()
             return
         for i in self._selected:
-            self._cluster[i] = dst
+            self._cluster[i] = int(dst)
         self._drag_temp_positions = None
         self._drag_anchor_xy = None
         self.redraw_all()
@@ -1806,6 +1899,33 @@ class DemandClusterPlot(pg.PlotWidget):
         self._drag_anchor_xy = None
         self.redraw_all()
         self.sigCoordsChanged.emit()
+
+    def _create_cluster_from_drop(self, drop_xy: Tuple[float, float]):
+        new_cid = int(max(self._cluster) if len(self._cluster) else 0) + 1
+        name = self._new_cluster_name.strip() or f"Cluster {new_cid}"
+        color = self._new_cluster_color or self._cluster_color(new_cid, alpha=255)
+
+        if self._drag_temp_positions is not None:
+            self._xy = self._drag_temp_positions
+
+        for i in self._selected:
+            self._cluster[i] = new_cid
+
+        self._cluster_names[new_cid] = name
+        self._cluster_custom_colors[new_cid] = QtGui.QColor(color)
+        self._new_clusters_created.append((new_cid, name, QtGui.QColor(color)))
+
+        self._drag_temp_positions = None
+        self._drag_anchor_xy = None
+        self.redraw_all()
+        self.sigClustersChanged.emit()
+
+    def _drop_with_snap(self, drop_xy: Tuple[float, float]):
+        dst = self._cluster_at_position(drop_xy, allow_far_new=self._new_cluster_enabled)
+        if self._new_cluster_enabled and dst is None:
+            self._create_cluster_from_drop(drop_xy)
+        else:
+            self._assign_selected_to_cluster(dst)
 
     def drag_event(self, pos: Tuple[float, float], ev):
         if not self._editable_widget:
@@ -1836,7 +1956,7 @@ class DemandClusterPlot(pg.PlotWidget):
             if self._free_move_points:
                 self._commit_selected_move(pos)
             else:
-                self._assign_selected_to_nearest_cluster(pos)
+                self._drop_with_snap(pos)
             return
 
         if self._drag_temp_positions is not None and self._selected and self._drag_anchor_xy is not None:
@@ -4531,6 +4651,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.demand_xy = xy_df
                 self.state.cluster_assign = cl_s
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
+                palette = pal_hex()
+                self.state.cluster_colors = {i + 1: palette[i % len(palette)] for i in range(k)}
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
                 self.state.demand_targets = targets
@@ -4540,7 +4662,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.demand_seg_cluster_map = dict(zip(ids, cl))
                 self.state.manual_dirty = False
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
+                args = (ids, labels, xy, cl, self.state.cluster_names, self.state.cluster_colors)
                 self.plot_preview.set_data(*args)
                 self.plot_edit.set_data(*args)
                 self._update_cluster_summary()
@@ -4611,13 +4733,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.demand_xy = xy_df
                 self.state.cluster_assign = cl_s
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
+                palette = pal_hex()
+                self.state.cluster_colors = {i + 1: palette[i % len(palette)] for i in range(k)}
                 self.state.demand_seg_profile = None
                 self.state.demand_targets = targets
                 self.state.demand_features_used = feat_cols
                 self.state.demand_seg_components = None
                 self.state.manual_dirty = False
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
+                args = (ids, labels, xy, cl, self.state.cluster_names, self.state.cluster_colors)
                 self.plot_preview.set_data(*args)
                 self.plot_edit.set_data(*args)
                 self._update_cluster_summary()
@@ -4830,6 +4954,38 @@ class IntegratedApp(QtWidgets.QMainWindow):
         olay.addWidget(self.btn_reset_label_pos)
         left.addWidget(opt_group)
 
+        add_group = QtWidgets.QGroupBox("Add Cluster (Drag into empty space)")
+        add_lay = QtWidgets.QVBoxLayout(add_group)
+        self.chk_add_cluster_mode = QtWidgets.QCheckBox("Enable drag-to-add cluster")
+        self.chk_add_cluster_mode.setToolTip(
+            "Select points, enable, then drop into an empty area to spawn a new cluster with the chosen name/color."
+        )
+        self.chk_add_cluster_mode.toggled.connect(self._on_new_cluster_toggle)
+        add_lay.addWidget(self.chk_add_cluster_mode)
+
+        name_row = QtWidgets.QHBoxLayout()
+        self.txt_new_cluster_name = QtWidgets.QLineEdit("New Cluster")
+        self.txt_new_cluster_name.textChanged.connect(lambda _: self._apply_new_cluster_template())
+        name_row.addWidget(QtWidgets.QLabel("Name"))
+        name_row.addWidget(self.txt_new_cluster_name)
+        add_lay.addLayout(name_row)
+
+        color_row = QtWidgets.QHBoxLayout()
+        self._new_cluster_color_hex = pal_hex()[0]
+        self.btn_new_cluster_color = QtWidgets.QPushButton("Pick Color")
+        style_button(self.btn_new_cluster_color, level=1)
+        self.btn_new_cluster_color.clicked.connect(self._pick_new_cluster_color)
+        self.lbl_new_cluster_color = QtWidgets.QLabel(self._new_cluster_color_hex)
+        color_row.addWidget(QtWidgets.QLabel("Color"))
+        color_row.addWidget(self.btn_new_cluster_color)
+        color_row.addWidget(self.lbl_new_cluster_color)
+        add_lay.addLayout(color_row)
+
+        self._update_new_cluster_color_button()
+        self._apply_new_cluster_template()
+        self._on_new_cluster_toggle(False)
+        left.addWidget(add_group)
+
         # [v8.1] Enhanced Cluster Summary with sub-segment details
         left.addWidget(QtWidgets.QLabel("<b>Cluster Summary</b> (Points & Sub-segments)"))
         self.tbl_cluster_summary = DataFrameTable(float_decimals=2)
@@ -4873,6 +5029,33 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._set_status("Edit Mode: Drag points/labels enabled. (Pan locked)")
         else:
             self._set_status("View Mode: Pan/Zoom enabled. (Editing locked)")
+
+    def _update_new_cluster_color_button(self):
+        col = getattr(self, "_new_cluster_color_hex", "#ff9800")
+        self.lbl_new_cluster_color.setText(col)
+        self.btn_new_cluster_color.setStyleSheet(
+            f"background-color: {col}; color: #000; border: 1px solid #555;"
+        )
+
+    def _apply_new_cluster_template(self):
+        name = self.txt_new_cluster_name.text().strip()
+        col = getattr(self, "_new_cluster_color_hex", None)
+        self.plot_edit.set_new_cluster_template(name, col)
+
+    def _on_new_cluster_toggle(self, checked: bool):
+        self.txt_new_cluster_name.setEnabled(bool(checked))
+        self.btn_new_cluster_color.setEnabled(bool(checked))
+        self.lbl_new_cluster_color.setEnabled(bool(checked))
+        self.plot_edit.set_new_cluster_mode(bool(checked))
+        if checked:
+            self._apply_new_cluster_template()
+
+    def _pick_new_cluster_color(self):
+        col = QtWidgets.QColorDialog.getColor(QtGui.QColor(self._new_cluster_color_hex), self, "Select Cluster Color")
+        if col.isValid():
+            self._new_cluster_color_hex = col.name()
+            self._update_new_cluster_color_button()
+            self._apply_new_cluster_template()
 
     def _update_cluster_summary(self):
         """[v8.1] Enhanced to show sub-segment details for each cluster."""
@@ -4963,6 +5146,23 @@ class IntegratedApp(QtWidgets.QMainWindow):
         s = self.plot_edit.get_cluster_series()
         self.state.cluster_assign = s
 
+        # Bring in any newly created cluster names/colors from the edit plot
+        new_clusters = self.plot_edit.consume_new_clusters()
+        for cid, name, color in new_clusters:
+            if name:
+                self.state.cluster_names[int(cid)] = name
+            if color:
+                self.state.cluster_colors[int(cid)] = color
+
+        plot_names = self.plot_edit.get_cluster_names()
+        plot_colors = self.plot_edit.get_cluster_colors()
+        for cid in s.unique():
+            cid_int = int(cid)
+            if cid_int not in plot_names:
+                plot_names[cid_int] = self.state.cluster_names.get(cid_int, f"Cluster {cid_int}")
+        self.state.cluster_names.update(plot_names)
+        self.state.cluster_colors.update(plot_colors)
+
         # 1) Update the plot's backing dataframe with the new cluster ids
         if self.state.demand_xy is not None and "id" in self.state.demand_xy.columns:
             df = self.state.demand_xy.copy()
@@ -4986,6 +5186,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.df = df
 
         self.state.manual_dirty = True
+        self.plot_edit.set_cluster_names(self.state.cluster_names)
+        self.plot_edit.set_cluster_colors(self.state.cluster_colors)
+        self.plot_preview.set_cluster_names(self.state.cluster_names)
+        self.plot_preview.set_cluster_colors(self.state.cluster_colors)
         self._update_cluster_summary()
         self._update_profiler()
         self._refresh_demand_preview()
@@ -5025,7 +5229,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
             cl = cl.fillna(default_cl)
 
         clusters = cl.astype(int).to_numpy()
-        self.plot_preview.set_data(ids, labels, xy, clusters, self.state.cluster_names)
+        self.plot_preview.set_data(
+            ids,
+            labels,
+            xy,
+            clusters,
+            self.state.cluster_names,
+            self.state.cluster_colors,
+        )
 
     def _rename_cluster(self):
         try:
@@ -5173,7 +5384,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         key_row = QtWidgets.QHBoxLayout()
         self.cmb_ai_provider = QtWidgets.QComboBox()
         self.cmb_ai_provider.addItem("OpenAI (GPT-4o-mini)", "openai")
-        self.cmb_ai_provider.addItem("Gemini (1.5-flash-latest)", "gemini")
+        self.cmb_ai_provider.addItem("Gemini (1.5-flash)", "gemini")
 
         self.txt_openai_key = QtWidgets.QLineEdit()
         self.txt_openai_key.setPlaceholderText("Enter OpenAI API Key (sk-...) or leave empty to generate prompt only")
