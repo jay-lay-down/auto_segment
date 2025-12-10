@@ -4918,6 +4918,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.tabs.addTab(tab, "Segmentation Editing")
         layout = QtWidgets.QHBoxLayout(tab)
 
+        # Initialize the editable plot first so dependent controls can reference it safely
+        self.plot_edit = DemandClusterPlot(editable=True)
+        self.plot_edit.sigClustersChanged.connect(self._on_manual_clusters_changed)
+        self.plot_edit.sigCoordsChanged.connect(self._on_manual_coords_changed)
+
         left = QtWidgets.QVBoxLayout()
 
         toggle_group = QtWidgets.QGroupBox("Edit Mode (Toggle)")
@@ -5007,9 +5012,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(left, 1)
 
         center = QtWidgets.QVBoxLayout()
-        self.plot_edit = DemandClusterPlot(editable=True)
-        self.plot_edit.sigClustersChanged.connect(self._on_manual_clusters_changed)
-        self.plot_edit.sigCoordsChanged.connect(self._on_manual_coords_changed)
         center.addWidget(self.plot_edit, 1)
         layout.addLayout(center, 2)
 
