@@ -442,12 +442,19 @@ def _normalize_gemini_model(model: Optional[str]) -> str:
         name = name.split("/", 1)[1]
 
     alias = {
+        "gemini": "gemini-1.5-flash",
         "gemini-1.5-flash": "gemini-1.5-flash",
         "gemini-1.5-flash-latest": "gemini-1.5-flash",
         "gemini-1.5-flash-001": "gemini-1.5-flash-001",
-        "gemini-pro": "gemini-pro",
+        "gemini-1.5-pro": "gemini-1.5-pro",
+        "gemini-1.5-pro-001": "gemini-1.5-pro-001",
+        "gemini-1.5-flash-8b": "gemini-1.5-flash-8b",
+        "gemini-3-pro-preview": "gemini-3-pro-preview",
+        "gemini-3.5-pro-preview": "gemini-3.5-pro-preview",
         "gemini (1.5-flash)": "gemini-1.5-flash",
         "gemini (1.5-flash-latest)": "gemini-1.5-flash",
+        "gemini (3-pro-preview)": "gemini-3-pro-preview",
+        "gemini (3.5-pro-preview)": "gemini-3.5-pro-preview",
     }
 
     return alias.get(name, name)
@@ -466,11 +473,30 @@ def call_gemini_api(
         return False, "API key is missing. Please enter a valid key."
 
     model = _normalize_gemini_model(model)
-    path_model = model if model.startswith("models/") else f"models/{model}"
+    fallback_by_model = {
+        "gemini-1.5-flash": ["gemini-1.5-flash-001", "gemini-1.5-pro"],
+        "gemini-1.5-flash-latest": ["gemini-1.5-flash", "gemini-1.5-flash-001"],
+        "gemini-1.5-flash-001": ["gemini-1.5-flash", "gemini-1.5-pro"],
+        "gemini-1.5-flash-8b": ["gemini-1.5-flash", "gemini-1.5-flash-001"],
+        "gemini-1.5-pro": ["gemini-1.5-pro-001", "gemini-1.5-flash"],
+        "gemini-1.5-pro-001": ["gemini-1.5-pro", "gemini-1.5-flash"],
+        "gemini-3-pro-preview": ["gemini-3.5-pro-preview", "gemini-1.5-pro"],
+        "gemini-3.5-pro-preview": ["gemini-3-pro-preview", "gemini-1.5-pro"],
+    }
+    candidate_models: List[str] = [model]
+    for alt in fallback_by_model.get(model, ["gemini-1.5-flash"]):
+        if alt not in candidate_models:
+            candidate_models.append(alt)
+
+    model_idx = 0
     delay = float(initial_delay)
     last_error = ""
 
     for attempt in range(max_retries):
+        current_model = candidate_models[min(model_idx, len(candidate_models) - 1)]
+        path_model = (
+            current_model if current_model.startswith("models/") else f"models/{current_model}"
+        )
         try:
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/{path_model}:generateContent"
@@ -516,9 +542,26 @@ def call_gemini_api(
         except requests.exceptions.HTTPError as http_err:
             status_code = getattr(getattr(http_err, "response", None), "status_code", None)
             if status_code == 404:
+                last_error = (
+                    f"Model not found (404) for '{current_model}'. "
+                    "Trying alternate Gemini model names."
+                )
+                if model_idx + 1 < len(candidate_models):
+                    model_idx += 1
+                    continue
+                tried = ", ".join(candidate_models)
+                recommended = ", ".join(
+                    [
+                        "gemini-1.5-flash",
+                        "gemini-1.5-flash-001",
+                        "gemini-1.5-pro",
+                        "gemini-3-pro-preview",
+                        "gemini-3.5-pro-preview",
+                    ]
+                )
                 msg = (
                     "Model not found (404). Please verify the Gemini model name "
-                    "(e.g., gemini-1.5-flash) and your API key's access."
+                    f"and access. Tried: {tried}. Recommended models: {recommended}."
                 )
             else:
                 msg = f"HTTP error: {http_err}"
