@@ -437,6 +437,7 @@ def _normalize_gemini_model(model: Optional[str]) -> str:
     if not name:
         return "gemini-1.5-flash"
 
+    name = name.lower()
     if name.startswith("models/"):
         name = name.split("/", 1)[1]
 
@@ -445,6 +446,8 @@ def _normalize_gemini_model(model: Optional[str]) -> str:
         "gemini-1.5-flash-latest": "gemini-1.5-flash",
         "gemini-1.5-flash-001": "gemini-1.5-flash-001",
         "gemini-pro": "gemini-pro",
+        "gemini (1.5-flash)": "gemini-1.5-flash",
+        "gemini (1.5-flash-latest)": "gemini-1.5-flash",
     }
 
     return alias.get(name, name)
