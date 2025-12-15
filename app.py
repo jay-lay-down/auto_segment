@@ -435,26 +435,30 @@ def _normalize_gemini_model(model: Optional[str]) -> str:
     """Ensure Gemini model names align with deployable versions."""
     name = (model or "").strip()
     if not name:
-        return "gemini-1.5-flash"
+        return "gemini-3-pro-preview"
 
     name = name.lower()
     if name.startswith("models/"):
         name = name.split("/", 1)[1]
 
     alias = {
-        "gemini": "gemini-1.5-flash",
+        "gemini": "gemini-3-pro-preview",
         "gemini-1.5-flash": "gemini-1.5-flash",
         "gemini-1.5-flash-latest": "gemini-1.5-flash",
         "gemini-1.5-flash-001": "gemini-1.5-flash-001",
         "gemini-1.5-pro": "gemini-1.5-pro",
         "gemini-1.5-pro-001": "gemini-1.5-pro-001",
         "gemini-1.5-flash-8b": "gemini-1.5-flash-8b",
+        "gemini-3-pro": "gemini-3-pro-preview",
         "gemini-3-pro-preview": "gemini-3-pro-preview",
+        "gemini-3.5-pro": "gemini-3.5-pro-preview",
         "gemini-3.5-pro-preview": "gemini-3.5-pro-preview",
+        "gemini-3.5-pro-preview-0409": "gemini-3.5-pro-preview-0409",
         "gemini (1.5-flash)": "gemini-1.5-flash",
         "gemini (1.5-flash-latest)": "gemini-1.5-flash",
         "gemini (3-pro-preview)": "gemini-3-pro-preview",
         "gemini (3.5-pro-preview)": "gemini-3.5-pro-preview",
+        "gemini (3.5-pro-preview-0409)": "gemini-3.5-pro-preview-0409",
     }
 
     return alias.get(name, name)
@@ -463,7 +467,7 @@ def _normalize_gemini_model(model: Optional[str]) -> str:
 def call_gemini_api(
     api_key: str,
     messages: List[dict],
-    model: str = "gemini-1.5-flash",
+    model: str = "gemini-3-pro-preview",
     max_retries: int = 4,
     initial_delay: float = 2.0,
     timeout: int = 30,
@@ -474,17 +478,31 @@ def call_gemini_api(
 
     model = _normalize_gemini_model(model)
     fallback_by_model = {
+        "gemini-3-pro-preview": [
+            "gemini-3.5-pro-preview",
+            "gemini-3.5-pro-preview-0409",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ],
+        "gemini-3.5-pro-preview": [
+            "gemini-3-pro-preview",
+            "gemini-3.5-pro-preview-0409",
+            "gemini-1.5-pro",
+        ],
+        "gemini-3.5-pro-preview-0409": [
+            "gemini-3.5-pro-preview",
+            "gemini-3-pro-preview",
+            "gemini-1.5-pro",
+        ],
         "gemini-1.5-flash": ["gemini-1.5-flash-001", "gemini-1.5-pro"],
         "gemini-1.5-flash-latest": ["gemini-1.5-flash", "gemini-1.5-flash-001"],
         "gemini-1.5-flash-001": ["gemini-1.5-flash", "gemini-1.5-pro"],
         "gemini-1.5-flash-8b": ["gemini-1.5-flash", "gemini-1.5-flash-001"],
         "gemini-1.5-pro": ["gemini-1.5-pro-001", "gemini-1.5-flash"],
         "gemini-1.5-pro-001": ["gemini-1.5-pro", "gemini-1.5-flash"],
-        "gemini-3-pro-preview": ["gemini-3.5-pro-preview", "gemini-1.5-pro"],
-        "gemini-3.5-pro-preview": ["gemini-3-pro-preview", "gemini-1.5-pro"],
     }
     candidate_models: List[str] = [model]
-    for alt in fallback_by_model.get(model, ["gemini-1.5-flash"]):
+    for alt in fallback_by_model.get(model, ["gemini-3-pro-preview", "gemini-1.5-flash"]):
         if alt not in candidate_models:
             candidate_models.append(alt)
 
@@ -552,11 +570,11 @@ def call_gemini_api(
                 tried = ", ".join(candidate_models)
                 recommended = ", ".join(
                     [
-                        "gemini-1.5-flash",
-                        "gemini-1.5-flash-001",
-                        "gemini-1.5-pro",
                         "gemini-3-pro-preview",
                         "gemini-3.5-pro-preview",
+                        "gemini-3.5-pro-preview-0409",
+                        "gemini-1.5-pro",
+                        "gemini-1.5-flash",
                     ]
                 )
                 msg = (
@@ -592,7 +610,7 @@ def call_ai_chat(
 ) -> Tuple[bool, str]:
     provider = (provider or "openai").lower()
     if provider == "gemini":
-        model = _normalize_gemini_model(model or "gemini-1.5-flash")
+        model = _normalize_gemini_model(model or "gemini-3-pro-preview")
         return call_gemini_api(
             api_key,
             messages,
@@ -5431,8 +5449,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         key_row = QtWidgets.QHBoxLayout()
         self.cmb_ai_provider = QtWidgets.QComboBox()
-        self.cmb_ai_provider.addItem("OpenAI (GPT-4o-mini)", "openai")
-        self.cmb_ai_provider.addItem("Gemini (1.5-flash)", "gemini")
+        self.cmb_ai_provider.addItem("OpenAI (기본: GPT-4o-mini)", "openai")
+        self.cmb_ai_provider.addItem("Gemini (기본: 3-pro-preview)", "gemini")
 
         self.txt_openai_key = QtWidgets.QLineEdit()
         self.txt_openai_key.setPlaceholderText("Enter OpenAI API Key (sk-...) or leave empty to generate prompt only")
