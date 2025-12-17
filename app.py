@@ -2805,6 +2805,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._render_factor_loadings_table()
             self._sync_factor_name_editor()
 
+            self._render_factor_loadings_table()
+
             self.tbl_preview.set_df(df)
             self._refresh_all_column_lists()
             self._set_status(f"{mode_name} completed. Columns {score_cols} added.")
