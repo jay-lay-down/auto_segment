@@ -227,6 +227,7 @@ class AppState:
     factor_loadings: Optional[pd.DataFrame] = None
     factor_mode: str = "PCA"
     factor_ai_names: Dict[str, str] = field(default_factory=dict)
+    factor_ai_suggestions: Dict[str, str] = field(default_factory=dict)
 
     # Decision tree outputs (Setting Tab)
     dt_improve_pivot: Optional[pd.DataFrame] = None
@@ -2608,7 +2609,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_factor_cols = QtWidgets.QListWidget()
         self.lst_factor_cols.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        left.addWidget(self.lst_factor_cols, 1)
+        self.lst_factor_cols.setMaximumHeight(220)
+        size_pol = self.lst_factor_cols.sizePolicy()
+        size_pol.setVerticalStretch(0)
+        self.lst_factor_cols.setSizePolicy(size_pol)
+        left.addWidget(self.lst_factor_cols)
 
         # Selection Buttons
         btnrow = QtWidgets.QHBoxLayout()
@@ -2665,6 +2670,32 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lbl_factor_info = QtWidgets.QLabel("Analysis not run.")
         self.lbl_factor_info.setWordWrap(True)
         left.addWidget(self.lbl_factor_info)
+
+        # Factor name editor (AI suggestions + manual edits)
+        name_grp = QtWidgets.QGroupBox("Factor Names (AI 제안/수정)")
+        name_lay = QtWidgets.QVBoxLayout(name_grp)
+        self.tbl_factor_name_editor = QtWidgets.QTableWidget()
+        self.tbl_factor_name_editor.setColumnCount(3)
+        self.tbl_factor_name_editor.setHorizontalHeaderLabels(["Factor", "Suggested", "Final Name"])
+        self.tbl_factor_name_editor.horizontalHeader().setStretchLastSection(True)
+        self.tbl_factor_name_editor.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+        self.tbl_factor_name_editor.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.AllEditTriggers)
+        self.tbl_factor_name_editor.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_factor_name_editor.setAlternatingRowColors(True)
+        self.tbl_factor_name_editor.setMinimumHeight(140)
+        name_lay.addWidget(self.tbl_factor_name_editor, 1)
+
+        name_btn_row = QtWidgets.QHBoxLayout()
+        self.btn_apply_factor_names = QtWidgets.QPushButton("Apply Edited Names")
+        style_button(self.btn_apply_factor_names, level=2)
+        self.btn_apply_factor_names.clicked.connect(self._apply_factor_names_from_editor)
+        self.btn_reset_factor_names = QtWidgets.QPushButton("Clear Names")
+        style_button(self.btn_reset_factor_names, level=1)
+        self.btn_reset_factor_names.clicked.connect(self._reset_factor_names)
+        name_btn_row.addWidget(self.btn_apply_factor_names)
+        name_btn_row.addWidget(self.btn_reset_factor_names)
+        name_lay.addLayout(name_btn_row)
+        left.addWidget(name_grp, 1)
 
         layout.addLayout(left, 2)
 
@@ -2768,6 +2799,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.factor_scores = scores_df
             self.state.factor_loadings = loadings
             self.state.factor_mode = mode_name
+            self.state.factor_ai_names = {}
+            self.state.factor_ai_suggestions = {}
+
+            self._render_factor_loadings_table()
+            self._sync_factor_name_editor()
 
             self._render_factor_loadings_table()
 
@@ -2816,9 +2852,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
             )
 
             if success:
-                applied = self._apply_ai_factor_names(result)
-                if applied:
-                    self._set_status("AI Naming Applied.")
+                suggestions = self._parse_ai_factor_suggestions(result)
+                if suggestions:
+                    self.state.factor_ai_suggestions = suggestions
+                    self._sync_factor_name_editor(suggestions)
+                    self._set_status("AI 제안 로드됨. 표에서 수정 후 적용하세요.")
                 else:
                     self._set_status("AI Naming returned no usable mapping.")
             else:
@@ -2828,17 +2866,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
         except Exception as e:
             show_error(self, "AI Error", e)
 
-    def _apply_ai_factor_names(self, ai_text: str) -> bool:
-        """Parse AI output, apply to RECODE table, and refresh factor loadings view."""
+    def _parse_ai_factor_suggestions(self, ai_text: str) -> Dict[str, str]:
+        """Parse AI output into a mapping without applying immediately."""
         try:
             suggestions = json.loads(ai_text)
         except Exception:
             QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
-            return False
+            return {}
 
         if not isinstance(suggestions, dict):
             QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
-            return False
+            return {}
 
         available_cols = set()
         if self.state.factor_scores is not None:
@@ -2854,15 +2892,47 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         if not applied:
             QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
-            return False
+            return {}
+        return applied
 
-        self.state.factor_ai_names.update(applied)
+    def _apply_factor_names_from_editor(self):
+        """Apply edited factor names from the editor table to loadings/recode."""
+        if self.state.factor_loadings is None:
+            QtWidgets.QMessageBox.warning(self, "No Factors", "Run Factor Analysis first.")
+            return
+
+        rows = self.tbl_factor_name_editor.rowCount()
+        applied: Dict[str, str] = {}
+        for r in range(rows):
+            factor_item = self.tbl_factor_name_editor.item(r, 0)
+            sugg_item = self.tbl_factor_name_editor.item(r, 1)
+            final_item = self.tbl_factor_name_editor.item(r, 2)
+            factor = factor_item.text().strip() if factor_item else ""
+            suggested = sugg_item.text().strip() if sugg_item else ""
+            final = final_item.text().strip() if final_item else ""
+            if not factor:
+                continue
+            name_to_use = final or suggested
+            if name_to_use:
+                applied[factor] = name_to_use
+
+        if not applied:
+            QtWidgets.QMessageBox.information(self, "No Names", "입력된 이름이 없습니다.")
+            return
+
+        self.state.factor_ai_names = applied
         self._render_factor_loadings_table()
         self._update_recode_with_ai_names(applied)
-
+        self._set_status("수정된 요인 이름을 적용했습니다.")
         msg = json.dumps(applied, ensure_ascii=False, indent=2)
-        QtWidgets.QMessageBox.information(self, "AI Suggestion Applied", f"적용된 이름:\n{msg}")
-        return True
+        QtWidgets.QMessageBox.information(self, "적용된 이름", msg)
+
+    def _reset_factor_names(self):
+        self.state.factor_ai_names = {}
+        self.state.factor_ai_suggestions = {}
+        self._sync_factor_name_editor()
+        self._render_factor_loadings_table()
+        self._set_status("요인 이름을 초기화했습니다.")
 
     def _update_recode_with_ai_names(self, ai_map: Dict[str, str]):
         if not ai_map:
@@ -2892,6 +2962,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _render_factor_loadings_table(self):
         if self.state.factor_loadings is None:
             self.tbl_factor_loadings.set_df(None)
+            self._sync_factor_name_editor()
             return
 
         disp = self.state.factor_loadings.copy()
@@ -2907,6 +2978,44 @@ class IntegratedApp(QtWidgets.QMainWindow):
         disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
         disp = disp.reset_index().rename(columns={"index": "variable"})
         self.tbl_factor_loadings.set_df(disp)
+        self._sync_factor_name_editor()
+
+    def _sync_factor_name_editor(self, suggestions: Optional[Dict[str, str]] = None):
+        """Refresh the editable factor-name table with current factors and suggestions."""
+        tbl = getattr(self, "tbl_factor_name_editor", None)
+        if tbl is None:
+            return
+
+        tbl.clearContents()
+
+        if self.state.factor_loadings is None:
+            tbl.setRowCount(0)
+            return
+
+        factors = list(self.state.factor_loadings.columns)
+        tbl.setRowCount(len(factors))
+        tbl.setColumnCount(3)
+        tbl.setHorizontalHeaderLabels(["Factor", "Suggested", "Final Name"])
+
+        sug_map = suggestions or self.state.factor_ai_suggestions or {}
+        cur_map = self.state.factor_ai_names
+
+        for r, factor in enumerate(factors):
+            suggested = sug_map.get(factor, "")
+            final = cur_map.get(factor, "") or suggested
+
+            f_item = QtWidgets.QTableWidgetItem(str(factor))
+            f_item.setFlags(f_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            s_item = QtWidgets.QTableWidgetItem(str(suggested))
+            s_item.setFlags(s_item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+            f_final = QtWidgets.QTableWidgetItem(str(final))
+            f_final.setFlags(f_final.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+
+            tbl.setItem(r, 0, f_item)
+            tbl.setItem(r, 1, s_item)
+            tbl.setItem(r, 2, f_final)
+
+        tbl.resizeColumnsToContents()
 
     def _get_ai_provider_and_key(self) -> Tuple[str, str]:
         provider = "openai"
@@ -5142,6 +5251,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 plot_names[cid_int] = self.state.cluster_names.get(cid_int, f"Cluster {cid_int}")
         self.state.cluster_names.update(plot_names)
         self.state.cluster_colors.update(plot_colors)
+
+        active_clusters = set(int(x) for x in s.unique())
+        self.state.cluster_names = {k: v for k, v in self.state.cluster_names.items() if int(k) in active_clusters}
+        self.state.cluster_colors = {k: v for k, v in self.state.cluster_colors.items() if int(k) in active_clusters}
 
         # 1) Update the plot's backing dataframe with the new cluster ids
         if self.state.demand_xy is not None and "id" in self.state.demand_xy.columns:
