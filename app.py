@@ -1604,6 +1604,7 @@ class DemandClusterPlot(pg.PlotWidget):
         self._new_cluster_name: str = ""
         self._new_cluster_color: Optional[QtGui.QColor] = None
         self._new_clusters_created: List[Tuple[int, str, QtGui.QColor]] = []
+        self._new_cluster_counter: int = 1
 
     def set_edit_mode_active(self, active: bool):
         self._edit_mode_active = active
@@ -1630,6 +1631,13 @@ class DemandClusterPlot(pg.PlotWidget):
                 self._new_cluster_color = None
         else:
             self._new_cluster_color = None
+        if name and name.lower().startswith("new cluster"):
+            try:
+                tail = name.split(" ", 2)[-1]
+                num = int(tail)
+                self._new_cluster_counter = max(self._new_cluster_counter, num)
+            except Exception:
+                pass
 
     def consume_new_clusters(self) -> List[Tuple[int, str, str]]:
         items: List[Tuple[int, str, str]] = []
@@ -1966,7 +1974,14 @@ class DemandClusterPlot(pg.PlotWidget):
 
     def _create_cluster_from_drop(self, drop_xy: Tuple[float, float]):
         new_cid = int(max(self._cluster) if len(self._cluster) else 0) + 1
-        name = self._new_cluster_name.strip() or f"Cluster {new_cid}"
+        base_name = self._new_cluster_name.strip() or f"New Cluster {self._new_cluster_counter}"
+        existing_names = {str(v).strip().lower() for v in self._cluster_names.values()}
+        name = base_name
+        suffix = 2
+        while name.strip().lower() in existing_names:
+            name = f"{base_name} {suffix}"
+            suffix += 1
+
         color = self._new_cluster_color or self._cluster_color(new_cid, alpha=255)
 
         if self._drag_temp_positions is not None:
@@ -1978,6 +1993,7 @@ class DemandClusterPlot(pg.PlotWidget):
         self._cluster_names[new_cid] = name
         self._cluster_custom_colors[new_cid] = QtGui.QColor(color)
         self._new_clusters_created.append((new_cid, name, QtGui.QColor(color)))
+        self._new_cluster_counter = max(self._new_cluster_counter + 1, new_cid + 1)
 
         self._drag_temp_positions = None
         self._drag_anchor_xy = None
@@ -5033,7 +5049,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         add_lay.addWidget(self.chk_add_cluster_mode)
 
         name_row = QtWidgets.QHBoxLayout()
-        self.txt_new_cluster_name = QtWidgets.QLineEdit("New Cluster")
+        self._new_cluster_seq = 1
+        self.txt_new_cluster_name = QtWidgets.QLineEdit(f"New Cluster {self._new_cluster_seq}")
         self.txt_new_cluster_name.textChanged.connect(lambda _: self._apply_new_cluster_template())
         name_row.addWidget(QtWidgets.QLabel("Name"))
         name_row.addWidget(self.txt_new_cluster_name)
@@ -5059,6 +5076,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         left.addWidget(QtWidgets.QLabel("<b>Cluster Summary</b> (Points & Sub-segments)"))
         self.tbl_cluster_summary = DataFrameTable(float_decimals=2)
         left.addWidget(self.tbl_cluster_summary, 1)
+        self.btn_refresh_cluster_summary = QtWidgets.QPushButton("표 업데이트 (세그 n 갱신)")
+        style_button(self.btn_refresh_cluster_summary, level=1)
+        self.btn_refresh_cluster_summary.clicked.connect(self._manual_refresh_cluster_table)
+        left.addWidget(self.btn_refresh_cluster_summary)
 
         rename_box = QtWidgets.QHBoxLayout()
         self.spin_rename_cluster_id = QtWidgets.QSpinBox()
@@ -5095,6 +5116,66 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._set_status("Edit Mode: Drag points/labels enabled. (Pan locked)")
         else:
             self._set_status("View Mode: Pan/Zoom enabled. (Editing locked)")
+
+    def _sync_clusters_from_edit_plot(self, status_msg: Optional[str] = None) -> bool:
+        if self.state.demand_xy is None or self.state.cluster_assign is None:
+            self._set_status("세그먼트 결과가 없습니다. 먼저 Demand Space를 실행하세요.")
+            return False
+
+        s = self.plot_edit.get_cluster_series()
+        self.state.cluster_assign = s
+
+        # Bring in any newly created cluster names/colors from the edit plot
+        new_clusters = self.plot_edit.consume_new_clusters()
+        for cid, name, color in new_clusters:
+            if name:
+                self.state.cluster_names[int(cid)] = name
+                self._bump_new_cluster_placeholder(name)
+            if color:
+                self.state.cluster_colors[int(cid)] = color
+
+        plot_names = self.plot_edit.get_cluster_names()
+        plot_colors = self.plot_edit.get_cluster_colors()
+        for cid in s.unique():
+            cid_int = int(cid)
+            if cid_int not in plot_names:
+                plot_names[cid_int] = self.state.cluster_names.get(cid_int, f"Cluster {cid_int}")
+        self.state.cluster_names.update(plot_names)
+        self.state.cluster_colors.update(plot_colors)
+
+        # 1) Update the plot's backing dataframe with the new cluster ids
+        if self.state.demand_xy is not None and "id" in self.state.demand_xy.columns:
+            df = self.state.demand_xy.copy()
+            mapped = df["id"].astype(str).map(s)
+            if "cluster_id" in df.columns:
+                mapped = mapped.fillna(df["cluster_id"])
+            df["cluster_id"] = mapped.astype(int)
+            self.state.demand_xy = df
+
+        # 2) When segments are the points, keep the segment→cluster map and base df in sync
+        if self.state.demand_mode.startswith("Segments"):
+            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
+
+            seg_labels = self.state.demand_seg_labels or self._current_segment_labels()
+            if seg_labels is not None and self.state.df is not None:
+                cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
+                df = self.state.df.copy()
+                df["demand_seg_label"] = seg_labels.values
+                df["demand_cluster_id"] = seg_labels.astype(str).map(cl_map).fillna(-1).astype(int)
+                df["demand_cluster_name"] = df["demand_cluster_id"].map(self.state.cluster_names).fillna("")
+                self.state.df = df
+
+        self.state.manual_dirty = True
+        self.plot_edit.set_cluster_names(self.state.cluster_names)
+        self.plot_edit.set_cluster_colors(self.state.cluster_colors)
+        self.plot_preview.set_cluster_names(self.state.cluster_names)
+        self.plot_preview.set_cluster_colors(self.state.cluster_colors)
+        self._update_cluster_summary()
+        self._update_profiler()
+        self._refresh_demand_preview()
+        if status_msg:
+            self._set_status(status_msg)
+        return True
 
     def _update_new_cluster_color_button(self):
         col = getattr(self, "_new_cluster_color_hex", "#ff9800")
@@ -5155,6 +5236,24 @@ class IntegratedApp(QtWidgets.QMainWindow):
         out = pd.DataFrame(rows).sort_values(["Cluster ID", "Sub-segment"]).reset_index(drop=True)
         self.tbl_cluster_summary.set_df(out, max_rows=2000)
 
+    def _manual_refresh_cluster_table(self):
+        self._sync_clusters_from_edit_plot("클러스터 표를 최신 상태로 동기화했습니다.")
+
+    def _bump_new_cluster_placeholder(self, last_created: Optional[str] = None):
+        if not last_created:
+            return
+        name = str(last_created).strip()
+        if not name.lower().startswith("new cluster"):
+            return
+        try:
+            parts = name.split()
+            num = int(parts[-1]) if parts[-1].isdigit() else None
+        except Exception:
+            num = None
+        if num is not None:
+            self._new_cluster_seq = max(self._new_cluster_seq, num + 1)
+            self.txt_new_cluster_name.setText(f"New Cluster {self._new_cluster_seq}")
+
     def _update_profiler(self):
         """Calculates Z-scores for each cluster to find distinctive features."""
         if self.state.df is None or self.state.cluster_assign is None:
@@ -5207,59 +5306,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.txt_profile_report.setHtml(report)
 
     def _on_manual_clusters_changed(self):
-        if self.state.demand_xy is None:
-            return
-        s = self.plot_edit.get_cluster_series()
-        self.state.cluster_assign = s
-
-        # Bring in any newly created cluster names/colors from the edit plot
-        new_clusters = self.plot_edit.consume_new_clusters()
-        for cid, name, color in new_clusters:
-            if name:
-                self.state.cluster_names[int(cid)] = name
-            if color:
-                self.state.cluster_colors[int(cid)] = color
-
-        plot_names = self.plot_edit.get_cluster_names()
-        plot_colors = self.plot_edit.get_cluster_colors()
-        for cid in s.unique():
-            cid_int = int(cid)
-            if cid_int not in plot_names:
-                plot_names[cid_int] = self.state.cluster_names.get(cid_int, f"Cluster {cid_int}")
-        self.state.cluster_names.update(plot_names)
-        self.state.cluster_colors.update(plot_colors)
-
-        # 1) Update the plot's backing dataframe with the new cluster ids
-        if self.state.demand_xy is not None and "id" in self.state.demand_xy.columns:
-            df = self.state.demand_xy.copy()
-            mapped = df["id"].astype(str).map(s)
-            if "cluster_id" in df.columns:
-                mapped = mapped.fillna(df["cluster_id"])
-            df["cluster_id"] = mapped.astype(int)
-            self.state.demand_xy = df
-
-        # 2) When segments are the points, keep the segment→cluster map and base df in sync
-        if self.state.demand_mode.startswith("Segments"):
-            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
-
-            seg_labels = self.state.demand_seg_labels or self._current_segment_labels()
-            if seg_labels is not None and self.state.df is not None:
-                cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
-                df = self.state.df.copy()
-                df["demand_seg_label"] = seg_labels.values
-                df["demand_cluster_id"] = seg_labels.astype(str).map(cl_map).fillna(-1).astype(int)
-                df["demand_cluster_name"] = df["demand_cluster_id"].map(self.state.cluster_names).fillna("")
-                self.state.df = df
-
-        self.state.manual_dirty = True
-        self.plot_edit.set_cluster_names(self.state.cluster_names)
-        self.plot_edit.set_cluster_colors(self.state.cluster_colors)
-        self.plot_preview.set_cluster_names(self.state.cluster_names)
-        self.plot_preview.set_cluster_colors(self.state.cluster_colors)
-        self._update_cluster_summary()
-        self._update_profiler()
-        self._refresh_demand_preview()
-        self._set_status("Manual clusters updated.")
+        self._sync_clusters_from_edit_plot("Manual clusters updated.")
 
     def _on_manual_coords_changed(self):
         if self.state.demand_xy is None:
