@@ -2805,8 +2805,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._render_factor_loadings_table()
             self._sync_factor_name_editor()
 
-            self._render_factor_loadings_table()
-
             self.tbl_preview.set_df(df)
             self._refresh_all_column_lists()
             self._set_status(f"{mode_name} completed. Columns {score_cols} added.")
@@ -2867,32 +2865,63 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "AI Error", e)
 
     def _parse_ai_factor_suggestions(self, ai_text: str) -> Dict[str, str]:
-        """Parse AI output into a mapping without applying immediately."""
-        try:
-            suggestions = json.loads(ai_text)
-        except Exception:
-            QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
-            return {}
-
-        if not isinstance(suggestions, dict):
-            QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
-            return {}
+        """Parse AI output into a mapping and push it into the editor (no popups)."""
+        factors = []
+        if self.state.factor_loadings is not None:
+            factors = list(map(str, self.state.factor_loadings.columns))
 
         available_cols = set()
         if self.state.factor_scores is not None:
             available_cols.update(map(str, self.state.factor_scores.columns))
         if self.state.factor_loadings is not None:
-            available_cols.update(map(str, self.state.factor_loadings.columns))
+            available_cols.update(factors)
 
-        applied = {
-            str(col): str(name).strip()
-            for col, name in suggestions.items()
-            if str(col) in available_cols and str(name).strip()
-        }
+        def _norm(x: Any) -> str:
+            return str(x).strip()
+
+        parsed: Dict[str, str] = {}
+        parsed_json: Any = None
+
+        # 1) Try JSON dict/list directly
+        try:
+            parsed_json = json.loads(ai_text)
+        except Exception:
+            parsed_json = None
+
+        if isinstance(parsed_json, dict):
+            parsed = {str(k): _norm(v) for k, v in parsed_json.items() if _norm(v)}
+        elif isinstance(parsed_json, list):
+            seq = [_norm(v) for v in parsed_json if _norm(v)]
+            parsed = {col: name for col, name in zip(factors or available_cols, seq)}
+
+        # 2) Fallback: parse "factor: name" lines or plain lines
+        if not parsed:
+            lines = [_norm(l) for l in ai_text.splitlines() if _norm(l)]
+            line_map = {}
+            for line in lines:
+                if ":" in line:
+                    left, right = line.split(":", 1)
+                    line_map[_norm(left)] = _norm(right)
+            if line_map:
+                parsed = line_map
+            elif lines:
+                parsed = {col: name for col, name in zip(factors or available_cols, lines)}
+
+        # 3) Keep only columns we actually have; if keys are missing, align by order
+        applied = {}
+        for col, name in parsed.items():
+            if col in available_cols:
+                applied[col] = name
+
+        if not applied and parsed:
+            for col, name in zip(factors, parsed.values()):
+                if col not in applied and name:
+                    applied[col] = name
 
         if not applied:
-            QtWidgets.QMessageBox.information(self, "AI Suggestion", ai_text)
+            self._set_status("AI 제안 파싱 실패: 응답에서 이름을 찾지 못했습니다.")
             return {}
+
         return applied
 
     def _apply_factor_names_from_editor(self):
