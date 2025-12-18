@@ -224,6 +224,7 @@ class AppState:
     factor_model: Any = None
     factor_cols: Optional[List[str]] = None
     factor_scores: Optional[pd.DataFrame] = None
+    factor_score_cols: List[str] = field(default_factory=list)
     factor_loadings: Optional[pd.DataFrame] = None
     factor_mode: str = "PCA"
     factor_ai_names: Dict[str, str] = field(default_factory=dict)
@@ -2332,7 +2333,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.lst_delete_cols.clear()
             for c in cols:
                 label = c
-                if str(c).startswith("Factor") or str(c).startswith("PCA") or str(c).endswith("_seg"):
+                if c in set(self._factor_score_columns()) or str(c).startswith("PCA") or str(c).endswith("_seg"):
                     label = f"{c} (derived)"
                 item = QtWidgets.QListWidgetItem(label)
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, c)
@@ -2530,8 +2531,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.factor_model = None
         self.state.factor_cols = None
         self.state.factor_scores = None
+        self.state.factor_score_cols = []
         self.state.factor_loadings = None
         self.state.factor_mode = "PCA"
+        self.state.factor_ai_names = {}
+        self.state.factor_ai_suggestions = {}
 
         if hasattr(self, "tbl_factor_loadings"):
             self.tbl_factor_loadings.set_df(None)
@@ -2797,6 +2801,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.factor_model = model
             self.state.factor_cols = cols
             self.state.factor_scores = scores_df
+            self.state.factor_score_cols = score_cols
             self.state.factor_loadings = loadings
             self.state.factor_mode = mode_name
             self.state.factor_ai_names = {}
@@ -2869,6 +2874,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         factors = []
         if self.state.factor_loadings is not None:
             factors = list(map(str, self.state.factor_loadings.columns))
+        elif self.state.factor_scores is not None:
+            factors = list(map(str, self.state.factor_scores.columns))
 
         available_cols = set()
         if self.state.factor_scores is not None:
@@ -2950,6 +2957,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
 
         self.state.factor_ai_names = applied
+        self._apply_factor_column_renames(applied)
         self._render_factor_loadings_table()
         self._update_recode_with_ai_names(applied)
         self._set_status("수정된 요인 이름을 적용했습니다.")
@@ -2959,6 +2967,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _reset_factor_names(self):
         self.state.factor_ai_names = {}
         self.state.factor_ai_suggestions = {}
+        self.state.factor_score_cols = list(self.state.factor_scores.columns) if self.state.factor_scores is not None else []
         self._sync_factor_name_editor()
         self._render_factor_loadings_table()
         self._set_status("요인 이름을 초기화했습니다.")
@@ -3045,6 +3054,62 @@ class IntegratedApp(QtWidgets.QMainWindow):
             tbl.setItem(r, 2, f_final)
 
         tbl.resizeColumnsToContents()
+
+    def _apply_factor_column_renames(self, name_map: Dict[str, str]):
+        """Rename factor score/loadings columns and propagate to df and cached outputs."""
+        if not name_map:
+            return
+
+        def _rename_cols(df_obj: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+            if df_obj is None:
+                return None
+            return df_obj.rename(columns=name_map)
+
+        # 1) Rename factor scores/loadings
+        if self.state.factor_scores is not None:
+            self.state.factor_scores = _rename_cols(self.state.factor_scores)
+            self.state.factor_score_cols = list(self.state.factor_scores.columns)
+        if self.state.factor_loadings is not None:
+            self.state.factor_loadings = _rename_cols(self.state.factor_loadings)
+
+        # 2) Rename columns in the main dataframe
+        if self.state.df is not None:
+            self.state.df = self.state.df.rename(columns=name_map)
+            self.tbl_preview.set_df(self.state.df)
+
+        # 3) Rename decision tree outputs if present
+        def _rename_dep_ind(df_obj: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+            if df_obj is None:
+                return None
+            df_obj = df_obj.copy()
+            df_obj = df_obj.rename(columns=name_map)
+            for col in ["dep", "ind", "target", "split_feature", "feature"]:
+                if col in df_obj.columns:
+                    df_obj[col] = df_obj[col].replace(name_map)
+            return df_obj
+
+        self.state.dt_improve_pivot = _rename_cols(self.state.dt_improve_pivot)
+        self.state.dt_split_best = _rename_dep_ind(self.state.dt_split_best)
+        self.state.dt_importance_summary = _rename_dep_ind(self.state.dt_importance_summary)
+        self.state.dt_full_nodes = _rename_dep_ind(self.state.dt_full_nodes)
+        self.state.dt_full_split_groups = _rename_dep_ind(self.state.dt_full_split_groups)
+        self.state.dt_full_split_branches = _rename_dep_ind(self.state.dt_full_split_branches)
+        self.state.dt_full_path_info = _rename_dep_ind(self.state.dt_full_path_info)
+        self.state.dt_full_split_paths = _rename_dep_ind(self.state.dt_full_split_paths)
+        self.state.dt_full_condition_freq = _rename_dep_ind(self.state.dt_full_condition_freq)
+        self.state.dt_full_split_view = _rename_dep_ind(self.state.dt_full_split_view)
+        self.state.dt_full_split_pivot = _rename_cols(self.state.dt_full_split_pivot)
+
+        # 4) Refresh UI lists
+        self._refresh_all_column_lists()
+
+    def _factor_score_columns(self) -> List[str]:
+        """Return current factor score column names in order."""
+        if self.state.factor_score_cols:
+            return list(self.state.factor_score_cols)
+        if self.state.factor_scores is not None:
+            return list(self.state.factor_scores.columns)
+        return []
 
     def _get_ai_provider_and_key(self) -> Tuple[str, str]:
         provider = "openai"
@@ -3194,8 +3259,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._ensure_df()
             df = self.state.df
 
-            fac_cols = [c for c in df.columns if str(c).startswith("Factor") and str(c)[6:].isdigit()]
-            fac_cols = sorted(fac_cols, key=lambda x: int(str(x)[6:]))
+            fac_cols = self._factor_score_columns()
 
             deps: List[str] = []
             if self.chk_use_all_factors.isChecked() and fac_cols:
@@ -3236,7 +3300,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             for dep in deps:
                 y = df[dep]
                 # Determine task type for dependent variable
-                is_factor = str(dep).startswith("Factor")
+                is_factor = dep in set(self._factor_score_columns()) or str(dep).startswith("PCA")
                 if is_factor:
                     task = "reg"
                 elif self.state.is_categorical(dep):
@@ -3548,7 +3612,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if dep not in df.columns or ind not in df.columns:
             raise RuntimeError("Columns missing.")
 
-        is_factor = str(dep).startswith("Factor") or str(dep).startswith("PCA")
+        is_factor = dep in set(self._factor_score_columns()) or str(dep).startswith("PCA")
         if is_factor:
             task = "reg"
         elif self.state.is_categorical(dep):
@@ -3646,7 +3710,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             right_cond = row["right_group"]
 
             y = df[dep]
-            is_factor = str(dep).startswith("Factor") or str(dep).startswith("PCA")
+            is_factor = dep in set(self._factor_score_columns()) or str(dep).startswith("PCA")
             task = "class" if self.state.is_categorical(dep) and not is_factor else "reg"
 
             def parse_cond(cond_str):
@@ -3968,8 +4032,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         df = self.state.df
         if df is None:
             return []
-        fac_cols = [c for c in df.columns if str(c).startswith("Factor")]
-        return fac_cols
+        return self._factor_score_columns()
 
     def _compute_dt_candidate_splits(self, var: str, dep: str) -> List[dict]:
         df = self.state.df
@@ -3979,7 +4042,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         y = df[dep]
         x = df[var]
 
-        is_factor = str(dep).startswith("Factor") or str(dep).startswith("PCA")
+        is_factor = dep in set(self._factor_score_columns()) or str(dep).startswith("PCA")
         if is_factor:
             task = "reg"
         elif self.state.is_categorical(dep):
@@ -5046,7 +5109,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         # Optional PCA/Factor profile mean features (align with R flow: target×seg pivot + PCA profile)
         if use_factors and self.state.factor_scores is not None:
-            fac_cols = [c for c in self.state.factor_scores.columns if str(c).startswith("Factor")]
+            fac_cols = self._factor_score_columns()
             fac_cols = fac_cols[: max(0, fac_k)]
             if fac_cols:
                 fac_df = self.state.factor_scores.reindex(df.index).copy()
@@ -5219,6 +5282,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.btn_refresh_cluster_summary.clicked.connect(self._manual_refresh_cluster_table)
         left.addWidget(self.btn_refresh_cluster_summary)
 
+        save_group = QtWidgets.QGroupBox("세그 결과 저장")
+        save_lay = QtWidgets.QHBoxLayout(save_group)
+        self._seg_save_counter = 1
+        self.txt_seg_save_name = QtWidgets.QLineEdit("seg_result_1")
+        self.btn_seg_save = QtWidgets.QPushButton("Save Seg Result")
+        style_button(self.btn_seg_save, level=2)
+        self.btn_seg_save.clicked.connect(self._save_segmentation_result)
+        save_lay.addWidget(QtWidgets.QLabel("Column"))
+        save_lay.addWidget(self.txt_seg_save_name)
+        save_lay.addWidget(self.btn_seg_save)
+        left.addWidget(save_group)
+
         rename_box = QtWidgets.QHBoxLayout()
         self.spin_rename_cluster_id = QtWidgets.QSpinBox()
         self.spin_rename_cluster_id.setRange(1, 999)
@@ -5380,6 +5455,50 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
     def _manual_refresh_cluster_table(self):
         self._sync_clusters_from_edit_plot("클러스터 표를 최신 상태로 동기화했습니다.")
+
+    def _save_segmentation_result(self):
+        try:
+            self._ensure_df()
+            if self.state.cluster_assign is None:
+                raise RuntimeError("세그먼트 결과가 없습니다. 먼저 Demand Space를 실행하세요.")
+
+            col = self.txt_seg_save_name.text().strip()
+            if not col:
+                raise RuntimeError("저장할 컬럼 이름을 입력하세요.")
+            if not col.endswith("_seg"):
+                col = f"{col}_seg"
+
+            name_map = {int(cid): self.state.cluster_names.get(int(cid), f"Cluster {int(cid)}") for cid in self.state.cluster_assign.unique()}
+            df = self.state.df.copy()
+
+            out_series = pd.Series(index=df.index, dtype=object)
+            id_series = pd.Series(index=df.index, dtype=object)
+
+            if self.state.demand_mode.startswith("Segments") and self.state.demand_seg_labels is not None:
+                seg_labels = self.state.demand_seg_labels.astype(str)
+                cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
+                cl_ids = seg_labels.map(cl_map)
+                out_series = cl_ids.map(name_map).fillna("")
+                id_series = cl_ids.fillna(-1).astype(int)
+            elif "id" in df.columns:
+                id_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
+                cl_ids = df["id"].astype(str).map(id_map)
+                out_series = cl_ids.map(name_map).fillna("")
+                id_series = cl_ids.fillna(-1).astype(int)
+            else:
+                raise RuntimeError("세그 결과를 원본 데이터에 매핑할 수 없습니다.")
+
+            df[col] = out_series
+            df[f"{col}_id"] = id_series
+            self.state.df = df
+            self.tbl_preview.set_df(df)
+            self._refresh_all_column_lists()
+
+            self._seg_save_counter = getattr(self, "_seg_save_counter", 1) + 1
+            self.txt_seg_save_name.setText(f"seg_result_{self._seg_save_counter}")
+            self._set_status(f"세그 결과를 '{col}' 컬럼에 저장했습니다.")
+        except Exception as e:
+            show_error(self, "Save Seg Result Error", e)
 
     def _bump_new_cluster_placeholder(self, last_created: Optional[str] = None):
         if not last_created:
