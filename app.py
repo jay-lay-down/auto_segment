@@ -2188,6 +2188,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._build_tab_rag()
 
         self._apply_tab_styles()
+
+        # Footer credit
+        footer = QtWidgets.QLabel(
+            'Made by <b>jihee.cho</b> | '
+            '<a href="https://github.com/jay-lay-down/">github.com/jay-lay-down</a>'
+        )
+        footer.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        footer.setOpenExternalLinks(True)
+        self.statusBar().addPermanentWidget(footer)
+
         self._set_status("Ready.")
 
     # -------------------------------------------------------------------------
