@@ -5464,12 +5464,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.tbl_cluster_summary.set_df(out, max_rows=2000)
 
     def _manual_refresh_cluster_table(self):
-        self._sync_clusters_from_edit_plot("클러스터 표를 최신 상태로 동기화했습니다.")
+        synced = self._sync_clusters_from_edit_plot("클러스터 표를 최신 상태로 동기화했습니다.")
+        if not synced:
+            self._set_status("세그먼트 결과가 없습니다. 먼저 Demand Space를 실행하세요.")
+            return
+        # Ensure downstream tables/previews are freshly rendered even if the sync produced no status text
+        self._update_cluster_summary()
+        self._update_profiler()
+        self._refresh_demand_preview()
 
     def _save_segmentation_result(self):
         try:
             self._ensure_df()
-            if self.state.cluster_assign is None:
+            synced = self._sync_clusters_from_edit_plot()
+            if not synced:
                 raise RuntimeError("세그먼트 결과가 없습니다. 먼저 Demand Space를 실행하세요.")
 
             col = self.txt_seg_save_name.text().strip()
@@ -5503,6 +5511,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.df = df
             self.tbl_preview.set_df(df)
             self._refresh_all_column_lists()
+            self._update_cluster_summary()
+            self._update_profiler()
+            self._refresh_demand_preview()
 
             self._seg_save_counter = getattr(self, "_seg_save_counter", 1) + 1
             self.txt_seg_save_name.setText(f"seg_result_{self._seg_save_counter}")
