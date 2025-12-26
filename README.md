@@ -6,7 +6,7 @@
 ![AI Assistant](https://github.com/jay-lay-down/auto_segment/blob/main/source/rag%EC%82%AC%EC%9A%A9.png)
 
 !! 데이터는 예시 데이터입니다. 
-데이터 샘플 링크: https://github.com/jay-lay-down/auto_segment/blob/main/assets/FAKE_SEGMENT.xlsx
+데이터 샘플 링크: https://github.com/jay-lay-down/auto_segment/blob/main/assets/FAKE_SEGMENT.xlsx \
 !! 프로그램 다운로드
 https://drive.google.com/uc?id=1AM6l7GJ6M72bnEtBa_xuRqlPfoh_Cedk&export=download
 
