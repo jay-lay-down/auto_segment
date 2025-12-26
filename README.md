@@ -5,7 +5,7 @@
 **AI 어시스턴트**가 탑재되어 분석 결과에 대한 즉각적인 해석과 오류 디버그, 분석 결과에 대한 질의응답 가능
 ![AI Assistant](https://github.com/jay-lay-down/auto_segment/blob/main/source/rag%EC%82%AC%EC%9A%A9.png)
 
-## 데이터는 예시 데이터입니다. ##
+!! 데이터는 예시 데이터입니다. 
 
 📦 설치 및 실행
 ```python
