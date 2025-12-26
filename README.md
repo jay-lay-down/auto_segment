@@ -1,12 +1,16 @@
 # auto_segment
 
-복잡한 코딩 없이 클릭만으로 변수를 가공하고, Demand Space(=segmentation과 혼용하여 사용) 상에서 드래그 앤 드롭으로 세그먼트를 조정하여 최적의 타겟 그룹을 발굴할 수 있습니다.
+복잡한 코딩 없이 클릭만으로 변수를 가공하고, Demand Space 상에서 드래그 앤 드롭으로 세그먼트를 조정하여 최적의 타겟 그룹을 발굴할 수 있습니다.
 ![세그먼트 자동화 v2](https://raw.githubusercontent.com/jay-lay-down/auto_segment/main/source/%EC%84%B8%EA%B7%B8%EB%A8%BC%ED%8A%B8%20%EC%9E%90%EB%8F%99%ED%99%94_v2.png)
 **AI 어시스턴트**가 탑재되어 분석 결과에 대한 즉각적인 해석과 오류 디버그, 분석 결과에 대한 질의응답 가능
 ![AI Assistant](https://github.com/jay-lay-down/auto_segment/blob/main/source/rag%EC%82%AC%EC%9A%A9.png)
 
 !! 데이터는 예시 데이터입니다. 
 데이터 샘플 링크: https://github.com/jay-lay-down/auto_segment/blob/main/assets/FAKE_SEGMENT.xlsx
+!! 프로그램 다운로드
+https://drive.google.com/uc?id=1AM6l7GJ6M72bnEtBa_xuRqlPfoh_Cedk&export=download
+
+
 
 📦 설치 및 실행
 ```python
