@@ -15,6 +15,8 @@ pip install PyQt6 pyqtgraph pandas numpy scikit-learn openpyxl requests
 # 실행
 python app.py
 
+# 데이터 샘플 링크: https://github.com/jay-lay-down/auto_segment/blob/main/assets/FAKE_SEGMENT.xlsx
+
 ## 🚀 사용 가이드 (Step-by-Step)
 분석 흐름은 탭 순서대로 진행하는 것을 권장합니다.
 
