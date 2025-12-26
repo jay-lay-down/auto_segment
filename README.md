@@ -69,9 +69,8 @@ Shift + 클릭: 점을 다중 선택합니다.
 전처리된 데이터, PCA 결과, 트리 분석 결과, 그리고 수작업으로 조정한 Demand Space 좌표 및 클러스터 정보까지 모두 엑셀 시트로 분리되어 저장됩니다.
 
 ### 🔑 AI 기능 설정 (API Key)
-AI 어시스턴트 기능을 사용하려면 OpenAI API Key가 필요합니다.
+AI 어시스턴트 기능을 사용하려면 OpenAI API Key 혹은 Gemini API Key가 필요합니다.
 프로그램 실행 후 AI Assistant (RAG) 탭으로 이동합니다.
-sk-로 시작하는 본인의 API 키를 입력합니다.
 질문을 입력하고 Send를 누르면 데이터 기반의 답변을 받을 수 있습니다.
 
 > OpenAI 기본 모델: `gpt-4o-mini` (UI 기본값), 고성능: `gpt-4o`.
