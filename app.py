@@ -5688,6 +5688,36 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.cluster_colors,
         )
 
+    def _sync_clusters_from_edit_plot(self, status_msg: Optional[str] = None) -> bool:
+        """Sync cluster assignments (and derived tables) from the editable plot without Series truthiness checks."""
+        if self.state.demand_xy is None:
+            return False
+
+        s = self.plot_edit.get_cluster_series()
+        if s is None or s.empty:
+            return False
+
+        self.state.cluster_assign = s
+        if "id" in self.state.demand_xy.columns:
+            df = self.state.demand_xy.copy()
+            mapped = df["id"].astype(str).map(s)
+            if "cluster_id" in df.columns:
+                mapped = mapped.fillna(df["cluster_id"])
+            df["cluster_id"] = mapped.astype(int)
+            self.state.demand_xy = df
+
+        if self.state.demand_mode.startswith("Segments"):
+            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
+
+        self.state.manual_dirty = True
+        self._update_cluster_summary()
+        self._update_profiler()
+        self._refresh_demand_preview()
+
+        if status_msg:
+            self._set_status(status_msg)
+        return True
+
     def _rename_cluster(self):
         try:
             cid = int(self.spin_rename_cluster_id.value())
