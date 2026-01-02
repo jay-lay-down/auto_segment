@@ -74,7 +74,7 @@ def is_categorical_series(s: pd.Series, max_unique_numeric_as_cat: int = 20) -> 
         return False
     if pd.api.types.is_bool_dtype(s):
         return True
-    if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s) or pd.api.types.is_categorical_dtype(s):
+    if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s) or isinstance(s.dtype, pd.CategoricalDtype):
         return True
     if pd.api.types.is_integer_dtype(s):
         nun = s.dropna().nunique()
@@ -250,6 +250,7 @@ class AppState:
     demand_seg_profile: Optional[pd.DataFrame] = None
     demand_seg_components: Optional[List[str]] = None
     demand_targets: Optional[List[str]] = None
+    demand_targets_used: Optional[List[str]] = None
     demand_features_used: Optional[List[str]] = None
     demand_seg_labels: Optional[pd.Series] = None
     demand_seg_sep: str = "|"
@@ -1878,6 +1879,52 @@ class IntegratedApp(QtWidgets.QMainWindow):
         for i in range(widget.count()):
             widget.item(i).setCheckState(st)
 
+    def _set_checked_items(self, widget: QtWidgets.QListWidget, names: List[str]):
+        block_prev = widget.blockSignals(True)
+        try:
+            want = set(names)
+            for i in range(widget.count()):
+                it = widget.item(i)
+                st = QtCore.Qt.CheckState.Checked if it.text() in want else QtCore.Qt.CheckState.Unchecked
+                it.setCheckState(st)
+        finally:
+            widget.blockSignals(block_prev)
+
+    def _sync_demand_target_master_checkbox(self):
+        if not hasattr(self, "chk_demand_targets_all"):
+            return
+        total = self.lst_demand_targets.count()
+        checked = len(self._selected_checked_items(self.lst_demand_targets))
+        if total == 0:
+            state = QtCore.Qt.CheckState.Unchecked
+        elif checked == 0:
+            state = QtCore.Qt.CheckState.Unchecked
+        elif checked == total:
+            state = QtCore.Qt.CheckState.Checked
+        else:
+            state = QtCore.Qt.CheckState.PartiallyChecked
+
+        block_prev = self.chk_demand_targets_all.blockSignals(True)
+        try:
+            self.chk_demand_targets_all.setCheckState(state)
+        finally:
+            self.chk_demand_targets_all.blockSignals(block_prev)
+
+    def _restore_demand_target_checks(self):
+        if self.state.demand_targets:
+            self._set_checked_items(self.lst_demand_targets, self.state.demand_targets)
+        self._sync_demand_target_master_checkbox()
+
+    def _on_demand_target_item_changed(self, _item):
+        self.state.demand_targets = self._selected_checked_items(self.lst_demand_targets)
+        self._sync_demand_target_master_checkbox()
+
+    def _on_toggle_all_demand_targets(self, state: int):
+        check = state == QtCore.Qt.CheckState.Checked
+        self._set_all_checks(self.lst_demand_targets, check)
+        self.state.demand_targets = self._selected_checked_items(self.lst_demand_targets)
+        self._sync_demand_target_master_checkbox()
+
     def _refresh_all_column_lists(self):
         """Updates all ComboBoxes and ListWidgets when new data is loaded."""
         df = self.state.df
@@ -1947,12 +1994,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
             it.setCheckState(QtCore.Qt.CheckState.Unchecked)
             self.lst_demand_segcols.addItem(it)
 
+        self.lst_demand_targets.blockSignals(True)
         self.lst_demand_targets.clear()
         for c in cols:
             it = QtWidgets.QListWidgetItem(c)
             it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
             it.setCheckState(QtCore.Qt.CheckState.Unchecked)
             self.lst_demand_targets.addItem(it)
+        self.lst_demand_targets.blockSignals(False)
+        self._restore_demand_target_checks()
 
     # -------------------------------------------------------------------------
     # [v8.1] Variable Type Manager
@@ -1991,6 +2041,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if not hasattr(self.state, "dt_importance_summary"):
                     self.state.dt_importance_summary = None
+                if not hasattr(self.state, "demand_targets_used"):
+                    self.state.demand_targets_used = getattr(self.state, "demand_targets", None)
 
                 if self.state.df is not None:
                     self.tbl_preview.set_df(self.state.df)
@@ -3277,10 +3329,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lst_demand_segcols.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         seg_l.addWidget(self.lst_demand_segcols, 2)
 
-        seg_l.addWidget(QtWidgets.QLabel("Target Variables (multi-select):"))
+        tgt_header = QtWidgets.QHBoxLayout()
+        tgt_header.addWidget(QtWidgets.QLabel("Target Variables (multi-select):"))
+        self.chk_demand_targets_all = QtWidgets.QCheckBox("Check/Uncheck All")
+        self.chk_demand_targets_all.stateChanged.connect(self._on_toggle_all_demand_targets)
+        tgt_header.addStretch(1)
+        tgt_header.addWidget(self.chk_demand_targets_all)
+        seg_l.addLayout(tgt_header)
         self.lst_demand_targets = QtWidgets.QListWidget()
         self.lst_demand_targets.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.lst_demand_targets.setMaximumHeight(120)
+        self.lst_demand_targets.itemChanged.connect(self._on_demand_target_item_changed)
         seg_l.addWidget(self.lst_demand_targets, 1)
 
         r = QtWidgets.QHBoxLayout()
@@ -3428,8 +3487,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 use_factors = bool(self.chk_demand_use_factors.isChecked())
                 fac_k = int(self.spin_demand_factor_k.value())
-                targets = self._selected_checked_items(self.lst_demand_targets)
+                targets = self.state.demand_targets or self._selected_checked_items(self.lst_demand_targets)
                 min_n = int(self.spin_demand_min_n.value())
+
+                targets_used = list(targets)
 
                 prof, feat_cols, labels_by_row = self._build_segment_profiles(
                     seg_cols, sep, use_factors, fac_k, targets, min_n
@@ -3483,6 +3544,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     "y": xy[:, 1],
                     "n": prof["n"].values,
                     "cluster_id": cl,
+                    "targets_used": [", ".join(targets_used)] * len(ids),
                 })
                 cl_s = pd.Series(cl, index=ids)
 
@@ -3492,7 +3554,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
-                self.state.demand_targets = targets
+                self.state.demand_targets = targets_used
+                self.state.demand_targets_used = targets_used
                 self.state.demand_features_used = feat_cols
                 self.state.demand_seg_labels = labels_by_row
                 self.state.demand_seg_sep = sep
@@ -3551,6 +3614,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.cluster_assign = cl_s
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
                 self.state.demand_seg_profile = None
+                self.state.demand_targets_used = None
                 self.state.manual_dirty = False
 
                 args = (ids, labels, xy, cl, self.state.cluster_names)
@@ -3594,6 +3658,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if cnt.empty:
             raise RuntimeError("No segments found for the selected *_seg columns.")
 
+        # Drop underpowered segment combinations so Min N actually affects the run
+        valid_levels = cnt[cnt >= max(1, int(min_n))].index.tolist()
+        if not valid_levels:
+            raise RuntimeError(f"모든 세그먼트가 Min N({min_n})보다 작습니다. 필터를 낮추거나 세그를 합쳐주세요.")
+        df = df[df["_SEG_LABEL_"].isin(valid_levels)].copy()
+        cnt = df["_SEG_LABEL_"].value_counts()
+
         if not targets:
             raise RuntimeError("Target 변수를 1개 이상 선택해 주세요. (Segments-as-points는 타깃×세그 분포 기반)")
 
@@ -3610,18 +3681,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 .astype(float)
             )
 
-            # Align all segment columns to the full set
+            # Align all segment columns to the full set and normalize column-wise (distribution vector for each segment)
             pivot = pivot.reindex(columns=seg_levels, fill_value=0.0)
-            col_sum = pivot.sum(axis=0)
+            col_sum = pivot.sum(axis=0).replace(0, np.nan)
             pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
+            pivot_norm.index = [f"{tgt}::{idx}" for idx in pivot_norm.index.astype(str)]
             pivot_norms.append(pivot_norm)
 
         pivot_stack = pd.concat(pivot_norms, axis=0)
-
-        if pivot_stack.shape[1] < 2:
-            raise RuntimeError("세그먼트 조합이 1개뿐입니다. 최소 2개 이상이어야 합니다.")
-
         seg_matrix = pivot_stack.T
+
+        if seg_matrix.shape[0] < 2:
+            raise RuntimeError("세그먼트 조합이 1개뿐입니다. 최소 2개 이상이어야 합니다.")
         seg_matrix["n"] = seg_matrix.index.map(cnt.get).fillna(0).astype(int)
 
         # Optional PCA/Factor profile mean features (align with R flow: target×seg pivot + PCA profile)
@@ -3647,6 +3718,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
             lambda r: sep.join(r.values), axis=1
         )
         return lbl
+
+    def _get_demand_seg_labels(self) -> Optional[pd.Series]:
+        """Safely return cached demand segment labels or recompute without truth-value checks."""
+        if self.state.demand_seg_labels is not None:
+            return self.state.demand_seg_labels
+        return self._current_segment_labels()
 
     def _variables_as_matrix(self, cols: List[str]):
         df = to_numeric_df(self.state.df, cols)
@@ -3775,6 +3852,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     "Sub-segment N": int(n_map.get(seg, 0)) if n_map else "-",
                     "Cluster Total N": n_sum if n_map else "-",
                     "Points in Cluster": len(items),
+                    "Targets Used": ", ".join(self.state.demand_targets_used or self.state.demand_targets or []),
                 })
         out = pd.DataFrame(rows).sort_values(["Cluster ID", "Sub-segment"]).reset_index(drop=True)
         self.tbl_cluster_summary.set_df(out, max_rows=2000)
@@ -3831,24 +3909,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.txt_profile_report.setHtml(report)
 
     def _on_manual_clusters_changed(self):
-        if self.state.demand_xy is None:
-            return
-        s = self.plot_edit.get_cluster_series()
-        self.state.cluster_assign = s
-        if self.state.demand_xy is not None and "id" in self.state.demand_xy.columns:
-            df = self.state.demand_xy.copy()
-            mapped = df["id"].astype(str).map(s)
-            if "cluster_id" in df.columns:
-                mapped = mapped.fillna(df["cluster_id"])
-            df["cluster_id"] = mapped.astype(int)
-            self.state.demand_xy = df
-        if self.state.demand_mode.startswith("Segments"):
-            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
-        self.state.manual_dirty = True
-        self._update_cluster_summary()
-        self._update_profiler()
-        self._refresh_demand_preview()
-        self._set_status("Manual clusters updated.")
+        self._sync_clusters_from_edit_plot("Manual clusters updated.")
 
     def _on_manual_coords_changed(self):
         if self.state.demand_xy is None:
@@ -3886,6 +3947,36 @@ class IntegratedApp(QtWidgets.QMainWindow):
         clusters = cl.astype(int).to_numpy()
         self.plot_preview.set_data(ids, labels, xy, clusters, self.state.cluster_names)
 
+    def _sync_clusters_from_edit_plot(self, status_msg: Optional[str] = None) -> bool:
+        """Sync cluster assignments (and derived tables) from the editable plot without Series truthiness checks."""
+        if self.state.demand_xy is None:
+            return False
+
+        s = self.plot_edit.get_cluster_series()
+        if s is None or s.empty:
+            return False
+
+        self.state.cluster_assign = s
+        if "id" in self.state.demand_xy.columns:
+            df = self.state.demand_xy.copy()
+            mapped = df["id"].astype(str).map(s)
+            if "cluster_id" in df.columns:
+                mapped = mapped.fillna(df["cluster_id"])
+            df["cluster_id"] = mapped.astype(int)
+            self.state.demand_xy = df
+
+        if self.state.demand_mode.startswith("Segments"):
+            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
+
+        self.state.manual_dirty = True
+        self._update_cluster_summary()
+        self._update_profiler()
+        self._refresh_demand_preview()
+
+        if status_msg:
+            self._set_status(status_msg)
+        return True
+
     def _rename_cluster(self):
         try:
             cid = int(self.spin_rename_cluster_id.value())
@@ -3912,7 +4003,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lbl_export = QtWidgets.QLabel(
             "Export Results to Excel:\n"
-            "Sheets: 01_Data, 02_RECODE, 03_Factor_Loadings, 04_Factor_Scores,\n"
+            "Sheets: 00_Metadata, 01_Data, 02_RECODE, 03_Factor_Loadings, 04_Factor_Scores,\n"
             "05_DT_ImprovePivot, 05_DT_Importance, 06_DT_BestSplit, 07_DT_Full_Nodes, ...\n"
             "13_Demand_Clusters, 14_Variable_Types, 15_Raw_with_Clusters"
         )
@@ -3957,6 +4048,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 raise RuntimeError("Select output path.")
 
             with pd.ExcelWriter(out, engine="openpyxl") as w:
+                metadata_rows = []
+                tgt_list = self.state.demand_targets_used or self.state.demand_targets
+                if tgt_list:
+                    metadata_rows.append({"key": "demand_targets_used", "value": ", ".join(tgt_list)})
+                if metadata_rows:
+                    pd.DataFrame(metadata_rows).to_excel(w, sheet_name="00_Metadata", index=False)
+
                 self.state.df.to_excel(w, sheet_name="01_Data", index=False)
                 if self.state.recode_df is not None:
                     self.state.recode_df.to_excel(w, sheet_name="02_RECODE", index=False)
@@ -3986,7 +4084,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     cl_df.to_excel(w, sheet_name="13_Demand_Clusters", index=False)
 
                 if self.state.demand_mode.startswith("Segments") and self.state.cluster_assign is not None:
-                    seg_labels = self.state.demand_seg_labels or self._current_segment_labels()
+                    seg_labels = self._get_demand_seg_labels()
                     if seg_labels is not None:
                         cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
                         raw = self.state.df.copy()
