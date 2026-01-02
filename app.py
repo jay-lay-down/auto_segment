@@ -5237,6 +5237,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         )
         return lbl
 
+    def _get_demand_seg_labels(self) -> Optional[pd.Series]:
+        """Safely return cached demand segment labels or recompute without truth-value checks."""
+        if self.state.demand_seg_labels is not None:
+            return self.state.demand_seg_labels
+        return self._current_segment_labels()
+
     def _variables_as_matrix(self, cols: List[str]):
         df = to_numeric_df(self.state.df, cols)
         df = df.dropna(axis=0, how="all")
@@ -5795,11 +5801,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     cl_df.to_excel(w, sheet_name="13_Demand_Clusters", index=False)
 
                 if self.state.demand_mode.startswith("Segments") and self.state.cluster_assign is not None:
-                    seg_labels = (
-                        self.state.demand_seg_labels
-                        if self.state.demand_seg_labels is not None
-                        else self._current_segment_labels()
-                    )
+                    seg_labels = self._get_demand_seg_labels()
                     if seg_labels is not None:
                         cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
                         raw = self.state.df.copy()
