@@ -74,7 +74,7 @@ def is_categorical_series(s: pd.Series, max_unique_numeric_as_cat: int = 20) -> 
         return False
     if pd.api.types.is_bool_dtype(s):
         return True
-    if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s) or pd.api.types.is_categorical_dtype(s):
+    if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s) or isinstance(s.dtype, pd.CategoricalDtype):
         return True
     if pd.api.types.is_integer_dtype(s):
         nun = s.dropna().nunique()
@@ -5795,7 +5795,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     cl_df.to_excel(w, sheet_name="13_Demand_Clusters", index=False)
 
                 if self.state.demand_mode.startswith("Segments") and self.state.cluster_assign is not None:
-                    seg_labels = self.state.demand_seg_labels or self._current_segment_labels()
+                    seg_labels = (
+                        self.state.demand_seg_labels
+                        if self.state.demand_seg_labels is not None
+                        else self._current_segment_labels()
+                    )
                     if seg_labels is not None:
                         cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
                         raw = self.state.df.copy()
