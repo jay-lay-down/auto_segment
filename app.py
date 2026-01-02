@@ -224,8 +224,11 @@ class AppState:
     factor_model: Any = None
     factor_cols: Optional[List[str]] = None
     factor_scores: Optional[pd.DataFrame] = None
+    factor_score_cols: List[str] = field(default_factory=list)
     factor_loadings: Optional[pd.DataFrame] = None
     factor_mode: str = "PCA"
+    factor_ai_names: Dict[str, str] = field(default_factory=dict)
+    factor_ai_suggestions: Dict[str, str] = field(default_factory=dict)
 
     # Decision tree outputs (Setting Tab)
     dt_improve_pivot: Optional[pd.DataFrame] = None
@@ -237,14 +240,22 @@ class AppState:
     dt_full_split_groups: Optional[pd.DataFrame] = None
     dt_full_split_branches: Optional[pd.DataFrame] = None
     dt_full_path_info: Optional[pd.DataFrame] = None
+    dt_full_split_paths: Optional[pd.DataFrame] = None
     dt_full_condition_freq: Optional[pd.DataFrame] = None
     dt_full_selected: Tuple[Optional[str], Optional[str]] = (None, None)
+    dt_full_split_view: Optional[pd.DataFrame] = None  # formatted split summary for the All Splits table
+    dt_full_split_pivot: Optional[pd.DataFrame] = None  # pivot: rows=split condition, cols=dep, val=improve
+    dt_selected_deps: Optional[List[str]] = None
+    dt_selected_inds: Optional[List[str]] = None
+    dt_edit_group_map: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    dt_edit_view_mode: str = "split"  # "split" (좌/우+개선도) or "combo" (모든 조합 개선도)
 
     # Demand Space Data
     demand_mode: str = "Segments-as-points"
     demand_xy: Optional[pd.DataFrame] = None
     cluster_assign: Optional[pd.Series] = None
     cluster_names: Dict[int, str] = field(default_factory=dict)
+    cluster_colors: Dict[int, str] = field(default_factory=dict)
 
     # Demand Space Profile Data
     demand_seg_profile: Optional[pd.DataFrame] = None
@@ -294,6 +305,15 @@ class AppState:
 # -----------------------------------------------------------------------------
 # [v8.1 NEW] API Call Helper with Retry Logic
 # -----------------------------------------------------------------------------
+def _flatten_messages(messages: List[dict]) -> str:
+    lines = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
 def call_openai_api(
     api_key: str,
     messages: List[dict],
@@ -311,6 +331,9 @@ def call_openai_api(
         - If success: result is the AI response content
         - If failure: result is the error message
     """
+    if not api_key or not str(api_key).strip():
+        return False, "API key is missing. Please enter a valid key."
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -354,8 +377,11 @@ def call_openai_api(
                 continue
 
             resp.raise_for_status()
-            data = resp.json()
-            answer = data["choices"][0]["message"]["content"]
+            try:
+                data = resp.json()
+                answer = data["choices"][0]["message"]["content"]
+            except (ValueError, KeyError, TypeError) as parse_err:
+                return False, f"Invalid response from server: {parse_err}"
             return True, answer
 
         except requests.exceptions.Timeout:
@@ -406,6 +432,206 @@ def call_openai_api(
         )
 
     return False, f"Failed after {max_retries} attempts. Last error: {last_error}"
+
+
+def _normalize_gemini_model(model: Optional[str]) -> str:
+    """Ensure Gemini model names align with deployable versions."""
+    name = (model or "").strip()
+    if not name:
+        return "gemini-3-pro-preview"
+
+    name = name.lower()
+    if name.startswith("models/"):
+        name = name.split("/", 1)[1]
+
+    alias = {
+        "gemini": "gemini-3-pro-preview",
+        "gemini-1.5-flash": "gemini-1.5-flash",
+        "gemini-1.5-flash-latest": "gemini-1.5-flash",
+        "gemini-1.5-flash-001": "gemini-1.5-flash-001",
+        "gemini-1.5-pro": "gemini-1.5-pro",
+        "gemini-1.5-pro-001": "gemini-1.5-pro-001",
+        "gemini-1.5-flash-8b": "gemini-1.5-flash-8b",
+        "gemini-3-pro": "gemini-3-pro-preview",
+        "gemini-3-pro-preview": "gemini-3-pro-preview",
+        "gemini-3.5-pro": "gemini-3.5-pro-preview",
+        "gemini-3.5-pro-preview": "gemini-3.5-pro-preview",
+        "gemini-3.5-pro-preview-0409": "gemini-3.5-pro-preview-0409",
+        "gemini (1.5-flash)": "gemini-1.5-flash",
+        "gemini (1.5-flash-latest)": "gemini-1.5-flash",
+        "gemini (3-pro-preview)": "gemini-3-pro-preview",
+        "gemini (3.5-pro-preview)": "gemini-3.5-pro-preview",
+        "gemini (3.5-pro-preview-0409)": "gemini-3.5-pro-preview-0409",
+    }
+
+    return alias.get(name, name)
+
+
+def call_gemini_api(
+    api_key: str,
+    messages: List[dict],
+    model: str = "gemini-3-pro-preview",
+    max_retries: int = 4,
+    initial_delay: float = 2.0,
+    timeout: int = 30,
+) -> Tuple[bool, str]:
+    """Calls Gemini Generative Language API with retry logic similar to OpenAI."""
+    if not api_key or not str(api_key).strip():
+        return False, "API key is missing. Please enter a valid key."
+
+    model = _normalize_gemini_model(model)
+    fallback_by_model = {
+        "gemini-3-pro-preview": [
+            "gemini-3.5-pro-preview",
+            "gemini-3.5-pro-preview-0409",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ],
+        "gemini-3.5-pro-preview": [
+            "gemini-3-pro-preview",
+            "gemini-3.5-pro-preview-0409",
+            "gemini-1.5-pro",
+        ],
+        "gemini-3.5-pro-preview-0409": [
+            "gemini-3.5-pro-preview",
+            "gemini-3-pro-preview",
+            "gemini-1.5-pro",
+        ],
+        "gemini-1.5-flash": ["gemini-1.5-flash-001", "gemini-1.5-pro"],
+        "gemini-1.5-flash-latest": ["gemini-1.5-flash", "gemini-1.5-flash-001"],
+        "gemini-1.5-flash-001": ["gemini-1.5-flash", "gemini-1.5-pro"],
+        "gemini-1.5-flash-8b": ["gemini-1.5-flash", "gemini-1.5-flash-001"],
+        "gemini-1.5-pro": ["gemini-1.5-pro-001", "gemini-1.5-flash"],
+        "gemini-1.5-pro-001": ["gemini-1.5-pro", "gemini-1.5-flash"],
+    }
+    candidate_models: List[str] = [model]
+    for alt in fallback_by_model.get(model, ["gemini-3-pro-preview", "gemini-1.5-flash"]):
+        if alt not in candidate_models:
+            candidate_models.append(alt)
+
+    model_idx = 0
+    delay = float(initial_delay)
+    last_error = ""
+
+    for attempt in range(max_retries):
+        current_model = candidate_models[min(model_idx, len(candidate_models) - 1)]
+        path_model = (
+            current_model if current_model.startswith("models/") else f"models/{current_model}"
+        )
+        try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/{path_model}:generateContent"
+                f"?key={api_key}"
+            )
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": _flatten_messages(messages)}],
+                    }
+                ]
+            }
+            resp = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+
+            if resp.status_code == 429:
+                last_error = (
+                    f"Rate limit hit. Waiting {delay:.1f}s before retry "
+                    f"({attempt + 1}/{max_retries})"
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+                candidates = data.get("candidates") or []
+                first = candidates[0]
+                parts = first.get("content", {}).get("parts", [])
+                text = parts[0].get("text") if parts else None
+                if not text:
+                    raise KeyError("No text in Gemini response")
+            except (ValueError, KeyError, IndexError, AttributeError) as parse_err:
+                return False, f"Invalid response from Gemini: {parse_err}"
+            return True, text
+
+        except requests.exceptions.HTTPError as http_err:
+            status_code = getattr(getattr(http_err, "response", None), "status_code", None)
+            if status_code == 404:
+                last_error = (
+                    f"Model not found (404) for '{current_model}'. "
+                    "Trying alternate Gemini model names."
+                )
+                if model_idx + 1 < len(candidate_models):
+                    model_idx += 1
+                    continue
+                tried = ", ".join(candidate_models)
+                recommended = ", ".join(
+                    [
+                        "gemini-3-pro-preview",
+                        "gemini-3.5-pro-preview",
+                        "gemini-3.5-pro-preview-0409",
+                        "gemini-1.5-pro",
+                        "gemini-1.5-flash",
+                    ]
+                )
+                msg = (
+                    "Model not found (404). Please verify the Gemini model name "
+                    f"and access. Tried: {tried}. Recommended models: {recommended}."
+                )
+            else:
+                msg = f"HTTP error: {http_err}"
+            return False, msg
+        except requests.exceptions.Timeout:
+            last_error = (
+                f"Request timeout after {timeout}s (Attempt {attempt + 1}/{max_retries})"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+        except requests.exceptions.RequestException as e:
+            last_error = f"Network error: {str(e)}"
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    msg = f"Failed after {max_retries} attempts. Last error: {last_error}"
+    return False, msg
+
+
+def call_ai_chat(
+    provider: str,
+    api_key: str,
+    messages: List[dict],
+    model: Optional[str] = None,
+    max_retries: int = 4,
+    initial_delay: float = 2.0,
+    timeout: int = 30,
+) -> Tuple[bool, str]:
+    provider = (provider or "openai").lower()
+    if provider == "gemini":
+        model = _normalize_gemini_model(model or "gemini-3-pro-preview")
+        return call_gemini_api(
+            api_key,
+            messages,
+            model=model,
+            max_retries=max_retries,
+            initial_delay=initial_delay,
+            timeout=timeout,
+        )
+
+    model = model or "gpt-4o-mini"
+    return call_openai_api(
+        api_key,
+        messages,
+        model=model,
+        max_retries=max_retries,
+        initial_delay=initial_delay,
+        timeout=timeout,
+    )
 
 # =============================================================================
 # app.py (Part 2/8)
@@ -1357,6 +1583,7 @@ class DemandClusterPlot(pg.PlotWidget):
         self._xy: np.ndarray = np.zeros((0, 2), dtype=float)
         self._cluster: np.ndarray = np.zeros((0,), dtype=int)
         self._cluster_names: Dict[int, str] = {}
+        self._cluster_custom_colors: Dict[int, QtGui.QColor] = {}
 
         self._scatter = pg.ScatterPlotItem(size=11, pxMode=True)
         self.addItem(self._scatter)
@@ -1375,6 +1602,13 @@ class DemandClusterPlot(pg.PlotWidget):
 
         self._label_pos_override: Dict[int, Tuple[float, float]] = {}
 
+        # New cluster creation template (user-defined name/color via UI)
+        self._new_cluster_enabled: bool = False
+        self._new_cluster_name: str = ""
+        self._new_cluster_color: Optional[QtGui.QColor] = None
+        self._new_clusters_created: List[Tuple[int, str, QtGui.QColor]] = []
+        self._new_cluster_counter: int = 1
+
     def set_edit_mode_active(self, active: bool):
         self._edit_mode_active = active
 
@@ -1387,6 +1621,36 @@ class DemandClusterPlot(pg.PlotWidget):
     def set_show_all_point_labels(self, on: bool):
         self._show_all_point_labels = bool(on)
         self._draw_scatter()
+
+    def set_new_cluster_mode(self, on: bool):
+        self._new_cluster_enabled = bool(on)
+
+    def set_new_cluster_template(self, name: str, color: Optional[str]):
+        self._new_cluster_name = name or ""
+        if color:
+            try:
+                self._new_cluster_color = qcolor(str(color))
+            except Exception:
+                self._new_cluster_color = None
+        else:
+            self._new_cluster_color = None
+        if name and name.lower().startswith("new cluster"):
+            try:
+                tail = name.split(" ", 2)[-1]
+                num = int(tail)
+                self._new_cluster_counter = max(self._new_cluster_counter, num)
+            except Exception:
+                pass
+
+    def consume_new_clusters(self) -> List[Tuple[int, str, str]]:
+        items: List[Tuple[int, str, str]] = []
+        for cid, name, col in self._new_clusters_created:
+            try:
+                items.append((int(cid), name, QtGui.QColor(col).name()))
+            except Exception:
+                continue
+        self._new_clusters_created.clear()
+        return items
 
     def reset_label_positions(self):
         self._label_pos_override.clear()
@@ -1438,16 +1702,33 @@ class DemandClusterPlot(pg.PlotWidget):
             self._label_items[cid].setPos(float(p[0]), float(p[1]))
 
     def _cluster_color(self, cid: int, alpha=255) -> QtGui.QColor:
+        if int(cid) in self._cluster_custom_colors:
+            c = QtGui.QColor(self._cluster_custom_colors[int(cid)])
+            c.setAlpha(int(alpha))
+            return c
         base = self._hex[(int(cid) - 1) % len(self._hex)]
         return qcolor(base, alpha=alpha)
 
-    def set_data(self, ids: List[str], labels: List[str], xy: np.ndarray, clusters: np.ndarray,
-                 cluster_names: Optional[Dict[int, str]] = None):
+    def set_data(
+        self,
+        ids: List[str],
+        labels: List[str],
+        xy: np.ndarray,
+        clusters: np.ndarray,
+        cluster_names: Optional[Dict[int, str]] = None,
+        cluster_colors: Optional[Dict[int, str]] = None,
+    ):
         self._ids = list(map(str, ids))
         self._labels = list(map(lambda x: "" if x is None else str(x), labels))
         self._xy = np.asarray(xy, dtype=float)
         self._cluster = np.asarray(clusters, dtype=int)
         self._cluster_names = dict(cluster_names or {})
+        self._cluster_custom_colors = {}
+        for k, v in (cluster_colors or {}).items():
+            try:
+                self._cluster_custom_colors[int(k)] = qcolor(str(v))
+            except Exception:
+                continue
 
         self._selected.clear()
         self._dragging = False
@@ -1466,11 +1747,33 @@ class DemandClusterPlot(pg.PlotWidget):
     def get_cluster_series(self) -> pd.Series:
         return pd.Series(self._cluster.copy(), index=self._ids)
 
+    def get_cluster_names(self) -> Dict[int, str]:
+        return dict(self._cluster_names)
+
+    def get_cluster_colors(self) -> Dict[int, str]:
+        out: Dict[int, str] = {}
+        for k, v in self._cluster_custom_colors.items():
+            try:
+                out[int(k)] = QtGui.QColor(v).name()
+            except Exception:
+                continue
+        return out
+
     def get_xy_map(self) -> Dict[str, Tuple[float, float]]:
         return {self._ids[i]: (float(self._xy[i, 0]), float(self._xy[i, 1])) for i in range(len(self._ids))}
 
     def set_cluster_names(self, names: Dict[int, str]):
         self._cluster_names = dict(names or {})
+        self._draw_hulls_and_labels()
+
+    def set_cluster_colors(self, colors: Dict[int, str]):
+        self._cluster_custom_colors = {}
+        for k, v in (colors or {}).items():
+            try:
+                self._cluster_custom_colors[int(k)] = qcolor(str(v))
+            except Exception:
+                continue
+        self._draw_scatter()
         self._draw_hulls_and_labels()
 
     def remember_label_position(self, cid: int, pos_xy: Tuple[float, float]):
@@ -1601,8 +1904,19 @@ class DemandClusterPlot(pg.PlotWidget):
             out[cid] = (float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1])))
         return out
 
-    def _cluster_at_position(self, drop_xy: Tuple[float, float]) -> Optional[int]:
-        """Return cluster id under drop_xy, preferring hull containment then nearest centroid."""
+    def _cluster_scale(self) -> float:
+        if self._xy.shape[0] == 0:
+            return 0.0
+        dx = float(np.max(self._xy[:, 0]) - np.min(self._xy[:, 0])) if self._xy.size else 0.0
+        dy = float(np.max(self._xy[:, 1]) - np.min(self._xy[:, 1])) if self._xy.size else 0.0
+        return max(dx, dy)
+
+    def _cluster_at_position(self, drop_xy: Tuple[float, float], allow_far_new: bool = False) -> Optional[int]:
+        """
+        Return cluster id under drop_xy, preferring hull containment then nearest centroid.
+        When allow_far_new=True, drop positions far from any centroid will return None
+        to signal new-cluster creation.
+        """
         pt = QtCore.QPointF(drop_xy[0], drop_xy[1])
 
         # 1) If the drop point is inside a drawn hull, use that cluster.
@@ -1618,14 +1932,25 @@ class DemandClusterPlot(pg.PlotWidget):
         if not cent:
             return None
         d2 = {cid: (drop_xy[0] - c[0]) ** 2 + (drop_xy[1] - c[1]) ** 2 for cid, c in cent.items()}
-        return int(min(d2, key=d2.get))
+        nearest = int(min(d2, key=d2.get))
+        if allow_far_new:
+            min_dist = float(np.sqrt(d2[nearest]))
+            scale = self._cluster_scale()
+            thresh = max(0.18 * scale, 0.0)
+            if scale <= 0:
+                thresh = 0.0
+            if thresh > 0 and min_dist > thresh:
+                return None
+        return nearest
 
-    def _assign_selected_to_nearest_cluster(self, drop_xy: Tuple[float, float]):
-        dst = self._cluster_at_position(drop_xy)
+    def _assign_selected_to_cluster(self, dst: Optional[int]):
         if dst is None or not self._selected:
+            self._drag_temp_positions = None
+            self._drag_anchor_xy = None
+            self._draw_scatter()
             return
         for i in self._selected:
-            self._cluster[i] = dst
+            self._cluster[i] = int(dst)
         self._drag_temp_positions = None
         self._drag_anchor_xy = None
         self.redraw_all()
@@ -1649,6 +1974,41 @@ class DemandClusterPlot(pg.PlotWidget):
         self._drag_anchor_xy = None
         self.redraw_all()
         self.sigCoordsChanged.emit()
+
+    def _create_cluster_from_drop(self, drop_xy: Tuple[float, float]):
+        new_cid = int(max(self._cluster) if len(self._cluster) else 0) + 1
+        base_name = self._new_cluster_name.strip() or f"New Cluster {self._new_cluster_counter}"
+        existing_names = {str(v).strip().lower() for v in self._cluster_names.values()}
+        name = base_name
+        suffix = 2
+        while name.strip().lower() in existing_names:
+            name = f"{base_name} {suffix}"
+            suffix += 1
+
+        color = self._new_cluster_color or self._cluster_color(new_cid, alpha=255)
+
+        if self._drag_temp_positions is not None:
+            self._xy = self._drag_temp_positions
+
+        for i in self._selected:
+            self._cluster[i] = new_cid
+
+        self._cluster_names[new_cid] = name
+        self._cluster_custom_colors[new_cid] = QtGui.QColor(color)
+        self._new_clusters_created.append((new_cid, name, QtGui.QColor(color)))
+        self._new_cluster_counter = max(self._new_cluster_counter + 1, new_cid + 1)
+
+        self._drag_temp_positions = None
+        self._drag_anchor_xy = None
+        self.redraw_all()
+        self.sigClustersChanged.emit()
+
+    def _drop_with_snap(self, drop_xy: Tuple[float, float]):
+        dst = self._cluster_at_position(drop_xy, allow_far_new=self._new_cluster_enabled)
+        if self._new_cluster_enabled and dst is None:
+            self._create_cluster_from_drop(drop_xy)
+        else:
+            self._assign_selected_to_cluster(dst)
 
     def drag_event(self, pos: Tuple[float, float], ev):
         if not self._editable_widget:
@@ -1679,7 +2039,7 @@ class DemandClusterPlot(pg.PlotWidget):
             if self._free_move_points:
                 self._commit_selected_move(pos)
             else:
-                self._assign_selected_to_nearest_cluster(pos)
+                self._drop_with_snap(pos)
             return
 
         if self._drag_temp_positions is not None and self._selected and self._drag_anchor_xy is not None:
@@ -1787,6 +2147,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.state = AppState()
 
+        # Compatibility flags for optional/legacy tab builders
+        self._dt_results_built = False
+
         # Menu Bar
         menubar = self.menuBar()
         file_menu = menubar.addMenu("File")
@@ -1818,6 +2181,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._build_tab_factor()
         self._build_tab_dt_setting()
         self._build_tab_dt_results()
+        self._build_tab_dt_editing()
         self._build_tab_grouping()
         self._build_tab_seg_setting()
         self._build_tab_seg_editing()
@@ -1825,6 +2189,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._build_tab_rag()
 
         self._apply_tab_styles()
+
+        # Footer credit
+        footer = QtWidgets.QLabel(
+            'Made by <b>jihee.cho</b> | '
+            '<a href="https://github.com/jay-lay-down/">github.com/jay-lay-down</a>'
+        )
+        footer.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        footer.setOpenExternalLinks(True)
+        self.statusBar().addPermanentWidget(footer)
+
         self._set_status("Ready.")
 
     # -------------------------------------------------------------------------
@@ -1868,6 +2242,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if it.checkState() == QtCore.Qt.CheckState.Checked:
                 out.append(it.text())
         return out
+
+    def _checked_or_selected_items(self, widget: QtWidgets.QListWidget) -> List[str]:
+        """Returns checked items, or falls back to selected items if none are checked."""
+
+        checked = self._selected_checked_items(widget)
+        if checked:
+            return checked
+        return [it.text() for it in widget.selectedItems()]
 
     def _set_checked_for_selected(self, widget: QtWidgets.QListWidget, checked: bool):
         st = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
@@ -1954,9 +2336,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 it.setBackground(QtGui.QColor("#fff3e0"))
             self.lst_dt_predictors.addItem(it)
 
-        self.cmb_dep_extra.clear()
-        self.cmb_dep_extra.addItem("(None)")
-        self.cmb_dep_extra.addItems(cols)
+        self.lst_dep_extra.clear()
+        for c in cols:
+            it = QtWidgets.QListWidgetItem(c)
+            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            it.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            self.lst_dep_extra.addItem(it)
 
         self.cmb_dt_full_dep.clear()
         self.cmb_dt_full_dep.addItems(cols)
@@ -2003,6 +2388,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.lst_demand_targets.addItem(it)
         self.lst_demand_targets.blockSignals(False)
         self._restore_demand_target_checks()
+
+        if hasattr(self, "lst_delete_cols"):
+            self.lst_delete_cols.clear()
+            for c in cols:
+                label = c
+                if c in set(self._factor_score_columns()) or str(c).startswith("PCA") or str(c).endswith("_seg"):
+                    label = f"{c} (derived)"
+                item = QtWidgets.QListWidgetItem(label)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, c)
+                self.lst_delete_cols.addItem(item)
+
+        self._refresh_dt_edit_var_options()
 
     # -------------------------------------------------------------------------
     # [v8.1] Variable Type Manager
@@ -2183,23 +2580,51 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.last_error = str(e)
             show_error(self, "Load Error", e)
 
-    def _reset_downstream_state(self):
+    def _clear_factor_results(self):
+        """Resets factor-related state and UI outputs."""
         self.state.factor_model = None
         self.state.factor_cols = None
         self.state.factor_scores = None
+        self.state.factor_score_cols = []
         self.state.factor_loadings = None
         self.state.factor_mode = "PCA"
+        self.state.factor_ai_names = {}
+        self.state.factor_ai_suggestions = {}
+
+        if hasattr(self, "tbl_factor_loadings"):
+            self.tbl_factor_loadings.set_df(None)
+        if hasattr(self, "lbl_factor_info"):
+            self.lbl_factor_info.setText("Analysis not run.")
+
+    def _clear_dt_outputs(self):
+        """Resets decision-tree related state and UI outputs."""
         self.state.dt_improve_pivot = None
         self.state.dt_split_best = None
         self.state.dt_importance_summary = None
         self.state.dt_full_nodes = None
-        
-        if hasattr(self, "tbl_factor_loadings"):
-            self.tbl_factor_loadings.set_df(None)
+        self.state.dt_full_split_groups = None
+        self.state.dt_full_path_info = None
+        self.state.dt_full_split_branches = None
+        self.state.dt_full_split_paths = None
+
         if hasattr(self, "tbl_dt_pivot"):
             self.tbl_dt_pivot.set_df(None)
         if hasattr(self, "tbl_dt_importance"):
             self.tbl_dt_importance.set_df(None)
+        if hasattr(self, "tbl_dt_bestsplit"):
+            self.tbl_dt_bestsplit.set_df(None)
+        if hasattr(self, "tbl_split_detail"):
+            self.tbl_split_detail.set_df(None)
+        if hasattr(self, "tbl_split_paths"):
+            self.tbl_split_paths.set_df(None)
+        if hasattr(self, "tree_viz"):
+            self.tree_viz.set_tree_data(pd.DataFrame())
+        if hasattr(self, "lbl_split_imp"):
+            self.lbl_split_imp.setText("No split selected.")
+
+    def _reset_downstream_state(self):
+        self._clear_factor_results()
+        self._clear_dt_outputs()
 
     # -------------------------------------------------------------------------
     # Tab 2: Recode Mapping
@@ -2242,7 +2667,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_factor_cols = QtWidgets.QListWidget()
         self.lst_factor_cols.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        left.addWidget(self.lst_factor_cols, 1)
+        self.lst_factor_cols.setMaximumHeight(220)
+        size_pol = self.lst_factor_cols.sizePolicy()
+        size_pol.setVerticalStretch(0)
+        self.lst_factor_cols.setSizePolicy(size_pol)
+        left.addWidget(self.lst_factor_cols)
 
         # Selection Buttons
         btnrow = QtWidgets.QHBoxLayout()
@@ -2299,6 +2728,32 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lbl_factor_info = QtWidgets.QLabel("Analysis not run.")
         self.lbl_factor_info.setWordWrap(True)
         left.addWidget(self.lbl_factor_info)
+
+        # Factor name editor (AI suggestions + manual edits)
+        name_grp = QtWidgets.QGroupBox("Factor Names (AI 제안/수정)")
+        name_lay = QtWidgets.QVBoxLayout(name_grp)
+        self.tbl_factor_name_editor = QtWidgets.QTableWidget()
+        self.tbl_factor_name_editor.setColumnCount(3)
+        self.tbl_factor_name_editor.setHorizontalHeaderLabels(["Factor", "Suggested", "Final Name"])
+        self.tbl_factor_name_editor.horizontalHeader().setStretchLastSection(True)
+        self.tbl_factor_name_editor.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+        self.tbl_factor_name_editor.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.AllEditTriggers)
+        self.tbl_factor_name_editor.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_factor_name_editor.setAlternatingRowColors(True)
+        self.tbl_factor_name_editor.setMinimumHeight(140)
+        name_lay.addWidget(self.tbl_factor_name_editor, 1)
+
+        name_btn_row = QtWidgets.QHBoxLayout()
+        self.btn_apply_factor_names = QtWidgets.QPushButton("Apply Edited Names")
+        style_button(self.btn_apply_factor_names, level=2)
+        self.btn_apply_factor_names.clicked.connect(self._apply_factor_names_from_editor)
+        self.btn_reset_factor_names = QtWidgets.QPushButton("Clear Names")
+        style_button(self.btn_reset_factor_names, level=1)
+        self.btn_reset_factor_names.clicked.connect(self._reset_factor_names)
+        name_btn_row.addWidget(self.btn_apply_factor_names)
+        name_btn_row.addWidget(self.btn_reset_factor_names)
+        name_lay.addLayout(name_btn_row)
+        left.addWidget(name_grp, 1)
 
         layout.addLayout(left, 2)
 
@@ -2394,20 +2849,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             loadings = pd.DataFrame(components.T, index=cols, columns=score_cols)
 
-            disp = loadings.copy()
-            disp["_maxabs_"] = disp.abs().max(axis=1)
-            disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
-            disp = disp.reset_index().rename(columns={"index": "variable"})
-
             self.lbl_factor_info.setText(info_text)
-            self.tbl_factor_loadings.set_df(disp)
 
             self.state.df = df
             self.state.factor_model = model
             self.state.factor_cols = cols
             self.state.factor_scores = scores_df
+            self.state.factor_score_cols = score_cols
             self.state.factor_loadings = loadings
             self.state.factor_mode = mode_name
+            self.state.factor_ai_names = {}
+            self.state.factor_ai_suggestions = {}
+
+            self._render_factor_loadings_table()
+            self._sync_factor_name_editor()
 
             self.tbl_preview.set_df(df)
             self._refresh_all_column_lists()
@@ -2423,9 +2878,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "No Factors", "Run Factor Analysis first.")
             return
             
-        key = self.txt_openai_key.text().strip()
+        provider, key = self._get_ai_provider_and_key()
         if not key:
-            QtWidgets.QMessageBox.warning(self, "No Key", "Enter API Key in AI Tab.")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No Key",
+                "Enter API Key in AI Tab for the selected provider (OpenAI/Gemini).",
+            )
             return
 
         loadings = self.state.factor_loadings
@@ -2441,17 +2900,287 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             # [v8.1] Use new retry-enabled API call
             messages = [{"role": "user", "content": txt}]
-            success, result = call_openai_api(key, messages, max_retries=3, initial_delay=2.0)
+            success, result = call_ai_chat(
+                provider,
+                key,
+                messages,
+                max_retries=3,
+                initial_delay=2.0,
+            )
 
             if success:
-                QtWidgets.QMessageBox.information(self, "AI Suggestion", result)
-                self._set_status("AI Naming Done.")
+                suggestions = self._parse_ai_factor_suggestions(result)
+                if suggestions:
+                    self.state.factor_ai_suggestions = suggestions
+                    self._sync_factor_name_editor(suggestions)
+                    self._set_status("AI 제안 로드됨. 표에서 수정 후 적용하세요.")
+                else:
+                    self._set_status("AI Naming returned no usable mapping.")
             else:
                 QtWidgets.QMessageBox.warning(self, "AI Error", result)
                 self._set_status("AI Naming Failed.")
 
         except Exception as e:
             show_error(self, "AI Error", e)
+
+    def _parse_ai_factor_suggestions(self, ai_text: str) -> Dict[str, str]:
+        """Parse AI output into a mapping and push it into the editor (no popups)."""
+        factors = []
+        if self.state.factor_loadings is not None:
+            factors = list(map(str, self.state.factor_loadings.columns))
+        elif self.state.factor_scores is not None:
+            factors = list(map(str, self.state.factor_scores.columns))
+
+        available_cols = set()
+        if self.state.factor_scores is not None:
+            available_cols.update(map(str, self.state.factor_scores.columns))
+        if self.state.factor_loadings is not None:
+            available_cols.update(factors)
+
+        def _norm(x: Any) -> str:
+            return str(x).strip()
+
+        parsed: Dict[str, str] = {}
+        parsed_json: Any = None
+
+        # 1) Try JSON dict/list directly
+        try:
+            parsed_json = json.loads(ai_text)
+        except Exception:
+            parsed_json = None
+
+        if isinstance(parsed_json, dict):
+            parsed = {str(k): _norm(v) for k, v in parsed_json.items() if _norm(v)}
+        elif isinstance(parsed_json, list):
+            seq = [_norm(v) for v in parsed_json if _norm(v)]
+            parsed = {col: name for col, name in zip(factors or available_cols, seq)}
+
+        # 2) Fallback: parse "factor: name" lines or plain lines
+        if not parsed:
+            lines = [_norm(l) for l in ai_text.splitlines() if _norm(l)]
+            line_map = {}
+            for line in lines:
+                if ":" in line:
+                    left, right = line.split(":", 1)
+                    line_map[_norm(left)] = _norm(right)
+            if line_map:
+                parsed = line_map
+            elif lines:
+                parsed = {col: name for col, name in zip(factors or available_cols, lines)}
+
+        # 3) Keep only columns we actually have; if keys are missing, align by order
+        applied = {}
+        for col, name in parsed.items():
+            if col in available_cols:
+                applied[col] = name
+
+        if not applied and parsed:
+            for col, name in zip(factors, parsed.values()):
+                if col not in applied and name:
+                    applied[col] = name
+
+        if not applied:
+            self._set_status("AI 제안 파싱 실패: 응답에서 이름을 찾지 못했습니다.")
+            return {}
+
+        return applied
+
+    def _apply_factor_names_from_editor(self):
+        """Apply edited factor names from the editor table to loadings/recode."""
+        if self.state.factor_loadings is None:
+            QtWidgets.QMessageBox.warning(self, "No Factors", "Run Factor Analysis first.")
+            return
+
+        rows = self.tbl_factor_name_editor.rowCount()
+        applied: Dict[str, str] = {}
+        for r in range(rows):
+            factor_item = self.tbl_factor_name_editor.item(r, 0)
+            sugg_item = self.tbl_factor_name_editor.item(r, 1)
+            final_item = self.tbl_factor_name_editor.item(r, 2)
+            factor = factor_item.text().strip() if factor_item else ""
+            suggested = sugg_item.text().strip() if sugg_item else ""
+            final = final_item.text().strip() if final_item else ""
+            if not factor:
+                continue
+            name_to_use = final or suggested
+            if name_to_use:
+                applied[factor] = name_to_use
+
+        if not applied:
+            QtWidgets.QMessageBox.information(self, "No Names", "입력된 이름이 없습니다.")
+            return
+
+        self.state.factor_ai_names = applied
+        self._apply_factor_column_renames(applied)
+        self._render_factor_loadings_table()
+        self._update_recode_with_ai_names(applied)
+        self._set_status("수정된 요인 이름을 적용했습니다.")
+        msg = json.dumps(applied, ensure_ascii=False, indent=2)
+        QtWidgets.QMessageBox.information(self, "적용된 이름", msg)
+
+    def _reset_factor_names(self):
+        self.state.factor_ai_names = {}
+        self.state.factor_ai_suggestions = {}
+        self.state.factor_score_cols = list(self.state.factor_scores.columns) if self.state.factor_scores is not None else []
+        self._sync_factor_name_editor()
+        self._render_factor_loadings_table()
+        self._set_status("요인 이름을 초기화했습니다.")
+
+    def _update_recode_with_ai_names(self, ai_map: Dict[str, str]):
+        if not ai_map:
+            return
+
+        rows = []
+        for col, name in ai_map.items():
+            rows.append({"QUESTION": str(col), "CODE": str(col), "NAME": str(name)})
+
+        current = normalize_recode_df(self.state.recode_df)
+        if current is None or current.empty:
+            recode = pd.DataFrame(rows)
+        else:
+            recode = current.copy()
+            for row in rows:
+                mask = (
+                    recode["QUESTION"].astype(str) == row["QUESTION"]
+                ) & (recode["CODE"].astype(str) == row["CODE"])
+                if mask.any():
+                    recode.loc[mask, "NAME"] = row["NAME"]
+                else:
+                    recode = pd.concat([recode, pd.DataFrame([row])], ignore_index=True)
+
+        self.state.recode_df = normalize_recode_df(recode)
+        self._update_recode_tab()
+
+    def _render_factor_loadings_table(self):
+        if self.state.factor_loadings is None:
+            self.tbl_factor_loadings.set_df(None)
+            self._sync_factor_name_editor()
+            return
+
+        disp = self.state.factor_loadings.copy()
+        rename_map = {
+            col: f"{self.state.factor_ai_names[col]} ({col})"
+            for col in disp.columns
+            if col in self.state.factor_ai_names and self.state.factor_ai_names[col]
+        }
+        if rename_map:
+            disp = disp.rename(columns=rename_map)
+
+        disp["_maxabs_"] = disp.abs().max(axis=1)
+        disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
+        disp = disp.reset_index().rename(columns={"index": "variable"})
+        self.tbl_factor_loadings.set_df(disp)
+        self._sync_factor_name_editor()
+
+    def _sync_factor_name_editor(self, suggestions: Optional[Dict[str, str]] = None):
+        """Refresh the editable factor-name table with current factors and suggestions."""
+        tbl = getattr(self, "tbl_factor_name_editor", None)
+        if tbl is None:
+            return
+
+        tbl.clearContents()
+
+        if self.state.factor_loadings is None:
+            tbl.setRowCount(0)
+            return
+
+        factors = list(self.state.factor_loadings.columns)
+        tbl.setRowCount(len(factors))
+        tbl.setColumnCount(3)
+        tbl.setHorizontalHeaderLabels(["Factor", "Suggested", "Final Name"])
+
+        sug_map = suggestions or self.state.factor_ai_suggestions or {}
+        cur_map = self.state.factor_ai_names
+
+        for r, factor in enumerate(factors):
+            suggested = sug_map.get(factor, "")
+            final = cur_map.get(factor, "") or suggested
+
+            f_item = QtWidgets.QTableWidgetItem(str(factor))
+            f_item.setFlags(f_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            s_item = QtWidgets.QTableWidgetItem(str(suggested))
+            s_item.setFlags(s_item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+            f_final = QtWidgets.QTableWidgetItem(str(final))
+            f_final.setFlags(f_final.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+
+            tbl.setItem(r, 0, f_item)
+            tbl.setItem(r, 1, s_item)
+            tbl.setItem(r, 2, f_final)
+
+        tbl.resizeColumnsToContents()
+
+    def _apply_factor_column_renames(self, name_map: Dict[str, str]):
+        """Rename factor score/loadings columns and propagate to df and cached outputs."""
+        if not name_map:
+            return
+
+        def _rename_cols(df_obj: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+            if df_obj is None:
+                return None
+            return df_obj.rename(columns=name_map)
+
+        # 1) Rename factor scores/loadings
+        if self.state.factor_scores is not None:
+            self.state.factor_scores = _rename_cols(self.state.factor_scores)
+            self.state.factor_score_cols = list(self.state.factor_scores.columns)
+        if self.state.factor_loadings is not None:
+            self.state.factor_loadings = _rename_cols(self.state.factor_loadings)
+
+        # 2) Rename columns in the main dataframe
+        if self.state.df is not None:
+            self.state.df = self.state.df.rename(columns=name_map)
+            self.tbl_preview.set_df(self.state.df)
+
+        # 3) Rename decision tree outputs if present
+        def _rename_dep_ind(df_obj: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+            if df_obj is None:
+                return None
+            df_obj = df_obj.copy()
+            df_obj = df_obj.rename(columns=name_map)
+            for col in ["dep", "ind", "target", "split_feature", "feature"]:
+                if col in df_obj.columns:
+                    df_obj[col] = df_obj[col].replace(name_map)
+            return df_obj
+
+        self.state.dt_improve_pivot = _rename_cols(self.state.dt_improve_pivot)
+        self.state.dt_split_best = _rename_dep_ind(self.state.dt_split_best)
+        self.state.dt_importance_summary = _rename_dep_ind(self.state.dt_importance_summary)
+        self.state.dt_full_nodes = _rename_dep_ind(self.state.dt_full_nodes)
+        self.state.dt_full_split_groups = _rename_dep_ind(self.state.dt_full_split_groups)
+        self.state.dt_full_split_branches = _rename_dep_ind(self.state.dt_full_split_branches)
+        self.state.dt_full_path_info = _rename_dep_ind(self.state.dt_full_path_info)
+        self.state.dt_full_split_paths = _rename_dep_ind(self.state.dt_full_split_paths)
+        self.state.dt_full_condition_freq = _rename_dep_ind(self.state.dt_full_condition_freq)
+        self.state.dt_full_split_view = _rename_dep_ind(self.state.dt_full_split_view)
+        self.state.dt_full_split_pivot = _rename_cols(self.state.dt_full_split_pivot)
+
+        # 4) Refresh UI lists
+        self._refresh_all_column_lists()
+
+    def _factor_score_columns(self) -> List[str]:
+        """Return current factor score column names in order."""
+        if self.state.factor_score_cols:
+            return list(self.state.factor_score_cols)
+        if self.state.factor_scores is not None:
+            return list(self.state.factor_scores.columns)
+        return []
+
+    def _get_ai_provider_and_key(self) -> Tuple[str, str]:
+        provider = "openai"
+        key = ""
+
+        if hasattr(self, "cmb_ai_provider"):
+            sel = self.cmb_ai_provider.currentData()
+            provider = sel or self.cmb_ai_provider.currentText() or "openai"
+
+        provider = str(provider).lower().strip() or "openai"
+
+        if provider == "gemini" and hasattr(self, "txt_gemini_key"):
+            key = self.txt_gemini_key.text().strip()
+        elif hasattr(self, "txt_openai_key"):
+            key = self.txt_openai_key.text().strip()
+
+        return provider, key
 
     # -------------------------------------------------------------------------
     # Tab 4: Decision Tree Setting
@@ -2478,17 +3207,41 @@ class IntegratedApp(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         self.chk_use_all_factors = QtWidgets.QCheckBox("Use all Factors (Factor1..k) as Targets")
         self.chk_use_all_factors.setChecked(True)
-        self.cmb_dep_extra = QtWidgets.QComboBox()
         self.btn_run_tree = QtWidgets.QPushButton("Run Decision Tree Analysis")
         style_button(self.btn_run_tree, level=2)
         self.btn_run_tree.clicked.connect(self._run_decision_tree_outputs)
 
         row.addWidget(self.chk_use_all_factors)
-        row.addSpacing(14)
-        row.addWidget(QtWidgets.QLabel("Extra Target (Optional):"))
-        row.addWidget(self.cmb_dep_extra)
+        row.addStretch(1)
         row.addWidget(self.btn_run_tree)
         layout.addLayout(row)
+
+        extra_box = QtWidgets.QGroupBox("Extra Targets (Optional, multi-select)")
+        extra_layout = QtWidgets.QVBoxLayout(extra_box)
+        extra_layout.addWidget(QtWidgets.QLabel("Check one or more existing columns to treat as additional targets."))
+
+        extra_row = QtWidgets.QHBoxLayout()
+        self.lst_dep_extra = QtWidgets.QListWidget()
+        self.lst_dep_extra.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.lst_dep_extra.setMaximumHeight(90)
+        extra_row.addWidget(self.lst_dep_extra, 1)
+
+        self.btn_dep_extra_check_all = QtWidgets.QPushButton("Check All")
+        style_button(self.btn_dep_extra_check_all, level=1)
+        self.btn_dep_extra_uncheck_all = QtWidgets.QPushButton("Uncheck All")
+        style_button(self.btn_dep_extra_uncheck_all, level=1)
+
+        self.btn_dep_extra_check_all.clicked.connect(lambda: self._set_all_checks(self.lst_dep_extra, True))
+        self.btn_dep_extra_uncheck_all.clicked.connect(lambda: self._set_all_checks(self.lst_dep_extra, False))
+
+        btn_col = QtWidgets.QVBoxLayout()
+        btn_col.addWidget(self.btn_dep_extra_check_all)
+        btn_col.addWidget(self.btn_dep_extra_uncheck_all)
+        btn_col.addStretch(1)
+
+        extra_row.addLayout(btn_col)
+        extra_layout.addLayout(extra_row)
+        layout.addWidget(extra_box)
 
         # Controls: Predictors (Whitelist)
         pred_box = QtWidgets.QGroupBox("Select Predictors (Independent Variables)")
@@ -2526,9 +3279,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         pred_layout.addWidget(self.lst_dt_predictors, 1)
         layout.addWidget(pred_box)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-
-        # A) Pivot (Main View)
+        # Importance + Pivot (Main View)
         w1 = QtWidgets.QWidget()
         l1 = QtWidgets.QVBoxLayout(w1)
         l1.addWidget(QtWidgets.QLabel("Predictor Importance (sum of improve_rel, cumulative %)"))
@@ -2548,17 +3299,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         rec_layout.addStretch(1)
         l1.addLayout(rec_layout)
 
-        # B) Best Split (Detail View)
-        w2 = QtWidgets.QWidget()
-        l2 = QtWidgets.QVBoxLayout(w2)
-        l2.addWidget(QtWidgets.QLabel("Best Split Detail (Root Node) - Reference"))
-        self.tbl_dt_bestsplit = DataFrameTable(float_decimals=2)
-        l2.addWidget(self.tbl_dt_bestsplit, 1)
-
-        splitter.addWidget(w1)
-        splitter.addWidget(w2)
-        splitter.setSizes([520, 240])
-        layout.addWidget(splitter, 1)
+        layout.addWidget(w1, 1)
 
     def _filter_dt_pred_list(self):
         term = self.txt_dt_pred_filter.text().strip().lower()
@@ -2572,25 +3313,40 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._ensure_df()
             df = self.state.df
 
-            fac_cols = [c for c in df.columns if str(c).startswith("Factor") and str(c)[6:].isdigit()]
-            fac_cols = sorted(fac_cols, key=lambda x: int(str(x)[6:]))
+            fac_cols = self._factor_score_columns()
 
             deps: List[str] = []
             if self.chk_use_all_factors.isChecked() and fac_cols:
                 deps.extend(fac_cols)
 
-            extra = self.cmb_dep_extra.currentText().strip()
-            if extra and extra != "(None)" and extra not in deps:
-                deps.append(extra)
+            extras = self._checked_or_selected_items(self.lst_dep_extra)
+            for extra in extras:
+                if extra not in deps:
+                    deps.append(extra)
 
             if not deps:
                 raise RuntimeError("No dependent targets selected. Run Factor Analysis first or select extra dep.")
 
-            ind_vars = self._selected_checked_items(self.lst_dt_predictors)
+            ind_vars = self._checked_or_selected_items(self.lst_dt_predictors)
             ind_vars = [c for c in ind_vars if c not in deps and c != "resp_id"]
 
             if len(ind_vars) == 0:
-                raise RuntimeError("No independent variables selected. Please check predictors.")
+                # If user didn't check/select, fall back to all categorical predictors (seg/demographic)
+                fallback = [
+                    c for c in df.columns
+                    if c not in deps and c != "resp_id" and self.state.is_categorical(c, df[c])
+                ]
+
+                if not fallback:
+                    raise RuntimeError(
+                        "No independent variables selected. "
+                        "Check predictors or mark categorical columns in Variable Type Manager."
+                    )
+
+                ind_vars = fallback
+                self._set_status(
+                    "No predictors selected → auto-using categorical columns as pivots."
+                )
 
             best_rows = []
             pivot = pd.DataFrame(index=ind_vars, columns=deps, dtype=float)
@@ -2598,7 +3354,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             for dep in deps:
                 y = df[dep]
                 # Determine task type for dependent variable
-                is_factor = str(dep).startswith("Factor")
+                is_factor = dep in set(self._factor_score_columns()) or str(dep).startswith("PCA")
                 if is_factor:
                     task = "reg"
                 elif self.state.is_categorical(dep):
@@ -2664,11 +3420,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
             self.tbl_dt_importance.set_df(importance_summary)
             self.tbl_dt_pivot.set_df(pivot_reset)
-            self.tbl_dt_bestsplit.set_df(best_df)
+            if hasattr(self, "tbl_dt_bestsplit_result") and self.tbl_dt_bestsplit_result is not None:
+                self.tbl_dt_bestsplit_result.set_df(best_df)
 
             self.state.dt_improve_pivot = pivot_reset
             self.state.dt_split_best = best_df
             self.state.dt_importance_summary = importance_summary
+            self.state.dt_selected_deps = deps
+            self.state.dt_selected_inds = ind_vars
 
             self.cmb_dt_full_dep.clear()
             self.cmb_dt_full_dep.addItems(deps)
@@ -2680,7 +3439,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.cmb_split_ind.clear()
             self.cmb_split_ind.addItems(ind_vars)
 
-            self._set_status("Decision Tree analysis completed.")
+            self._refresh_split_path_options()
+            self._refresh_dt_edit_var_options()
+
+            if self.tbl_dt_pivot.rowCount() > 0:
+                self.tbl_dt_pivot.selectRow(0)
+
+            used_msg = (
+                f"Targets: {len(deps)} | Predictors (rows): {len(ind_vars)}"
+            )
+            self._set_status(f"Decision Tree analysis completed. {used_msg}")
 
         except Exception as e:
             self.state.last_error = str(e)
@@ -2689,12 +3457,21 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _recommend_grouping_transfer(self):
         """Auto-generates grouping mapping based on the best split for selected Ind."""
         try:
-            sel_rows = self.tbl_dt_pivot.selectedItems()
-            if not sel_rows:
+            sel_model_rows = self.tbl_dt_pivot.selectionModel().selectedRows()
+            if sel_model_rows:
+                row_idx = sel_model_rows[0].row()
+            elif self.tbl_dt_pivot.currentRow() >= 0:
+                row_idx = self.tbl_dt_pivot.currentRow()
+            elif self.tbl_dt_pivot.rowCount() == 1:
+                row_idx = 0
+            else:
                 raise RuntimeError("Please select a row (Predictor) in the Pivot table.")
 
-            row_idx = sel_rows[0].row()
-            ind_val = self.tbl_dt_pivot.item(row_idx, 0).text()
+            ind_item = self.tbl_dt_pivot.item(row_idx, 0)
+            if ind_item is None:
+                raise RuntimeError("Pivot table is empty. Run Decision Tree analysis first.")
+
+            ind_val = ind_item.text()
 
             if self.state.dt_split_best is None:
                 raise RuntimeError("No Best Split data. Run Analysis first.")
@@ -2788,7 +3565,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.tbl_group_map.set_df(map_df)
             self.txt_group_newcol.setText(f"{ind_val}_seg")
 
-            self.tabs.setCurrentIndex(5)
+            self.tabs.setCurrentIndex(6)
             self._set_status(f"Recommendation for '{ind_val}' transferred to Group Tab.")
 
         except Exception as e:
@@ -2804,6 +3581,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # Tab 5: Decision Tree Results (Full Tree Viewer)
     # -------------------------------------------------------------------------
     def _build_tab_dt_results(self):
+        if self._dt_results_built:
+            return
+        self._dt_results_built = True
+
         tab = QtWidgets.QWidget()
         self.tabs.addTab(tab, "Decision Tree Results")
 
@@ -2856,16 +3637,26 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         botw = QtWidgets.QWidget()
         bl = QtWidgets.QVBoxLayout(botw)
-        bl.addWidget(QtWidgets.QLabel("Split Detail:"))
+
+        detail_box = QtWidgets.QGroupBox("Split Detail")
+        dlay = QtWidgets.QVBoxLayout(detail_box)
         self.lbl_split_imp = QtWidgets.QLabel("No split selected.")
         self.lbl_split_imp.setWordWrap(True)
-        bl.addWidget(self.lbl_split_imp)
+        dlay.addWidget(self.lbl_split_imp)
         self.tbl_split_detail = DataFrameTable(float_decimals=2)
-        bl.addWidget(self.tbl_split_detail, 1)
+        dlay.addWidget(self.tbl_split_detail, 1)
+        bl.addWidget(detail_box, 1)
+        note = QtWidgets.QLabel(
+            "Split-level path summaries have moved to the new Decision Tree Editing tab."
+        )
+        note.setStyleSheet("color:#546e7a;")
+        bl.addWidget(note)
         splitter.addWidget(botw)
 
-        splitter.setSizes([280, 520])
+        splitter.setSizes([260, 660])
         layout.addWidget(splitter, 1)
+
+        self._refresh_split_path_options()
 
     def _compute_full_tree_internal(self, dep: str, ind: str):
         df = self.state.df
@@ -2875,7 +3666,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if dep not in df.columns or ind not in df.columns:
             raise RuntimeError("Columns missing.")
 
-        is_factor = str(dep).startswith("Factor") or str(dep).startswith("PCA")
+        is_factor = dep in set(self._factor_score_columns()) or str(dep).startswith("PCA")
         if is_factor:
             task = "reg"
         elif self.state.is_categorical(dep):
@@ -2901,12 +3692,22 @@ class IntegratedApp(QtWidgets.QMainWindow):
             force_categorical=force_cat
         )
 
+        split_paths = pd.DataFrame()
+        if not split_groups.empty and not nodes_df.empty:
+            split_paths = split_groups.merge(
+                nodes_df[["node_id", "condition"]], on="node_id", how="left"
+            )
+            split_paths = split_paths.rename(columns={"condition": "path_to_node"})
+
         self.state.dt_full_nodes = nodes_df
         self.state.dt_full_split_groups = split_groups
         self.state.dt_full_split_branches = branches
         self.state.dt_full_path_info = path_info
+        self.state.dt_full_split_paths = split_paths
         self.state.dt_full_condition_freq = cond_freq
         self.state.dt_full_selected = (dep, ind)
+        self.state.dt_full_split_view = None
+        self.state.dt_full_split_pivot = None
 
         return task, nodes_df, split_groups, path_info, cond_freq
 
@@ -2934,6 +3735,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.cmb_split_select.setCurrentIndex(0)
                 self._split_update_detail()
 
+            if hasattr(self, "_select_path_filter_variable"):
+                self._select_path_filter_variable(ind)
+            if hasattr(self, "_update_split_path_table"):
+                self._update_split_path_table()
+
             self._set_status(f"Tree Built: dep={dep}, ind={ind} (task={task})")
         except Exception as e:
             self.state.last_error = str(e)
@@ -2958,7 +3764,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             right_cond = row["right_group"]
 
             y = df[dep]
-            is_factor = str(dep).startswith("Factor") or str(dep).startswith("PCA")
+            is_factor = dep in set(self._factor_score_columns()) or str(dep).startswith("PCA")
             task = "class" if self.state.is_categorical(dep) and not is_factor else "reg"
 
             def parse_cond(cond_str):
@@ -3029,8 +3835,558 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.last_error = str(e)
             show_error(self, "Split Detail Error", e)
 
+    def _refresh_split_path_options(self):
+        if not hasattr(self, "cmb_path_var") or not hasattr(self, "lst_path_vars"):
+            return
+        vars_available: List[str] = []
+        if getattr(self.state, "dt_importance_summary", None) is not None:
+            vars_available = self.state.dt_importance_summary.get("ind", pd.Series(dtype=str)).dropna().astype(str).tolist()
+        elif getattr(self.state, "dt_split_best", None) is not None:
+            vars_available = self.state.dt_split_best.get("ind", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
+        elif self.state.df is not None:
+            vars_available = list(self.state.df.columns)
+
+        vars_available = sorted(dict.fromkeys(vars_available))
+
+        self.cmb_path_var.blockSignals(True)
+        self.cmb_path_var.clear()
+        self.cmb_path_var.addItem("(All)")
+        self.cmb_path_var.addItems(vars_available)
+        self.cmb_path_var.blockSignals(False)
+
+        self.lst_path_vars.blockSignals(True)
+        self.lst_path_vars.clear()
+        for v in vars_available:
+            it = QtWidgets.QListWidgetItem(v)
+            self.lst_path_vars.addItem(it)
+        self.lst_path_vars.blockSignals(False)
+
+    def _toggle_path_multi_mode(self, checked: bool):
+        self.cmb_path_var.setVisible(not checked)
+        self.lst_path_vars.setVisible(checked)
+        self._update_split_path_table()
+
+    def _get_selected_path_vars(self) -> List[str]:
+        if not self.chk_path_filter.isChecked():
+            return []
+        if self.chk_path_multi.isChecked():
+            return [it.text() for it in self.lst_path_vars.selectedItems()]
+        sel = self.cmb_path_var.currentText().strip()
+        return [] if sel in ["", "(All)"] else [sel]
+
+    def _select_path_filter_variable(self, var: str):
+        if not hasattr(self, "cmb_path_var") or not hasattr(self, "lst_path_vars"):
+            return
+        if not var:
+            return
+        idx = self.cmb_path_var.findText(var)
+        if idx >= 0:
+            self.cmb_path_var.setCurrentIndex(idx)
+        for i in range(self.lst_path_vars.count()):
+            if self.lst_path_vars.item(i).text() == var:
+                self.lst_path_vars.setCurrentRow(i)
+                break
+
+    def _update_split_path_table(self):
+        if not hasattr(self, "tbl_split_paths"):
+            return
+        paths_df = getattr(self.state, "dt_full_split_paths", None)
+        if paths_df is None or paths_df.empty:
+            paths_df = getattr(self.state, "dt_full_path_info", None)
+        if paths_df is None:
+            self.tbl_split_paths.set_df(None)
+            return
+
+        df_view = paths_df.copy()
+        selected_vars = self._get_selected_path_vars()
+        if selected_vars:
+            df_view = df_view[df_view["ind"].astype(str).isin(selected_vars)]
+
+        self.tbl_split_paths.set_df(df_view)
+
     # -------------------------------------------------------------------------
-    # Tab 6: Group & Compose
+    # Optional compatibility: Tab 5 (Legacy) Decision Tree Editing alias
+    # -------------------------------------------------------------------------
+    def _build_tab_dt_editing(self):
+        if getattr(self, "_dt_editing_built", False):
+            return
+        self._dt_editing_built = True
+
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "Decision Tree Editing")
+
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        info = QtWidgets.QLabel(
+            "의사결정나무 결과를 기준으로 구분변수별 피벗/그룹핑을 직접 편집합니다.<br>"
+            "• 위의 콤보박스에서 구분변수를 선택하면 좌측 열에 하위 요인(범주)이 나열됩니다.<br>"
+            "• 상단 분석에서 선택했던 모든 목적변수가 가로 축으로 표시되고, 최적 분할 시 어디에 속했는지(left/right)를 보여줍니다.<br>"
+            "• 아래에서 범주를 선택해 라벨을 합치고 저장하면 *_seg 컬럼으로 바로 생성됩니다."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        filter_row = QtWidgets.QHBoxLayout()
+        self.cmb_dt_edit_var = QtWidgets.QComboBox()
+        self.cmb_dt_edit_var.currentIndexChanged.connect(self._load_dt_edit_grid)
+        filter_row.addWidget(QtWidgets.QLabel("구분변수 선택"))
+        filter_row.addWidget(self.cmb_dt_edit_var, 3)
+
+        self.lbl_dt_edit_targets = QtWidgets.QLabel("(목적변수: 분석 실행 후 자동 채움)")
+        self.lbl_dt_edit_targets.setStyleSheet("color:#546e7a;")
+        filter_row.addWidget(self.lbl_dt_edit_targets, 2)
+        layout.addLayout(filter_row)
+
+        view_row = QtWidgets.QHBoxLayout()
+        self.cmb_dt_edit_view_mode = QtWidgets.QComboBox()
+        self.cmb_dt_edit_view_mode.addItem("안 1) 좌/우 + 개선도 요약", "split")
+        self.cmb_dt_edit_view_mode.addItem("안 2) 모든 조합 + 개선도", "combo")
+        self.cmb_dt_edit_view_mode.currentIndexChanged.connect(self._on_dt_edit_view_changed)
+        view_row.addWidget(QtWidgets.QLabel("보기 전환"))
+        view_row.addWidget(self.cmb_dt_edit_view_mode, 2)
+        view_row.addStretch(1)
+        layout.addLayout(view_row)
+
+        self.tbl_dt_edit_grid = DataFrameTable(editable=True, float_decimals=2, max_col_width=260)
+        self.tbl_dt_edit_combo = DataFrameTable(editable=False, float_decimals=3, max_col_width=260)
+        self.dt_edit_view_stack = QtWidgets.QStackedWidget()
+        self.dt_edit_view_stack.addWidget(self.tbl_dt_edit_grid)
+        self.dt_edit_view_stack.addWidget(self.tbl_dt_edit_combo)
+        layout.addWidget(self.dt_edit_view_stack, 1)
+
+        summary_box = QtWidgets.QGroupBox("목적변수별 개선도 요약 (선택 구분변수)")
+        summary_layout = QtWidgets.QVBoxLayout(summary_box)
+        self.tbl_dt_edit_summary = DataFrameTable(editable=False, float_decimals=3, max_col_width=260)
+        summary_layout.addWidget(self.tbl_dt_edit_summary)
+        layout.addWidget(summary_box)
+
+        merge_row = QtWidgets.QHBoxLayout()
+        self.txt_dt_edit_merge_label = QtWidgets.QLineEdit("Merged")
+        self.btn_dt_edit_merge = QtWidgets.QPushButton("선택 범주 묶기 (라벨 적용)")
+        style_button(self.btn_dt_edit_merge, level=1)
+        self.btn_dt_edit_merge.clicked.connect(self._dt_edit_merge_selected)
+        self.btn_dt_edit_reset = QtWidgets.QPushButton("원본 라벨로 초기화")
+        style_button(self.btn_dt_edit_reset, level=1)
+        self.btn_dt_edit_reset.clicked.connect(self._reset_dt_edit_groups)
+
+        merge_row.addWidget(QtWidgets.QLabel("새 그룹 라벨"))
+        merge_row.addWidget(self.txt_dt_edit_merge_label, 2)
+        merge_row.addWidget(self.btn_dt_edit_merge)
+        merge_row.addWidget(self.btn_dt_edit_reset)
+        merge_row.addStretch(1)
+        layout.addLayout(merge_row)
+
+        apply_row = QtWidgets.QHBoxLayout()
+        self.txt_dt_edit_newcol = QtWidgets.QLineEdit("")
+        self.txt_dt_edit_newcol.setPlaceholderText("예: gender_dt_seg")
+        self.btn_dt_edit_apply = QtWidgets.QPushButton("그룹핑 저장 → 새 *_seg 생성")
+        style_button(self.btn_dt_edit_apply, level=2)
+        self.btn_dt_edit_apply.clicked.connect(self._apply_dt_edit_grouping)
+
+        apply_row.addWidget(QtWidgets.QLabel("새 컬럼 이름"))
+        apply_row.addWidget(self.txt_dt_edit_newcol, 3)
+        apply_row.addWidget(self.btn_dt_edit_apply)
+        layout.addLayout(apply_row)
+
+        self._refresh_dt_edit_var_options()
+        self._switch_dt_edit_view_mode()
+        self._load_dt_edit_grid()
+
+    def _refresh_dt_edit_var_options(self):
+        if not hasattr(self, "cmb_dt_edit_var"):
+            return
+
+        current = self.cmb_dt_edit_var.currentText()
+        df = self.state.df
+        vars_available: List[str] = []
+
+        if self.state.dt_split_best is not None and not self.state.dt_split_best.empty:
+            vars_available = (
+                self.state.dt_split_best.get("ind", pd.Series(dtype=str))
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+        elif self.state.dt_selected_inds:
+            vars_available = list(self.state.dt_selected_inds)
+        elif df is not None:
+            vars_available = [c for c in df.columns if self.state.is_categorical(c)]
+
+        if df is not None:
+            vars_available = [v for v in vars_available if v in df.columns]
+
+        vars_available = sorted(dict.fromkeys(vars_available))
+
+        self.cmb_dt_edit_var.blockSignals(True)
+        self.cmb_dt_edit_var.clear()
+        self.cmb_dt_edit_var.addItems(vars_available)
+        if current:
+            idx = self.cmb_dt_edit_var.findText(current)
+            if idx >= 0:
+                self.cmb_dt_edit_var.setCurrentIndex(idx)
+        self.cmb_dt_edit_var.blockSignals(False)
+
+    def _switch_dt_edit_view_mode(self) -> str:
+        """Sets the Decision Tree Editing view mode (안1 vs 안2) and toggles controls."""
+        mode = getattr(self.state, "dt_edit_view_mode", "split") or "split"
+        if hasattr(self, "cmb_dt_edit_view_mode"):
+            data = self.cmb_dt_edit_view_mode.currentData()
+            mode = data if data in ["split", "combo"] else mode
+            idx = self.cmb_dt_edit_view_mode.findData(mode)
+            if idx >= 0 and self.cmb_dt_edit_view_mode.currentIndex() != idx:
+                self.cmb_dt_edit_view_mode.blockSignals(True)
+                self.cmb_dt_edit_view_mode.setCurrentIndex(idx)
+                self.cmb_dt_edit_view_mode.blockSignals(False)
+
+        self.state.dt_edit_view_mode = mode
+
+        if hasattr(self, "dt_edit_view_stack"):
+            self.dt_edit_view_stack.setCurrentIndex(0 if mode == "split" else 1)
+
+        can_edit = mode == "split"
+        for btn_name in ["btn_dt_edit_merge", "btn_dt_edit_reset", "btn_dt_edit_apply"]:
+            if hasattr(self, btn_name):
+                btn = getattr(self, btn_name)
+                btn.setEnabled(can_edit)
+
+        return mode
+
+    def _on_dt_edit_view_changed(self):
+        self._switch_dt_edit_view_mode()
+        self._load_dt_edit_grid()
+
+    def _parse_items_list(self, val: Any) -> List[str]:
+        if val is None:
+            return []
+        if isinstance(val, (list, tuple, set, np.ndarray, pd.Series)):
+            return [str(v) for v in val]
+        try:
+            parsed = ast.literal_eval(str(val))
+            if isinstance(parsed, (list, tuple, set, np.ndarray, pd.Series)):
+                return [str(v) for v in parsed]
+        except Exception:
+            pass
+        txt = str(val)
+        if txt in ["", "None", "nan"]:
+            return []
+        return [txt]
+
+    def _get_dt_edit_targets(self) -> List[str]:
+        if self.state.dt_selected_deps:
+            return list(self.state.dt_selected_deps)
+        if self.state.dt_split_best is not None and not self.state.dt_split_best.empty:
+            return (
+                self.state.dt_split_best.get("dep", pd.Series(dtype=str))
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+        df = self.state.df
+        if df is None:
+            return []
+        return self._factor_score_columns()
+
+    def _compute_dt_candidate_splits(self, var: str, dep: str) -> List[dict]:
+        df = self.state.df
+        if df is None or var not in df.columns or dep not in df.columns:
+            return []
+
+        y = df[dep]
+        x = df[var]
+
+        is_factor = dep in set(self._factor_score_columns()) or str(dep).startswith("PCA")
+        if is_factor:
+            task = "reg"
+        elif self.state.is_categorical(dep):
+            task = "class"
+        else:
+            task = "reg"
+
+        force_cat = None
+        vtype = self.state.get_var_type(var)
+        if vtype == VAR_TYPE_CATEGORICAL:
+            force_cat = True
+        elif vtype == VAR_TYPE_NUMERIC:
+            force_cat = False
+
+        _, rows = univariate_best_split(y, x, task=task, force_categorical=force_cat)
+        for r in rows:
+            r["dep"] = dep
+            r["ind"] = var
+        return rows
+
+    def _format_split_combo_desc(self, row: dict) -> str:
+        stype = str(row.get("split_type", ""))
+        if stype.startswith("categorical"):
+            left_items = self._parse_items_list(row.get("left_items"))
+            right_items = self._parse_items_list(row.get("right_items"))
+            if not right_items and left_items:
+                right_items = ["(Else)"]
+            left_txt = ",".join(left_items) if left_items else str(row.get("left_group", ""))
+            right_txt = ",".join(right_items) if right_items else str(row.get("right_group", ""))
+            return f"L:{left_txt} | R:{right_txt}"
+
+        cp = row.get("cutpoint")
+        cp_txt = fmt_float(cp, 3) if isinstance(cp, (int, float)) else str(cp)
+        return f"<= {cp_txt} | > {cp_txt}"
+
+    def _build_dt_combo_view_df(self, var: str, targets: List[str]) -> pd.DataFrame:
+        combo_map: Dict[str, dict] = {}
+        max_rows = 300
+
+        for dep in targets:
+            candidates = self._compute_dt_candidate_splits(var, dep)
+            for row in candidates:
+                key = self._format_split_combo_desc(row)
+                rec = combo_map.setdefault(
+                    key,
+                    {
+                        "split_desc": key,
+                        "split_type": row.get("split_type", ""),
+                        "left_n": row.get("n_left", np.nan),
+                        "right_n": row.get("n_right", np.nan),
+                    },
+                )
+                rec[dep] = row.get("improve_rel", np.nan)
+
+        if not combo_map:
+            return pd.DataFrame()
+
+        df_view = pd.DataFrame(combo_map.values())
+        if len(df_view) > max_rows:
+            df_view["max_improve"] = df_view[targets].max(axis=1)
+            df_view = df_view.sort_values("max_improve", ascending=False).head(max_rows)
+            df_view = df_view.drop(columns=["max_improve"])
+
+        cols = ["split_desc", "split_type", "left_n", "right_n"] + targets
+        cols = [c for c in cols if c in df_view.columns]
+        return df_view[cols]
+
+    def _build_dt_edit_summary_df(self, var: str, targets: List[str]) -> pd.DataFrame:
+        summary_rows = []
+        best_df = getattr(self.state, "dt_split_best", None)
+        has_best = best_df is not None and not best_df.empty
+
+        for dep in targets:
+            row = None
+            if has_best:
+                cand = best_df[(best_df["ind"] == var) & (best_df["dep"] == dep)]
+                if not cand.empty:
+                    row = cand.loc[cand["improve_rel"].idxmax()]
+
+            if row is None:
+                candidates = self._compute_dt_candidate_splits(var, dep)
+                if candidates:
+                    row = max(candidates, key=lambda r: r.get("improve_rel", -np.inf))
+
+            if row is None:
+                continue
+
+            summary_rows.append(
+                {
+                    "dep": dep,
+                    "split_type": row.get("split_type", ""),
+                    "left_group": row.get("left_group", ""),
+                    "right_group": row.get("right_group", ""),
+                    "improve_rel": row.get("improve_rel", np.nan),
+                    "n_left": row.get("n_left", np.nan),
+                    "n_right": row.get("n_right", np.nan),
+                }
+            )
+
+        if not summary_rows:
+            return pd.DataFrame()
+
+        return pd.DataFrame(summary_rows).sort_values("improve_rel", ascending=False)
+
+    def _build_dt_edit_split_view_df(self, df: pd.DataFrame, var: str, targets: List[str]) -> pd.DataFrame:
+        cats = (
+            pd.Series(df[var].dropna().unique())
+            .astype(str)
+            .sort_values()
+            .tolist()
+        )
+
+        split_info: Dict[str, Dict[str, set]] = {}
+        if self.state.dt_split_best is not None and not self.state.dt_split_best.empty:
+            sub = self.state.dt_split_best[self.state.dt_split_best["ind"] == var]
+            for dep in targets:
+                cand = sub[sub["dep"] == dep]
+                if cand.empty:
+                    continue
+                row = cand.loc[cand["improve_rel"].idxmax()]
+                if not str(row.get("split_type", "")).startswith("categorical"):
+                    continue
+                left_set = set(self._parse_items_list(row.get("left_items")))
+                right_set = set(self._parse_items_list(row.get("right_items")))
+                split_info[dep] = {"left": left_set, "right": right_set}
+
+        user_map = self.state.dt_edit_group_map.get(var, {})
+        rows = []
+        for cat in cats:
+            row = {"level": cat}
+            for dep in targets:
+                info = split_info.get(dep)
+                if not info:
+                    row[dep] = ""
+                    continue
+                if cat in info.get("left", set()):
+                    row[dep] = "Left"
+                elif info.get("right"):
+                    row[dep] = "Right" if cat in info.get("right", set()) else "Right(Else)"
+                elif info.get("left"):
+                    row[dep] = "Right(Else)"
+                else:
+                    row[dep] = ""
+            row["custom_group"] = user_map.get(cat, cat)
+            rows.append(row)
+
+        view = pd.DataFrame(rows)
+        cols = ["level"] + targets + ["custom_group"] if targets else ["level", "custom_group"]
+        view = view[cols]
+        return view
+
+    def _load_dt_edit_grid(self):
+        if not hasattr(self, "tbl_dt_edit_grid"):
+            return
+
+        df = self.state.df
+        var = self.cmb_dt_edit_var.currentText().strip() if hasattr(self, "cmb_dt_edit_var") else ""
+        targets = self._get_dt_edit_targets()
+
+        self.lbl_dt_edit_targets.setText(
+            "목적변수: " + (", ".join(targets) if targets else "(분석 실행 필요)")
+        )
+
+        mode = self._switch_dt_edit_view_mode()
+
+        if df is None or not var:
+            self.tbl_dt_edit_grid.set_df(None)
+            if hasattr(self, "tbl_dt_edit_combo"):
+                self.tbl_dt_edit_combo.set_df(None)
+            if hasattr(self, "tbl_dt_edit_summary"):
+                self.tbl_dt_edit_summary.set_df(None)
+            return
+
+        if not var:
+            self.txt_dt_edit_newcol.setPlaceholderText("예: gender_dt_seg")
+        else:
+            suggestion = f"{var}_dt_seg"
+            if not self.txt_dt_edit_newcol.text().strip():
+                self.txt_dt_edit_newcol.setText(suggestion if suggestion.endswith("_seg") else suggestion + "_seg")
+
+        summary_df = self._build_dt_edit_summary_df(var, targets)
+        if hasattr(self, "tbl_dt_edit_summary"):
+            self.tbl_dt_edit_summary.set_df(summary_df if not summary_df.empty else None)
+
+        if mode == "combo":
+            combo_df = self._build_dt_combo_view_df(var, targets) if targets else pd.DataFrame()
+            if hasattr(self, "tbl_dt_edit_combo"):
+                self.tbl_dt_edit_combo.set_df(combo_df if not combo_df.empty else None)
+            self.tbl_dt_edit_grid.set_df(None)
+        else:
+            split_df = self._build_dt_edit_split_view_df(df, var, targets)
+            self.tbl_dt_edit_grid.set_df(split_df if not split_df.empty else None)
+            if hasattr(self, "tbl_dt_edit_combo"):
+                self.tbl_dt_edit_combo.set_df(None)
+
+    def _extract_dt_edit_df(self) -> pd.DataFrame:
+        table = self.tbl_dt_edit_grid
+        cols = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+        data = []
+        for r in range(table.rowCount()):
+            row = {}
+            for c, col_name in enumerate(cols):
+                item = table.item(r, c)
+                row[col_name] = item.text() if item is not None else ""
+            data.append(row)
+        return pd.DataFrame(data)
+
+    def _dt_edit_merge_selected(self):
+        try:
+            if getattr(self.state, "dt_edit_view_mode", "split") != "split":
+                raise RuntimeError("좌/우 보기에서만 범주 라벨을 묶을 수 있습니다. 보기 전환을 '안 1'로 변경하세요.")
+            label = self.txt_dt_edit_merge_label.text().strip()
+            if not label:
+                raise RuntimeError("라벨을 입력하세요.")
+            sel = self.tbl_dt_edit_grid.selectedItems()
+            if not sel:
+                raise RuntimeError("묶을 범주 행을 선택하세요.")
+
+            rows_idx = sorted(set([it.row() for it in sel]))
+            df_current = self._extract_dt_edit_df()
+            for r in rows_idx:
+                if "custom_group" in df_current.columns and r < len(df_current):
+                    df_current.at[r, "custom_group"] = label
+
+            var = self.cmb_dt_edit_var.currentText().strip()
+            if var:
+                self.state.dt_edit_group_map[var] = {
+                    row["level"]: row.get("custom_group", row.get("level", ""))
+                    for _, row in df_current.iterrows()
+                    if str(row.get("level", "")) != ""
+                }
+
+            self.tbl_dt_edit_grid.set_df(df_current)
+            self._set_status("선택한 범주가 새 라벨로 묶였습니다.")
+        except Exception as e:
+            show_error(self, "Grouping Error", e)
+
+    def _reset_dt_edit_groups(self):
+        try:
+            if getattr(self.state, "dt_edit_view_mode", "split") != "split":
+                raise RuntimeError("좌/우 보기에서만 라벨을 초기화할 수 있습니다. 보기 전환을 '안 1'로 변경하세요.")
+            var = self.cmb_dt_edit_var.currentText().strip()
+            if var in self.state.dt_edit_group_map:
+                self.state.dt_edit_group_map.pop(var, None)
+            self._load_dt_edit_grid()
+            self._set_status("라벨이 원본 값으로 초기화되었습니다.")
+        except Exception as e:
+            show_error(self, "Reset Error", e)
+
+    def _apply_dt_edit_grouping(self):
+        try:
+            if getattr(self.state, "dt_edit_view_mode", "split") != "split":
+                raise RuntimeError("조합 보기에서는 저장할 수 없습니다. 보기 전환을 '안 1'로 변경하세요.")
+            self._ensure_df()
+            df = self.state.df
+            var = self.cmb_dt_edit_var.currentText().strip()
+            if not var:
+                raise RuntimeError("구분변수를 선택하세요.")
+
+            table_df = self._extract_dt_edit_df()
+            if table_df.empty:
+                raise RuntimeError("그룹핑할 항목이 없습니다.")
+
+            newcol = self.txt_dt_edit_newcol.text().strip()
+            if not newcol:
+                newcol = f"{var}_dt_seg"
+            if not newcol.endswith("_seg"):
+                newcol = newcol + "_seg"
+
+            mapping = {}
+            for _, row in table_df.iterrows():
+                key = str(row.get("level", ""))
+                if key == "":
+                    continue
+                val = str(row.get("custom_group", key)).strip()
+                mapping[key] = val if val else key
+
+            s = df[var].astype(str)
+            df[newcol] = s.map(mapping).fillna(s)
+
+            self.state.df = df
+            self.state.dt_edit_group_map[var] = mapping
+            self.tbl_preview.set_df(df)
+            self._refresh_all_column_lists()
+            self._set_status(f"새 그룹 컬럼 생성: {newcol}")
+        except Exception as e:
+            show_error(self, "Save Grouping Error", e)
+
+    # -------------------------------------------------------------------------
+    # Tab 7: Group & Compose
     # -------------------------------------------------------------------------
     def _build_tab_grouping(self):
         tab = QtWidgets.QWidget()
@@ -3140,6 +4496,32 @@ class IntegratedApp(QtWidgets.QMainWindow):
         c.addWidget(self.lst_compose_segs, 2)
         c.addLayout(right, 1)
         layout.addWidget(box2, 1)
+
+        # Cleanup Section
+        box3 = QtWidgets.QGroupBox("Cleanup: Delete Derived Columns (Factor / *_seg / Custom)")
+        dlay = QtWidgets.QVBoxLayout(box3)
+
+        info = QtWidgets.QLabel(
+            "Select columns to delete when a derived factor/segment was created in error. "
+            "Original data is untouched on disk; this removes columns from the in-memory dataset."
+        )
+        info.setWordWrap(True)
+        dlay.addWidget(info)
+
+        self.lst_delete_cols = QtWidgets.QListWidget()
+        self.lst_delete_cols.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        dlay.addWidget(self.lst_delete_cols, 1)
+
+        del_row = QtWidgets.QHBoxLayout()
+        self.btn_delete_cols = QtWidgets.QPushButton("Delete Selected Columns")
+        style_button(self.btn_delete_cols, level=2)
+        self.btn_delete_cols.clicked.connect(self._delete_selected_columns)
+
+        del_row.addStretch(1)
+        del_row.addWidget(self.btn_delete_cols)
+        dlay.addLayout(del_row)
+
+        layout.addWidget(box3, 1)
 
     def _apply_binary_recode(self):
         try:
@@ -3292,8 +4674,69 @@ class IntegratedApp(QtWidgets.QMainWindow):
         except Exception as e:
             show_error(self, "Compose Error", e)
 
+    def _delete_selected_columns(self):
+        try:
+            self._ensure_df()
+            df = self.state.df
+
+            selected = [it.data(QtCore.Qt.ItemDataRole.UserRole) for it in self.lst_delete_cols.selectedItems()]
+            selected = [c for c in selected if c]
+            if not selected:
+                raise RuntimeError("삭제할 컬럼을 선택하세요.")
+
+            confirm = QtWidgets.QMessageBox.question(
+                self,
+                "Delete Columns",
+                "선택한 컬럼을 삭제할까요? 이 작업은 현재 세션의 데이터프레임에서만 적용됩니다.",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
+            df = df.drop(columns=selected, errors="ignore")
+
+            # Remove variable type overrides for dropped columns
+            self.state.var_types = {k: v for k, v in self.state.var_types.items() if k not in selected}
+
+            # Clear factor outputs if any factor-related columns were removed
+            factor_related = set(self.state.factor_cols or [])
+            if self.state.factor_scores is not None:
+                factor_related |= set(self.state.factor_scores.columns)
+            needs_factor_reset = bool(
+                set(selected) & factor_related
+                or any(str(c).startswith(("Factor", "PCA")) for c in selected)
+            )
+            if needs_factor_reset:
+                self._clear_factor_results()
+
+            # Clear decision tree outputs if removed columns were used as dep/ind
+            needs_dt_reset = False
+            for df_attr in [self.state.dt_improve_pivot, self.state.dt_split_best]:
+                if df_attr is None:
+                    continue
+                if "ind" in df_attr.columns and df_attr["ind"].astype(str).isin(selected).any():
+                    needs_dt_reset = True
+                if "dep" in df_attr.columns and df_attr["dep"].astype(str).isin(selected).any():
+                    needs_dt_reset = True
+                if needs_dt_reset:
+                    break
+            if self.state.dt_full_nodes is not None and "split_feature" in self.state.dt_full_nodes.columns:
+                if self.state.dt_full_nodes["split_feature"].astype(str).isin(selected).any():
+                    needs_dt_reset = True
+            if needs_dt_reset:
+                self._clear_dt_outputs()
+
+            self.state.df = df
+            self.tbl_preview.set_df(df)
+            self._refresh_all_column_lists()
+
+            cleared = " (Factor/DT 결과 초기화)" if needs_factor_reset or needs_dt_reset else ""
+            self._set_status(f"Columns deleted: {', '.join(selected)}{cleared}")
+        except Exception as e:
+            show_error(self, "Delete Error", e)
+
     # -------------------------------------------------------------------------
-    # Tab 7: Segmentation Setting (Demand Space)
+    # Tab 8: Segmentation Setting (Demand Space)
     # -------------------------------------------------------------------------
     def _build_tab_seg_setting(self):
         tab = QtWidgets.QWidget()
@@ -3425,7 +4868,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_demand_segcols.setEnabled(seg_mode)
         self.txt_demand_seg_sep.setEnabled(seg_mode)
-        self.lst_demand_targets.setEnabled(seg_mode)
+        # Targets are used in both segments-as-points and variables-as-points (multi-target pivot)
+        self.lst_demand_targets.setEnabled(True)
         self.spin_demand_min_n.setEnabled(seg_mode)
         self.chk_demand_use_factors.setEnabled(seg_mode)
         self.spin_demand_factor_k.setEnabled(seg_mode)
@@ -3460,7 +4904,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 # =============================================================================
 
     # -------------------------------------------------------------------------
-    # Tab 7 (cont): Demand Space Analysis Logic
+    # Tab 8 (cont): Demand Space Analysis Logic
     # -------------------------------------------------------------------------
     def _run_demand_space(self):
         try:
@@ -3480,7 +4924,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 return labels + 1
 
             if seg_mode:
-                seg_cols = self._selected_checked_items(self.lst_demand_segcols)
+                seg_cols = self._checked_or_selected_items(self.lst_demand_segcols)
                 if len(seg_cols) < 1:
                     raise RuntimeError("Select at least 1 *_seg column.")
                 sep = self.txt_demand_seg_sep.text().strip() or "|"
@@ -3552,6 +4996,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.demand_xy = xy_df
                 self.state.cluster_assign = cl_s
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
+                palette = pal_hex()
+                self.state.cluster_colors = {i + 1: palette[i % len(palette)] for i in range(k)}
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
                 self.state.demand_targets = targets_used
@@ -3562,7 +5008,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.demand_seg_cluster_map = dict(zip(ids, cl))
                 self.state.manual_dirty = False
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
+                args = (ids, labels, xy, cl, self.state.cluster_names, self.state.cluster_colors)
                 self.plot_preview.set_data(*args)
                 self.plot_edit.set_data(*args)
                 self._update_cluster_summary()
@@ -3575,36 +5021,56 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self._set_status("Demand Space Analysis Completed.")
 
             else:
-                cols = self._selected_checked_items(self.lst_demand_vars)
-                if len(cols) < 3:
-                    raise RuntimeError("Select at least 3 variables.")
-                Vz, labels = self._variables_as_matrix(cols)
+                cols = self._checked_or_selected_items(self.lst_demand_vars)
+                targets = self._checked_or_selected_items(self.lst_demand_targets)
+                if len(cols) < 2:
+                    raise RuntimeError("변수를 2개 이상 선택해 주세요.")
+                if not targets:
+                    raise RuntimeError("타깃 변수를 1개 이상 선택해 주세요. (Variables-as-points도 타깃×변수 피벗 기반)")
 
-                coord_name = ""
-                fallback_note = ""
-                if mode.startswith("PCA") and Vz.shape[0] >= 2:
-                    pca = PCA(n_components=2, random_state=42)
-                    xy = pca.fit_transform(Vz)
-                    coord_name = "PCA(variables)"
+                prof, feat_cols = self._build_variable_profiles(cols, targets)
+                X = prof[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                n_points, n_features = X.shape
+                if n_points < 2:
+                    raise RuntimeError("변수 포인트가 1개뿐입니다. 최소 2개 이상이어야 합니다.")
+
+                dist_condensed = pdist(X.values, metric="euclidean")
+                if np.allclose(dist_condensed, 0):
+                    xy = np.zeros((n_points, 2))
+                    coord_name = "MDS(target×variable) (모든 거리가 0)"
                 else:
-                    if mode.startswith("PCA") and Vz.shape[0] < 2:
-                        fallback_note = " (선택한 변수 수가 2개 미만이라 MDS로 자동 전환되었습니다.)"
-                    C = np.corrcoef(Vz)
-                    D = 1.0 - C
-                    D = np.clip(D, 0.0, 2.0)
-                    mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42, n_init=2, max_iter=300)
-                    xy = mds.fit_transform(D)
-                    coord_name = "MDS(1-corr,variables)" + fallback_note
+                    dist_square = squareform(dist_condensed)
+                    coord_name = "MDS(target×variable)"
+                    if mode.startswith("PCA") and n_features >= 2:
+                        pca = PCA(n_components=2, random_state=42)
+                        xy = pca.fit_transform(X.values)
+                        coord_name = "PCA(target×variable 분포)"
+                    else:
+                        mds = MDS(
+                            n_components=2,
+                            dissimilarity="precomputed",
+                            random_state=42,
+                            n_init=4,
+                            max_iter=500,
+                        )
+                        xy = mds.fit_transform(dist_square)
 
                 k = max(2, min(k, xy.shape[0]))
-                cl = _cluster_labels(xy)
+                if cluster_method.startswith("Hierarchical"):
+                    Z = linkage(dist_condensed if len(dist_condensed) else np.array([0.0]), method="complete")
+                    cl = fcluster(Z, t=k, criterion="maxclust")
+                else:
+                    km = KMeans(n_clusters=k, n_init=10, random_state=42)
+                    cl = km.fit_predict(X.values) + 1
 
-                ids = labels
+                ids = prof.index.astype(str).tolist()
+                labels = ids[:]
                 xy_df = pd.DataFrame({
                     "id": ids,
                     "label": labels,
                     "x": xy[:, 0],
                     "y": xy[:, 1],
+                    "n": prof["n"].values,
                     "cluster_id": cl,
                 })
                 cl_s = pd.Series(cl, index=ids)
@@ -3613,17 +5079,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.demand_xy = xy_df
                 self.state.cluster_assign = cl_s
                 self.state.cluster_names = {i + 1: f"Cluster {i + 1}" for i in range(k)}
+                palette = pal_hex()
+                self.state.cluster_colors = {i + 1: palette[i % len(palette)] for i in range(k)}
                 self.state.demand_seg_profile = None
                 self.state.demand_targets_used = None
                 self.state.manual_dirty = False
 
-                args = (ids, labels, xy, cl, self.state.cluster_names)
+                args = (ids, labels, xy, cl, self.state.cluster_names, self.state.cluster_colors)
                 self.plot_preview.set_data(*args)
                 self.plot_edit.set_data(*args)
                 self._update_cluster_summary()
                 self._update_profiler()
 
-                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}.")
+                tgt_txt = ", ".join(targets)
+                self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}, targets=[{tgt_txt}].")
                 self._set_status("Demand Space (Vars) Analysis Completed.")
 
         except Exception as e:
@@ -3650,9 +5119,19 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _build_segment_profiles(
         self, seg_cols: List[str], sep: str, use_factors: bool, fac_k: int, targets: List[str], min_n: int
     ):
-        df = self.state.df.copy()
+        df_all = self.state.df.copy()
 
-        df["_SEG_LABEL_"] = df[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+        missing_seg_cols = [c for c in seg_cols if c not in df_all.columns]
+        if missing_seg_cols:
+            raise RuntimeError(f"다음 세그먼트 컬럼이 없습니다: {', '.join(missing_seg_cols)}")
+
+        seg_labels_full = df_all[seg_cols].astype(str).apply(lambda r: sep.join(r.values), axis=1)
+        df_all["_SEG_LABEL_"] = seg_labels_full
+
+        min_n = max(1, int(min_n))
+        seg_counts_all = df_all["_SEG_LABEL_"].value_counts()
+        keep_labels = seg_counts_all[seg_counts_all >= min_n].index
+        df = df_all[df_all["_SEG_LABEL_"].isin(keep_labels)].copy()
 
         cnt = df["_SEG_LABEL_"].value_counts()
         if cnt.empty:
@@ -3694,9 +5173,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
             raise RuntimeError("세그먼트 조합이 1개뿐입니다. 최소 2개 이상이어야 합니다.")
         seg_matrix["n"] = seg_matrix.index.map(cnt.get).fillna(0).astype(int)
 
+        # Initialize feature list early so it always exists, even if factor logic is skipped
+        feat_cols = [c for c in seg_matrix.columns if c != "n"]
+
         # Optional PCA/Factor profile mean features (align with R flow: target×seg pivot + PCA profile)
         if use_factors and self.state.factor_scores is not None:
-            fac_cols = [c for c in self.state.factor_scores.columns if str(c).startswith("Factor")]
+            fac_cols = self._factor_score_columns()
             fac_cols = fac_cols[: max(0, fac_k)]
             if fac_cols:
                 fac_df = self.state.factor_scores.reindex(df.index).copy()
@@ -3704,10 +5186,58 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 fac_mean = fac_df.groupby("_SEG_LABEL_")[fac_cols].mean()
                 seg_matrix = seg_matrix.join(fac_mean, how="left")
                 seg_matrix[fac_cols] = seg_matrix[fac_cols].fillna(0.0)
+                feat_cols = [c for c in seg_matrix.columns if c != "n"]
+        labels_by_row = seg_labels_full.copy()
+        return seg_matrix, feat_cols, labels_by_row
 
-        feature_cols = [c for c in seg_matrix.columns if c != "n"]
-        labels_by_row = df["_SEG_LABEL_"].copy()
-        return seg_matrix, feature_cols, labels_by_row
+    def _build_variable_profiles(self, var_cols: List[str], targets: List[str]):
+        df = self.state.df.copy()
+
+        if not targets:
+            raise RuntimeError("타깃 변수를 1개 이상 선택해 주세요.")
+        missing_tgt = [t for t in targets if t not in df.columns]
+        if missing_tgt:
+            raise RuntimeError(f"다음 타깃 변수가 데이터에 없습니다: {', '.join(missing_tgt)}")
+
+        missing_vars = [c for c in var_cols if c not in df.columns]
+        if missing_vars:
+            raise RuntimeError(f"다음 변수 컬럼이 없습니다: {', '.join(missing_vars)}")
+
+        long_df = df[targets + var_cols].copy()
+        long_df["_cnt"] = 1
+        melted = long_df.melt(id_vars=targets, value_vars=var_cols, var_name="_VAR_", value_name="_VAL_")
+        melted["_cnt"] = melted["_VAL_"].notna().astype(int)
+
+        pivot_norms: List[pd.DataFrame] = []
+        for tgt in targets:
+            pivot = (
+                melted.pivot_table(
+                    index=tgt,
+                    columns="_VAR_",
+                    values="_cnt",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .astype(float)
+            )
+            pivot = pivot.reindex(columns=var_cols, fill_value=0.0)
+            col_sum = pivot.sum(axis=0)
+            pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
+            pivot_norms.append(pivot_norm)
+
+        if not pivot_norms:
+            raise RuntimeError("피벗을 계산할 수 없습니다. 선택된 타깃/변수를 확인하세요.")
+
+        pivot_stack = pd.concat(pivot_norms, axis=0)
+        if pivot_stack.shape[1] < 2:
+            raise RuntimeError("변수 포인트가 1개뿐입니다. 최소 2개 이상이어야 합니다.")
+
+        var_matrix = pivot_stack.T
+        n_counts = melted.groupby("_VAR_")["_cnt"].sum().reindex(var_cols).fillna(0).astype(int)
+        var_matrix["n"] = n_counts.values
+
+        feature_cols = [c for c in var_matrix.columns if c != "n"]
+        return var_matrix, feature_cols
 
     def _current_segment_labels(self) -> Optional[pd.Series]:
         if self.state.df is None or not self.state.demand_seg_components:
@@ -3731,12 +5261,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
         return Vz, cols
 
     # -------------------------------------------------------------------------
-    # Tab 8: Segmentation Editing
+    # Tab 9: Segmentation Editing
     # -------------------------------------------------------------------------
     def _build_tab_seg_editing(self):
         tab = QtWidgets.QWidget()
         self.tabs.addTab(tab, "Segmentation Editing")
         layout = QtWidgets.QHBoxLayout(tab)
+
+        # Initialize the editable plot first so dependent controls can reference it safely
+        self.plot_edit = DemandClusterPlot(editable=True)
+        self.plot_edit.sigClustersChanged.connect(self._on_manual_clusters_changed)
+        self.plot_edit.sigCoordsChanged.connect(self._on_manual_coords_changed)
 
         left = QtWidgets.QVBoxLayout()
 
@@ -3746,7 +5281,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.radio_edit_points.setToolTip("Drag points to move/merge. Pan is locked.")
         self.radio_edit_view = QtWidgets.QRadioButton("View/Pan Mode")
         self.radio_edit_view.setToolTip("Drag background to pan. Editing is locked.")
-        self.radio_edit_view.setChecked(True)
+        # Default to Edit mode so drag-to-merge stays enabled on tab open
+        self.radio_edit_points.setChecked(True)
 
         self.radio_edit_points.toggled.connect(self._on_edit_mode_toggled)
         self.radio_edit_view.toggled.connect(self._on_edit_mode_toggled)
@@ -3773,10 +5309,59 @@ class IntegratedApp(QtWidgets.QMainWindow):
         olay.addWidget(self.btn_reset_label_pos)
         left.addWidget(opt_group)
 
+        add_group = QtWidgets.QGroupBox("Add Cluster (Drag into empty space)")
+        add_lay = QtWidgets.QVBoxLayout(add_group)
+        self.chk_add_cluster_mode = QtWidgets.QCheckBox("Enable drag-to-add cluster")
+        self.chk_add_cluster_mode.setToolTip(
+            "Select points, enable, then drop into an empty area to spawn a new cluster with the chosen name/color."
+        )
+        self.chk_add_cluster_mode.toggled.connect(self._on_new_cluster_toggle)
+        add_lay.addWidget(self.chk_add_cluster_mode)
+
+        name_row = QtWidgets.QHBoxLayout()
+        self._new_cluster_seq = 1
+        self.txt_new_cluster_name = QtWidgets.QLineEdit(f"New Cluster {self._new_cluster_seq}")
+        self.txt_new_cluster_name.textChanged.connect(lambda _: self._apply_new_cluster_template())
+        name_row.addWidget(QtWidgets.QLabel("Name"))
+        name_row.addWidget(self.txt_new_cluster_name)
+        add_lay.addLayout(name_row)
+
+        color_row = QtWidgets.QHBoxLayout()
+        self._new_cluster_color_hex = pal_hex()[0]
+        self.btn_new_cluster_color = QtWidgets.QPushButton("Pick Color")
+        style_button(self.btn_new_cluster_color, level=1)
+        self.btn_new_cluster_color.clicked.connect(self._pick_new_cluster_color)
+        self.lbl_new_cluster_color = QtWidgets.QLabel(self._new_cluster_color_hex)
+        color_row.addWidget(QtWidgets.QLabel("Color"))
+        color_row.addWidget(self.btn_new_cluster_color)
+        color_row.addWidget(self.lbl_new_cluster_color)
+        add_lay.addLayout(color_row)
+
+        self._update_new_cluster_color_button()
+        self._apply_new_cluster_template()
+        self._on_new_cluster_toggle(False)
+        left.addWidget(add_group)
+
         # [v8.1] Enhanced Cluster Summary with sub-segment details
         left.addWidget(QtWidgets.QLabel("<b>Cluster Summary</b> (Points & Sub-segments)"))
         self.tbl_cluster_summary = DataFrameTable(float_decimals=2)
         left.addWidget(self.tbl_cluster_summary, 1)
+        self.btn_refresh_cluster_summary = QtWidgets.QPushButton("표 업데이트 (세그 n 갱신)")
+        style_button(self.btn_refresh_cluster_summary, level=1)
+        self.btn_refresh_cluster_summary.clicked.connect(self._manual_refresh_cluster_table)
+        left.addWidget(self.btn_refresh_cluster_summary)
+
+        save_group = QtWidgets.QGroupBox("세그 결과 저장")
+        save_lay = QtWidgets.QHBoxLayout(save_group)
+        self._seg_save_counter = 1
+        self.txt_seg_save_name = QtWidgets.QLineEdit("seg_result_1")
+        self.btn_seg_save = QtWidgets.QPushButton("Save Seg Result")
+        style_button(self.btn_seg_save, level=2)
+        self.btn_seg_save.clicked.connect(self._save_segmentation_result)
+        save_lay.addWidget(QtWidgets.QLabel("Column"))
+        save_lay.addWidget(self.txt_seg_save_name)
+        save_lay.addWidget(self.btn_seg_save)
+        left.addWidget(save_group)
 
         rename_box = QtWidgets.QHBoxLayout()
         self.spin_rename_cluster_id = QtWidgets.QSpinBox()
@@ -3794,9 +5379,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(left, 1)
 
         center = QtWidgets.QVBoxLayout()
-        self.plot_edit = DemandClusterPlot(editable=True)
-        self.plot_edit.sigClustersChanged.connect(self._on_manual_clusters_changed)
-        self.plot_edit.sigCoordsChanged.connect(self._on_manual_coords_changed)
         center.addWidget(self.plot_edit, 1)
         layout.addLayout(center, 2)
 
@@ -3816,6 +5398,97 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._set_status("Edit Mode: Drag points/labels enabled. (Pan locked)")
         else:
             self._set_status("View Mode: Pan/Zoom enabled. (Editing locked)")
+
+    def _sync_clusters_from_edit_plot(self, status_msg: Optional[str] = None) -> bool:
+        if self.state.demand_xy is None or self.state.cluster_assign is None:
+            self._set_status("세그먼트 결과가 없습니다. 먼저 Demand Space를 실행하세요.")
+            return False
+
+        s = self.plot_edit.get_cluster_series()
+        self.state.cluster_assign = s
+
+        # Bring in any newly created cluster names/colors from the edit plot
+        new_clusters = self.plot_edit.consume_new_clusters()
+        for cid, name, color in new_clusters:
+            if name:
+                self.state.cluster_names[int(cid)] = name
+                self._bump_new_cluster_placeholder(name)
+            if color:
+                self.state.cluster_colors[int(cid)] = color
+
+        plot_names = self.plot_edit.get_cluster_names()
+        plot_colors = self.plot_edit.get_cluster_colors()
+        for cid in s.unique():
+            cid_int = int(cid)
+            if cid_int not in plot_names:
+                plot_names[cid_int] = self.state.cluster_names.get(cid_int, f"Cluster {cid_int}")
+        self.state.cluster_names.update(plot_names)
+        self.state.cluster_colors.update(plot_colors)
+
+        active_clusters = set(int(x) for x in s.unique())
+        self.state.cluster_names = {k: v for k, v in self.state.cluster_names.items() if int(k) in active_clusters}
+        self.state.cluster_colors = {k: v for k, v in self.state.cluster_colors.items() if int(k) in active_clusters}
+
+        # 1) Update the plot's backing dataframe with the new cluster ids
+        if self.state.demand_xy is not None and "id" in self.state.demand_xy.columns:
+            df = self.state.demand_xy.copy()
+            mapped = df["id"].astype(str).map(s)
+            if "cluster_id" in df.columns:
+                mapped = mapped.fillna(df["cluster_id"])
+            df["cluster_id"] = mapped.astype(int)
+            self.state.demand_xy = df
+
+        # 2) When segments are the points, keep the segment→cluster map and base df in sync
+        if self.state.demand_mode.startswith("Segments"):
+            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
+
+            seg_labels = self.state.demand_seg_labels or self._current_segment_labels()
+            if seg_labels is not None and self.state.df is not None:
+                cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
+                df = self.state.df.copy()
+                df["demand_seg_label"] = seg_labels.values
+                df["demand_cluster_id"] = seg_labels.astype(str).map(cl_map).fillna(-1).astype(int)
+                df["demand_cluster_name"] = df["demand_cluster_id"].map(self.state.cluster_names).fillna("")
+                self.state.df = df
+
+        self.state.manual_dirty = True
+        self.plot_edit.set_cluster_names(self.state.cluster_names)
+        self.plot_edit.set_cluster_colors(self.state.cluster_colors)
+        self.plot_preview.set_cluster_names(self.state.cluster_names)
+        self.plot_preview.set_cluster_colors(self.state.cluster_colors)
+        self._update_cluster_summary()
+        self._update_profiler()
+        self._refresh_demand_preview()
+        if status_msg:
+            self._set_status(status_msg)
+        return True
+
+    def _update_new_cluster_color_button(self):
+        col = getattr(self, "_new_cluster_color_hex", "#ff9800")
+        self.lbl_new_cluster_color.setText(col)
+        self.btn_new_cluster_color.setStyleSheet(
+            f"background-color: {col}; color: #000; border: 1px solid #555;"
+        )
+
+    def _apply_new_cluster_template(self):
+        name = self.txt_new_cluster_name.text().strip()
+        col = getattr(self, "_new_cluster_color_hex", None)
+        self.plot_edit.set_new_cluster_template(name, col)
+
+    def _on_new_cluster_toggle(self, checked: bool):
+        self.txt_new_cluster_name.setEnabled(bool(checked))
+        self.btn_new_cluster_color.setEnabled(bool(checked))
+        self.lbl_new_cluster_color.setEnabled(bool(checked))
+        self.plot_edit.set_new_cluster_mode(bool(checked))
+        if checked:
+            self._apply_new_cluster_template()
+
+    def _pick_new_cluster_color(self):
+        col = QtWidgets.QColorDialog.getColor(QtGui.QColor(self._new_cluster_color_hex), self, "Select Cluster Color")
+        if col.isValid():
+            self._new_cluster_color_hex = col.name()
+            self._update_new_cluster_color_button()
+            self._apply_new_cluster_template()
 
     def _update_cluster_summary(self):
         """[v8.1] Enhanced to show sub-segment details for each cluster."""
@@ -3849,6 +5522,79 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 })
         out = pd.DataFrame(rows).sort_values(["Cluster ID", "Sub-segment"]).reset_index(drop=True)
         self.tbl_cluster_summary.set_df(out, max_rows=2000)
+
+    def _manual_refresh_cluster_table(self):
+        synced = self._sync_clusters_from_edit_plot("클러스터 표를 최신 상태로 동기화했습니다.")
+        if not synced:
+            self._set_status("세그먼트 결과가 없습니다. 먼저 Demand Space를 실행하세요.")
+            return
+        # Ensure downstream tables/previews are freshly rendered even if the sync produced no status text
+        self._update_cluster_summary()
+        self._update_profiler()
+        self._refresh_demand_preview()
+
+    def _save_segmentation_result(self):
+        try:
+            self._ensure_df()
+            synced = self._sync_clusters_from_edit_plot()
+            if not synced:
+                raise RuntimeError("세그먼트 결과가 없습니다. 먼저 Demand Space를 실행하세요.")
+
+            col = self.txt_seg_save_name.text().strip()
+            if not col:
+                raise RuntimeError("저장할 컬럼 이름을 입력하세요.")
+            if not col.endswith("_seg"):
+                col = f"{col}_seg"
+
+            name_map = {int(cid): self.state.cluster_names.get(int(cid), f"Cluster {int(cid)}") for cid in self.state.cluster_assign.unique()}
+            df = self.state.df.copy()
+
+            out_series = pd.Series(index=df.index, dtype=object)
+            id_series = pd.Series(index=df.index, dtype=object)
+
+            if self.state.demand_mode.startswith("Segments") and self.state.demand_seg_labels is not None:
+                seg_labels = self.state.demand_seg_labels.astype(str)
+                cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
+                cl_ids = seg_labels.map(cl_map)
+                out_series = cl_ids.map(name_map).fillna("")
+                id_series = cl_ids.fillna(-1).astype(int)
+            elif "id" in df.columns:
+                id_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
+                cl_ids = df["id"].astype(str).map(id_map)
+                out_series = cl_ids.map(name_map).fillna("")
+                id_series = cl_ids.fillna(-1).astype(int)
+            else:
+                raise RuntimeError("세그 결과를 원본 데이터에 매핑할 수 없습니다.")
+
+            df[col] = out_series
+            df[f"{col}_id"] = id_series
+            self.state.df = df
+            self.tbl_preview.set_df(df)
+            self._refresh_all_column_lists()
+            self._update_cluster_summary()
+            self._update_profiler()
+            self._refresh_demand_preview()
+
+            self._seg_save_counter = getattr(self, "_seg_save_counter", 1) + 1
+            self.txt_seg_save_name.setText(f"seg_result_{self._seg_save_counter}")
+            self._set_status(f"세그 결과를 '{col}' 컬럼에 저장했습니다.")
+        except Exception as e:
+            show_error(self, "Save Seg Result Error", e)
+
+    def _bump_new_cluster_placeholder(self, last_created: Optional[str] = None):
+        if not last_created:
+            return
+        name = str(last_created).strip()
+        if not name.lower().startswith("new cluster"):
+            return
+        try:
+            parts = name.split()
+            num = int(parts[-1]) if parts[-1].isdigit() else None
+        except Exception:
+            num = None
+        if num is not None:
+            self._new_cluster_seq = max(self._new_cluster_seq, num + 1)
+            self.txt_new_cluster_name.setText(f"New Cluster {self._new_cluster_seq}")
 
     def _update_profiler(self):
         """Calculates Z-scores for each cluster to find distinctive features."""
@@ -3902,24 +5648,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.txt_profile_report.setHtml(report)
 
     def _on_manual_clusters_changed(self):
-        if self.state.demand_xy is None:
-            return
-        s = self.plot_edit.get_cluster_series()
-        self.state.cluster_assign = s
-        if self.state.demand_xy is not None and "id" in self.state.demand_xy.columns:
-            df = self.state.demand_xy.copy()
-            mapped = df["id"].astype(str).map(s)
-            if "cluster_id" in df.columns:
-                mapped = mapped.fillna(df["cluster_id"])
-            df["cluster_id"] = mapped.astype(int)
-            self.state.demand_xy = df
-        if self.state.demand_mode.startswith("Segments"):
-            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
-        self.state.manual_dirty = True
-        self._update_cluster_summary()
-        self._update_profiler()
-        self._refresh_demand_preview()
-        self._set_status("Manual clusters updated.")
+        self._sync_clusters_from_edit_plot("Manual clusters updated.")
 
     def _on_manual_coords_changed(self):
         if self.state.demand_xy is None:
@@ -3955,7 +5684,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
             cl = cl.fillna(default_cl)
 
         clusters = cl.astype(int).to_numpy()
-        self.plot_preview.set_data(ids, labels, xy, clusters, self.state.cluster_names)
+        self.plot_preview.set_data(
+            ids,
+            labels,
+            xy,
+            clusters,
+            self.state.cluster_names,
+            self.state.cluster_colors,
+        )
 
     def _rename_cluster(self):
         try:
@@ -3974,7 +5710,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Rename Error", e)
 
     # -------------------------------------------------------------------------
-    # Tab 9: Export
+    # Tab 10: Export
     # -------------------------------------------------------------------------
     def _build_tab_export(self):
         tab = QtWidgets.QWidget()
@@ -4053,6 +5789,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if self.state.dt_full_nodes is not None:
                     self.state.dt_full_nodes.to_excel(w, sheet_name="07_DT_Full_Nodes", index=False)
+                if self.state.dt_full_split_groups is not None:
+                    self.state.dt_full_split_groups.to_excel(w, sheet_name="07_DT_Split_Groups", index=False)
+                if self.state.dt_full_path_info is not None:
+                    self.state.dt_full_path_info.to_excel(w, sheet_name="07_DT_Path_Info", index=False)
+                if getattr(self.state, "dt_full_split_paths", None) is not None:
+                    self.state.dt_full_split_paths.to_excel(w, sheet_name="07_DT_Variable_Paths", index=False)
 
                 if self.state.demand_xy is not None:
                     self.state.demand_xy.to_excel(w, sheet_name="12_Demand_Coords", index=False)
@@ -4087,7 +5829,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             show_error(self, "Export Error", e)
 
     # -------------------------------------------------------------------------
-    # Tab 10: AI Assistant (RAG Chatbot) with Retry Logic
+    # Tab 11: AI Assistant (RAG Chatbot) with Retry Logic
     # -------------------------------------------------------------------------
     def _build_tab_rag(self):
         tab = QtWidgets.QWidget()
@@ -4097,15 +5839,28 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addWidget(QtWidgets.QLabel("<b>AI Assistant</b>: Ask questions about your current data/analysis."))
 
         # [v8.1] Enhanced API Key section with status
-        key_box = QtWidgets.QGroupBox("OpenAI API Configuration")
+        key_box = QtWidgets.QGroupBox("AI API Configuration (GPT / Gemini)")
         key_layout = QtWidgets.QVBoxLayout(key_box)
-        
+
         key_row = QtWidgets.QHBoxLayout()
+        self.cmb_ai_provider = QtWidgets.QComboBox()
+        self.cmb_ai_provider.addItem("OpenAI (기본: GPT-4o-mini)", "openai")
+        self.cmb_ai_provider.addItem("Gemini (기본: 3-pro-preview)", "gemini")
+
         self.txt_openai_key = QtWidgets.QLineEdit()
         self.txt_openai_key.setPlaceholderText("Enter OpenAI API Key (sk-...) or leave empty to generate prompt only")
         self.txt_openai_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        key_row.addWidget(QtWidgets.QLabel("API Key:"))
+
+        self.txt_gemini_key = QtWidgets.QLineEdit()
+        self.txt_gemini_key.setPlaceholderText("Enter Gemini API Key (AI Studio) or leave empty to generate prompt only")
+        self.txt_gemini_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+
+        key_row.addWidget(QtWidgets.QLabel("Provider:"))
+        key_row.addWidget(self.cmb_ai_provider)
+        key_row.addWidget(QtWidgets.QLabel("OpenAI Key:"))
         key_row.addWidget(self.txt_openai_key, 1)
+        key_row.addWidget(QtWidgets.QLabel("Gemini Key:"))
+        key_row.addWidget(self.txt_gemini_key, 1)
         key_layout.addLayout(key_row)
         
         # [v8.1] API status and retry info
@@ -4180,15 +5935,20 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.txt_chat_history.append(f"<b>User:</b> {query}")
         self.txt_user_query.clear()
 
-        api_key = self.txt_openai_key.text().strip()
+        provider, api_key = self._get_ai_provider_and_key()
+        provider_label = "Gemini" if provider == "gemini" else "ChatGPT"
         if not api_key:
-            self.txt_chat_history.append(f"<br><i>[System] No API Key provided. Copy this prompt to ChatGPT:</i><br>")
+            self.txt_chat_history.append(
+                f"<br><i>[System] No API Key provided. Copy this prompt to {provider_label}:</i><br>"
+            )
             self.txt_chat_history.append(f"<pre style='background:#f5f5f5; padding:10px;'>{full_prompt}</pre><br><hr>")
             return
 
         try:
             self.txt_chat_history.append("<i>... Thinking (with auto-retry on rate limit) ...</i>")
-            self.lbl_api_status.setText("<b style='color:orange;'>⏳ Sending request...</b>")
+            self.lbl_api_status.setText(
+                f"<b style='color:orange;'>⏳ Sending request via {provider_label}...</b>"
+            )
             QtWidgets.QApplication.processEvents()
 
             # [v8.1] Use new retry-enabled API call
@@ -4196,12 +5956,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 {"role": "system", "content": "You are a Data Analysis Assistant for market research."},
                 {"role": "user", "content": full_prompt}
             ]
-            success, result = call_openai_api(
-                api_key, 
-                messages, 
-                max_retries=3, 
+            success, result = call_ai_chat(
+                provider,
+                api_key,
+                messages,
+                max_retries=3,
                 initial_delay=2.0,
-                timeout=30
+                timeout=30,
             )
 
             if success:
