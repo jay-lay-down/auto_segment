@@ -2389,18 +2389,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lst_demand_targets.blockSignals(False)
         self._restore_demand_target_checks()
 
-        if hasattr(self, "lst_delete_cols"):
-            self.lst_delete_cols.clear()
-            for c in cols:
-                label = c
-                if c in set(self._factor_score_columns()) or str(c).startswith("PCA") or str(c).endswith("_seg"):
-                    label = f"{c} (derived)"
-                item = QtWidgets.QListWidgetItem(label)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, c)
-                self.lst_delete_cols.addItem(item)
-
-        self._refresh_dt_edit_var_options()
-
     # -------------------------------------------------------------------------
     # [v8.1] Variable Type Manager
     # -------------------------------------------------------------------------
@@ -5160,14 +5148,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 .astype(float)
             )
 
-            # Align all segment rows to the full set and normalize within each segment (distribution vector)
-            pivot = pivot.reindex(index=seg_levels, fill_value=0.0)
-            row_sum = pivot.sum(axis=1).replace(0, np.nan)
-            pivot_norm = pivot.divide(row_sum, axis=0).fillna(0.0)
-            pivot_norm.columns = [f"{tgt}::{c}" for c in pivot_norm.columns.astype(str)]
+            # Align all segment columns to the full set and normalize column-wise (distribution vector for each segment)
+            pivot = pivot.reindex(columns=seg_levels, fill_value=0.0)
+            col_sum = pivot.sum(axis=0).replace(0, np.nan)
+            pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
+            pivot_norm.index = [f"{tgt}::{idx}" for idx in pivot_norm.index.astype(str)]
             pivot_norms.append(pivot_norm)
 
-        seg_matrix = pd.concat(pivot_norms, axis=1)
+        pivot_stack = pd.concat(pivot_norms, axis=0)
+        seg_matrix = pivot_stack.T
 
         if seg_matrix.shape[0] < 2:
             raise RuntimeError("세그먼트 조합이 1개뿐입니다. 최소 2개 이상이어야 합니다.")
