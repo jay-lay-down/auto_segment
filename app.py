@@ -170,8 +170,10 @@ def normalize_recode_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
         return None
 
     q = pick("question", "문항", "문항명", "q", "item", "variable")
+    qk = pick("question_kr", "questionkr", "문항(한글)", "문항한글", "question (kr)")
     c = pick("code", "코드", "값", "value", "val")
     n = pick("name", "라벨", "label", "명", "설명", "text")
+    nk = pick("name_kr", "label_kr", "라벨한글", "name (kr)")
 
     if q is None or c is None or n is None:
         if len(cols) >= 3:
@@ -181,10 +183,14 @@ def normalize_recode_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     rename_map = {}
     if q:
         rename_map[q] = "QUESTION"
+    if qk:
+        rename_map[qk] = "QUESTION_KR"
     if c:
         rename_map[c] = "CODE"
     if n:
         rename_map[n] = "NAME"
+    if nk:
+        rename_map[nk] = "NAME_KR"
     out = out.rename(columns=rename_map)
 
     for cc in ["QUESTION", "CODE", "NAME"]:
@@ -194,6 +200,10 @@ def normalize_recode_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     out["QUESTION"] = out["QUESTION"].astype(str).str.strip()
     out["CODE"] = out["CODE"].astype(str).str.strip()
     out["NAME"] = out["NAME"].astype(str).str.strip()
+    if "QUESTION_KR" in out.columns:
+        out["QUESTION_KR"] = out["QUESTION_KR"].astype(str).str.strip()
+    if "NAME_KR" in out.columns:
+        out["NAME_KR"] = out["NAME_KR"].astype(str).str.strip()
     return out[["QUESTION", "CODE", "NAME"] + [c for c in out.columns if c not in ["QUESTION", "CODE", "NAME"]]]
 
 
@@ -216,6 +226,8 @@ class AppState:
     path: Optional[str] = None
     sheet: Optional[str] = None
     recode_df: Optional[pd.DataFrame] = None
+    recode_sources: List[str] = field(default_factory=list)
+    recode_label_mode: str = "original"  # "original" or "korean"
 
     # [v8.1 NEW] Variable Type Overrides: {column_name: VAR_TYPE_NUMERIC | VAR_TYPE_CATEGORICAL | VAR_TYPE_AUTO}
     var_types: Dict[str, str] = field(default_factory=dict)
@@ -2542,13 +2554,21 @@ class IntegratedApp(QtWidgets.QMainWindow):
             # [v8.1] Reset variable types on new data load
             self.state.var_types = {}
 
-            # Load RECODE sheet if exists
+            # Load RECODE sheet(s) if they exist
             xls = pd.ExcelFile(path, engine="openpyxl")
-            if "RECODE" in xls.sheet_names:
-                rec = pd.read_excel(path, sheet_name="RECODE", engine="openpyxl")
-                self.state.recode_df = normalize_recode_df(rec)
+            recode_sheets = [s for s in xls.sheet_names if s.lower().startswith("recode")]
+            rec_frames: List[pd.DataFrame] = []
+            for rs in recode_sheets:
+                rec = pd.read_excel(path, sheet_name=rs, engine="openpyxl")
+                rec["_SOURCE_SHEET"] = rs
+                rec_frames.append(rec)
+            if rec_frames:
+                merged_recode = pd.concat(rec_frames, ignore_index=True)
+                self.state.recode_df = normalize_recode_df(merged_recode)
+                self.state.recode_sources = recode_sheets
             else:
                 self.state.recode_df = None
+                self.state.recode_sources = []
 
             self.tbl_preview.set_df(df)
             self.lbl_data_info.setText(f"Loaded: {os.path.basename(path)} / sheet={sheet} / rows={len(df):,} cols={df.shape[1]:,}")
@@ -2621,12 +2641,144 @@ class IntegratedApp(QtWidgets.QMainWindow):
         tab = QtWidgets.QWidget()
         self.tabs.addTab(tab, "Recode Mapping")
         layout = QtWidgets.QVBoxLayout(tab)
-        layout.addWidget(QtWidgets.QLabel("Check 'RECODE' sheet (QUESTION / CODE / NAME)."))
-        self.tbl_recode = DataFrameTable(float_decimals=2)
+
+        layout.addWidget(QtWidgets.QLabel("Load & edit RECODE sheets (QUESTION / CODE / NAME / *_KR)."))
+
+        ctrl = QtWidgets.QHBoxLayout()
+        self.btn_reload_recode = QtWidgets.QPushButton("Reload RECODE sheets from file")
+        style_button(self.btn_reload_recode, level=1)
+        self.btn_reload_recode.clicked.connect(self._reload_recode_from_source)
+        self.btn_save_recode = QtWidgets.QPushButton("Apply grid edits to RECODE")
+        style_button(self.btn_save_recode, level=2)
+        self.btn_save_recode.clicked.connect(self._save_recode_edits)
+        ctrl.addWidget(self.btn_reload_recode)
+        ctrl.addWidget(self.btn_save_recode)
+        ctrl.addStretch(1)
+        layout.addLayout(ctrl)
+
+        mode_box = QtWidgets.QGroupBox("Question / Code Label Display")
+        mode_lay = QtWidgets.QHBoxLayout(mode_box)
+        self.radio_recode_original = QtWidgets.QRadioButton("Use original labels (QUESTION / NAME)")
+        self.radio_recode_korean = QtWidgets.QRadioButton("Use Korean labels when available (QUESTION_KR / NAME_KR)")
+        self.radio_recode_original.setChecked(True)
+        self.radio_recode_original.toggled.connect(lambda v: v and self._on_recode_label_mode_changed("original"))
+        self.radio_recode_korean.toggled.connect(lambda v: v and self._on_recode_label_mode_changed("korean"))
+        mode_lay.addWidget(self.radio_recode_original)
+        mode_lay.addWidget(self.radio_recode_korean)
+        layout.addWidget(mode_box)
+
+        self.lbl_recode_info = QtWidgets.QLabel("")
+        self.lbl_recode_info.setStyleSheet("color:#546e7a;")
+        layout.addWidget(self.lbl_recode_info)
+
+        self.tbl_recode = DataFrameTable(editable=True, float_decimals=2)
         layout.addWidget(self.tbl_recode, 1)
 
     def _update_recode_tab(self):
+        if not hasattr(self, "tbl_recode"):
+            return
         self.tbl_recode.set_df(self.state.recode_df)
+        df = self.state.recode_df
+
+        has_korean = self._has_korean_labels(df)
+        if hasattr(self, "radio_recode_korean"):
+            self.radio_recode_korean.setEnabled(has_korean)
+        if not has_korean and self.state.recode_label_mode == "korean":
+            self.state.recode_label_mode = "original"
+
+        if hasattr(self, "radio_recode_original"):
+            self.radio_recode_original.setChecked(self.state.recode_label_mode == "original")
+        if hasattr(self, "radio_recode_korean"):
+            self.radio_recode_korean.setChecked(self.state.recode_label_mode == "korean")
+
+        label_col = self._recode_label_column(df)
+        q_col = self._recode_question_label_column(df)
+        sheets = ", ".join(self.state.recode_sources) if getattr(self.state, "recode_sources", []) else "None"
+        if hasattr(self, "lbl_recode_info"):
+            self.lbl_recode_info.setText(
+                f"Loaded RECODE sheets: {sheets} | Code label column: {label_col} | Question label column: {q_col}"
+            )
+
+    def _on_recode_label_mode_changed(self, mode: str):
+        self.state.recode_label_mode = mode
+        self._update_recode_tab()
+        self._set_status(f"Recode label mode set to: {mode}")
+
+    def _reload_recode_from_source(self):
+        try:
+            if not self.state.path:
+                raise RuntimeError("데이터 파일을 먼저 불러온 뒤 RECODE 시트를 새로고침하세요.")
+            xls = pd.ExcelFile(self.state.path, engine="openpyxl")
+            recode_sheets = [s for s in xls.sheet_names if s.lower().startswith("recode")]
+            if not recode_sheets:
+                raise RuntimeError("RECODE 시트를 찾을 수 없습니다.")
+
+            frames: List[pd.DataFrame] = []
+            for rs in recode_sheets:
+                rec = pd.read_excel(self.state.path, sheet_name=rs, engine="openpyxl")
+                rec["_SOURCE_SHEET"] = rs
+                frames.append(rec)
+            merged = pd.concat(frames, ignore_index=True)
+            self.state.recode_df = normalize_recode_df(merged)
+            self.state.recode_sources = recode_sheets
+            self._update_recode_tab()
+            self._set_status(f"RECODE 새로고침 완료: {', '.join(recode_sheets)}")
+        except Exception as e:
+            self.state.last_error = str(e)
+            show_error(self, "Reload RECODE Error", e)
+
+    def _save_recode_edits(self):
+        try:
+            df = self._extract_table_to_df(self.tbl_recode)
+            if df.empty:
+                self.state.recode_df = None
+                self.state.recode_sources = []
+            else:
+                self.state.recode_df = normalize_recode_df(df)
+            self._update_recode_tab()
+            self._set_status("RECODE 매핑 변경사항이 반영되었습니다.")
+        except Exception as e:
+            self.state.last_error = str(e)
+            show_error(self, "Save RECODE Error", e)
+
+    def _extract_table_to_df(self, table: QtWidgets.QTableWidget) -> pd.DataFrame:
+        cols = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+        data = []
+        for r in range(table.rowCount()):
+            row = {}
+            for c, col_name in enumerate(cols):
+                item = table.item(r, c)
+                row[col_name] = item.text() if item is not None else ""
+            data.append(row)
+        return pd.DataFrame(data)
+
+    def _has_korean_labels(self, df: Optional[pd.DataFrame]) -> bool:
+        return df is not None and any(col in df.columns for col in ["NAME_KR", "QUESTION_KR"])
+
+    def _recode_label_column(self, df: Optional[pd.DataFrame]) -> str:
+        if self.state.recode_label_mode == "korean" and df is not None:
+            for c in ["NAME_KR", "LABEL_KR", "NAME_KO"]:
+                if c in df.columns:
+                    return c
+        return "NAME"
+
+    def _recode_question_label_column(self, df: Optional[pd.DataFrame]) -> str:
+        if self.state.recode_label_mode == "korean" and df is not None and "QUESTION_KR" in df.columns:
+            return "QUESTION_KR"
+        return "QUESTION"
+
+    def _get_recode_lookup(self, question: str) -> Dict[str, str]:
+        if self.state.recode_df is None:
+            return {}
+        r = self.state.recode_df
+        mask = r["QUESTION"].astype(str).str.strip() == str(question).strip()
+        r = r[mask]
+        if r.empty:
+            return {}
+        name_col = self._recode_label_column(r)
+        if name_col not in r.columns:
+            name_col = "NAME"
+        return dict(zip(r["CODE"].astype(str).str.strip(), r[name_col].astype(str).str.strip()))
 
 # =============================================================================
 # app.py (Part 6/8)
@@ -3481,12 +3633,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             except Exception:
                 vals = vals.sort_values()
 
-            rec_name = {}
-            if self.state.recode_df is not None:
-                r = self.state.recode_df
-                r = r[r["QUESTION"].astype(str).str.strip() == ind_val]
-                rec_name = dict(zip(r["CODE"].astype(str).str.strip(), r["NAME"].astype(str).str.strip()))
-
+            rec_name = self._get_recode_lookup(ind_val)
             recode_names = [rec_name.get(v, "") for v in vals.values]
 
             seg_labels = []
@@ -4593,13 +4740,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             except:
                 vals = vals.sort_values()
 
-            rec_name = {}
-            if self.state.recode_df is not None:
-                r = self.state.recode_df
-                if src in r["QUESTION"].astype(str).values:
-                    r = r[r["QUESTION"].astype(str).str.strip() == src]
-                    rec_name = dict(zip(r["CODE"].astype(str).str.strip(), r["NAME"].astype(str).str.strip()))
-
+            rec_name = self._get_recode_lookup(src)
             recode_names = [rec_name.get(v, "") for v in vals.values]
             seg_default = [rec_name.get(v, v) if rec_name.get(v, "") != "" else v for v in vals.values]
 
