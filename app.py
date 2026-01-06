@@ -723,7 +723,7 @@ class VariableTypeManagerDialog(QtWidgets.QDialog):
     """
     def __init__(self, df: pd.DataFrame, var_types: Dict[str, str], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Variable Type Manager (SPSS Style)")
+        self.setWindowTitle("Variable Type Manager")
         self.resize(900, 600)
         self.df = df
         self.var_types = var_types.copy()  # Work on a copy
@@ -4574,11 +4574,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         r1 = QtWidgets.QHBoxLayout()
         self.cmb_group_source = QtWidgets.QComboBox()
-        self.txt_group_newcol = QtWidgets.QLineEdit("custom_seg")
+        self.cmb_group_source.currentTextChanged.connect(self._on_group_source_changed)
+        self.txt_group_newcol = QtWidgets.QLineEdit("")
         self.btn_group_build = QtWidgets.QPushButton("Build Mapping Table")
         style_button(self.btn_group_build, level=1)
         self.btn_group_build.clicked.connect(self._build_group_mapping)
-        self.btn_group_apply = QtWidgets.QPushButton("Apply Mapping -> Create Seg")
+        self.btn_group_apply = QtWidgets.QPushButton("Create IV (Apply Mapping)")
         style_button(self.btn_group_apply, level=2)
         self.btn_group_apply.clicked.connect(self._apply_group_mapping)
 
@@ -4731,6 +4732,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             src = self.cmb_group_source.currentText().strip()
             if not src:
                 raise RuntimeError("Select source column.")
+            if not self.txt_group_newcol.text().strip():
+                self.txt_group_newcol.setText(f"{src}_seg")
 
             vals = pd.Series(df[src].dropna().unique()).astype(str)
             try:
@@ -4761,7 +4764,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             src = self.cmb_group_source.currentText().strip()
             newcol = self.txt_group_newcol.text().strip()
             if not newcol:
-                raise RuntimeError("Enter new column name.")
+                newcol = src
             if not newcol.endswith("_seg"):
                 newcol += "_seg"
 
@@ -4781,6 +4784,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
         except Exception as e:
             show_error(self, "Apply Mapping Error", e)
 
+    def _on_group_source_changed(self, text: str):
+        """Auto-suggest a new column name based on the source column."""
+        if not text:
+            return
+        current = self.txt_group_newcol.text().strip()
+        if current == "" or current.endswith("_seg") or current == "custom_seg":
+            suggested = f"{text}_seg"
+            self.txt_group_newcol.setText(suggested)
+
     def _compose_segs(self):
         try:
             self._ensure_df()
@@ -4790,7 +4802,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 raise RuntimeError("Select 2 or more *_seg columns.")
             newcol = self.txt_compose_newcol.text().strip()
             if not newcol:
-                raise RuntimeError("Enter new column name.")
+                base = "_".join(cols)
+                newcol = base
             if not newcol.endswith("_seg"):
                 newcol += "_seg"
             sep = self.txt_compose_sep.text() or "|"
