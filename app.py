@@ -74,7 +74,7 @@ def is_categorical_series(s: pd.Series, max_unique_numeric_as_cat: int = 20) -> 
         return False
     if pd.api.types.is_bool_dtype(s):
         return True
-    if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s) or pd.api.types.is_categorical_dtype(s):
+    if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s) or isinstance(s.dtype, pd.CategoricalDtype):
         return True
     if pd.api.types.is_integer_dtype(s):
         nun = s.dropna().nunique()
@@ -170,8 +170,10 @@ def normalize_recode_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
         return None
 
     q = pick("question", "문항", "문항명", "q", "item", "variable")
+    qk = pick("question_kr", "questionkr", "문항(한글)", "문항한글", "question (kr)")
     c = pick("code", "코드", "값", "value", "val")
     n = pick("name", "라벨", "label", "명", "설명", "text")
+    nk = pick("name_kr", "label_kr", "라벨한글", "name (kr)")
 
     if q is None or c is None or n is None:
         if len(cols) >= 3:
@@ -181,10 +183,14 @@ def normalize_recode_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     rename_map = {}
     if q:
         rename_map[q] = "QUESTION"
+    if qk:
+        rename_map[qk] = "QUESTION_KR"
     if c:
         rename_map[c] = "CODE"
     if n:
         rename_map[n] = "NAME"
+    if nk:
+        rename_map[nk] = "NAME_KR"
     out = out.rename(columns=rename_map)
 
     for cc in ["QUESTION", "CODE", "NAME"]:
@@ -194,6 +200,10 @@ def normalize_recode_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     out["QUESTION"] = out["QUESTION"].astype(str).str.strip()
     out["CODE"] = out["CODE"].astype(str).str.strip()
     out["NAME"] = out["NAME"].astype(str).str.strip()
+    if "QUESTION_KR" in out.columns:
+        out["QUESTION_KR"] = out["QUESTION_KR"].astype(str).str.strip()
+    if "NAME_KR" in out.columns:
+        out["NAME_KR"] = out["NAME_KR"].astype(str).str.strip()
     return out[["QUESTION", "CODE", "NAME"] + [c for c in out.columns if c not in ["QUESTION", "CODE", "NAME"]]]
 
 
@@ -216,6 +226,8 @@ class AppState:
     path: Optional[str] = None
     sheet: Optional[str] = None
     recode_df: Optional[pd.DataFrame] = None
+    recode_sources: List[str] = field(default_factory=list)
+    recode_label_mode: str = "original"  # "original" or "korean"
 
     # [v8.1 NEW] Variable Type Overrides: {column_name: VAR_TYPE_NUMERIC | VAR_TYPE_CATEGORICAL | VAR_TYPE_AUTO}
     var_types: Dict[str, str] = field(default_factory=dict)
@@ -261,6 +273,7 @@ class AppState:
     demand_seg_profile: Optional[pd.DataFrame] = None
     demand_seg_components: Optional[List[str]] = None
     demand_targets: Optional[List[str]] = None
+    demand_targets_used: Optional[List[str]] = None
     demand_features_used: Optional[List[str]] = None
     demand_seg_labels: Optional[pd.Series] = None
     demand_seg_sep: str = "|"
@@ -710,7 +723,7 @@ class VariableTypeManagerDialog(QtWidgets.QDialog):
     """
     def __init__(self, df: pd.DataFrame, var_types: Dict[str, str], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Variable Type Manager (SPSS Style)")
+        self.setWindowTitle("Variable Type Manager")
         self.resize(900, 600)
         self.df = df
         self.var_types = var_types.copy()  # Work on a copy
@@ -2260,6 +2273,52 @@ class IntegratedApp(QtWidgets.QMainWindow):
         for i in range(widget.count()):
             widget.item(i).setCheckState(st)
 
+    def _set_checked_items(self, widget: QtWidgets.QListWidget, names: List[str]):
+        block_prev = widget.blockSignals(True)
+        try:
+            want = set(names)
+            for i in range(widget.count()):
+                it = widget.item(i)
+                st = QtCore.Qt.CheckState.Checked if it.text() in want else QtCore.Qt.CheckState.Unchecked
+                it.setCheckState(st)
+        finally:
+            widget.blockSignals(block_prev)
+
+    def _sync_demand_target_master_checkbox(self):
+        if not hasattr(self, "chk_demand_targets_all"):
+            return
+        total = self.lst_demand_targets.count()
+        checked = len(self._selected_checked_items(self.lst_demand_targets))
+        if total == 0:
+            state = QtCore.Qt.CheckState.Unchecked
+        elif checked == 0:
+            state = QtCore.Qt.CheckState.Unchecked
+        elif checked == total:
+            state = QtCore.Qt.CheckState.Checked
+        else:
+            state = QtCore.Qt.CheckState.PartiallyChecked
+
+        block_prev = self.chk_demand_targets_all.blockSignals(True)
+        try:
+            self.chk_demand_targets_all.setCheckState(state)
+        finally:
+            self.chk_demand_targets_all.blockSignals(block_prev)
+
+    def _restore_demand_target_checks(self):
+        if self.state.demand_targets:
+            self._set_checked_items(self.lst_demand_targets, self.state.demand_targets)
+        self._sync_demand_target_master_checkbox()
+
+    def _on_demand_target_item_changed(self, _item):
+        self.state.demand_targets = self._selected_checked_items(self.lst_demand_targets)
+        self._sync_demand_target_master_checkbox()
+
+    def _on_toggle_all_demand_targets(self, state: int):
+        check = state == QtCore.Qt.CheckState.Checked
+        self._set_all_checks(self.lst_demand_targets, check)
+        self.state.demand_targets = self._selected_checked_items(self.lst_demand_targets)
+        self._sync_demand_target_master_checkbox()
+
     def _refresh_all_column_lists(self):
         """Updates all ComboBoxes and ListWidgets when new data is loaded."""
         df = self.state.df
@@ -2332,6 +2391,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             it.setCheckState(QtCore.Qt.CheckState.Unchecked)
             self.lst_demand_segcols.addItem(it)
 
+        self.lst_demand_targets.blockSignals(True)
         self.lst_demand_targets.clear()
         for c in cols:
             it = QtWidgets.QListWidgetItem(c)
@@ -2510,13 +2570,21 @@ class IntegratedApp(QtWidgets.QMainWindow):
             # [v8.1] Reset variable types on new data load
             self.state.var_types = {}
 
-            # Load RECODE sheet if exists
+            # Load RECODE sheet(s) if they exist
             xls = pd.ExcelFile(path, engine="openpyxl")
-            if "RECODE" in xls.sheet_names:
-                rec = pd.read_excel(path, sheet_name="RECODE", engine="openpyxl")
-                self.state.recode_df = normalize_recode_df(rec)
+            recode_sheets = [s for s in xls.sheet_names if s.lower().startswith("recode")]
+            rec_frames: List[pd.DataFrame] = []
+            for rs in recode_sheets:
+                rec = pd.read_excel(path, sheet_name=rs, engine="openpyxl")
+                rec["_SOURCE_SHEET"] = rs
+                rec_frames.append(rec)
+            if rec_frames:
+                merged_recode = pd.concat(rec_frames, ignore_index=True)
+                self.state.recode_df = normalize_recode_df(merged_recode)
+                self.state.recode_sources = recode_sheets
             else:
                 self.state.recode_df = None
+                self.state.recode_sources = []
 
             self.tbl_preview.set_df(df)
             self.lbl_data_info.setText(f"Loaded: {os.path.basename(path)} / sheet={sheet} / rows={len(df):,} cols={df.shape[1]:,}")
@@ -2589,12 +2657,144 @@ class IntegratedApp(QtWidgets.QMainWindow):
         tab = QtWidgets.QWidget()
         self.tabs.addTab(tab, "Recode Mapping")
         layout = QtWidgets.QVBoxLayout(tab)
-        layout.addWidget(QtWidgets.QLabel("Check 'RECODE' sheet (QUESTION / CODE / NAME)."))
-        self.tbl_recode = DataFrameTable(float_decimals=2)
+
+        layout.addWidget(QtWidgets.QLabel("Load & edit RECODE sheets (QUESTION / CODE / NAME / *_KR)."))
+
+        ctrl = QtWidgets.QHBoxLayout()
+        self.btn_reload_recode = QtWidgets.QPushButton("Reload RECODE sheets from file")
+        style_button(self.btn_reload_recode, level=1)
+        self.btn_reload_recode.clicked.connect(self._reload_recode_from_source)
+        self.btn_save_recode = QtWidgets.QPushButton("Apply grid edits to RECODE")
+        style_button(self.btn_save_recode, level=2)
+        self.btn_save_recode.clicked.connect(self._save_recode_edits)
+        ctrl.addWidget(self.btn_reload_recode)
+        ctrl.addWidget(self.btn_save_recode)
+        ctrl.addStretch(1)
+        layout.addLayout(ctrl)
+
+        mode_box = QtWidgets.QGroupBox("Question / Code Label Display")
+        mode_lay = QtWidgets.QHBoxLayout(mode_box)
+        self.radio_recode_original = QtWidgets.QRadioButton("Use original labels (QUESTION / NAME)")
+        self.radio_recode_korean = QtWidgets.QRadioButton("Use Korean labels when available (QUESTION_KR / NAME_KR)")
+        self.radio_recode_original.setChecked(True)
+        self.radio_recode_original.toggled.connect(lambda v: v and self._on_recode_label_mode_changed("original"))
+        self.radio_recode_korean.toggled.connect(lambda v: v and self._on_recode_label_mode_changed("korean"))
+        mode_lay.addWidget(self.radio_recode_original)
+        mode_lay.addWidget(self.radio_recode_korean)
+        layout.addWidget(mode_box)
+
+        self.lbl_recode_info = QtWidgets.QLabel("")
+        self.lbl_recode_info.setStyleSheet("color:#546e7a;")
+        layout.addWidget(self.lbl_recode_info)
+
+        self.tbl_recode = DataFrameTable(editable=True, float_decimals=2)
         layout.addWidget(self.tbl_recode, 1)
 
     def _update_recode_tab(self):
+        if not hasattr(self, "tbl_recode"):
+            return
         self.tbl_recode.set_df(self.state.recode_df)
+        df = self.state.recode_df
+
+        has_korean = self._has_korean_labels(df)
+        if hasattr(self, "radio_recode_korean"):
+            self.radio_recode_korean.setEnabled(has_korean)
+        if not has_korean and self.state.recode_label_mode == "korean":
+            self.state.recode_label_mode = "original"
+
+        if hasattr(self, "radio_recode_original"):
+            self.radio_recode_original.setChecked(self.state.recode_label_mode == "original")
+        if hasattr(self, "radio_recode_korean"):
+            self.radio_recode_korean.setChecked(self.state.recode_label_mode == "korean")
+
+        label_col = self._recode_label_column(df)
+        q_col = self._recode_question_label_column(df)
+        sheets = ", ".join(self.state.recode_sources) if getattr(self.state, "recode_sources", []) else "None"
+        if hasattr(self, "lbl_recode_info"):
+            self.lbl_recode_info.setText(
+                f"Loaded RECODE sheets: {sheets} | Code label column: {label_col} | Question label column: {q_col}"
+            )
+
+    def _on_recode_label_mode_changed(self, mode: str):
+        self.state.recode_label_mode = mode
+        self._update_recode_tab()
+        self._set_status(f"Recode label mode set to: {mode}")
+
+    def _reload_recode_from_source(self):
+        try:
+            if not self.state.path:
+                raise RuntimeError("데이터 파일을 먼저 불러온 뒤 RECODE 시트를 새로고침하세요.")
+            xls = pd.ExcelFile(self.state.path, engine="openpyxl")
+            recode_sheets = [s for s in xls.sheet_names if s.lower().startswith("recode")]
+            if not recode_sheets:
+                raise RuntimeError("RECODE 시트를 찾을 수 없습니다.")
+
+            frames: List[pd.DataFrame] = []
+            for rs in recode_sheets:
+                rec = pd.read_excel(self.state.path, sheet_name=rs, engine="openpyxl")
+                rec["_SOURCE_SHEET"] = rs
+                frames.append(rec)
+            merged = pd.concat(frames, ignore_index=True)
+            self.state.recode_df = normalize_recode_df(merged)
+            self.state.recode_sources = recode_sheets
+            self._update_recode_tab()
+            self._set_status(f"RECODE 새로고침 완료: {', '.join(recode_sheets)}")
+        except Exception as e:
+            self.state.last_error = str(e)
+            show_error(self, "Reload RECODE Error", e)
+
+    def _save_recode_edits(self):
+        try:
+            df = self._extract_table_to_df(self.tbl_recode)
+            if df.empty:
+                self.state.recode_df = None
+                self.state.recode_sources = []
+            else:
+                self.state.recode_df = normalize_recode_df(df)
+            self._update_recode_tab()
+            self._set_status("RECODE 매핑 변경사항이 반영되었습니다.")
+        except Exception as e:
+            self.state.last_error = str(e)
+            show_error(self, "Save RECODE Error", e)
+
+    def _extract_table_to_df(self, table: QtWidgets.QTableWidget) -> pd.DataFrame:
+        cols = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+        data = []
+        for r in range(table.rowCount()):
+            row = {}
+            for c, col_name in enumerate(cols):
+                item = table.item(r, c)
+                row[col_name] = item.text() if item is not None else ""
+            data.append(row)
+        return pd.DataFrame(data)
+
+    def _has_korean_labels(self, df: Optional[pd.DataFrame]) -> bool:
+        return df is not None and any(col in df.columns for col in ["NAME_KR", "QUESTION_KR"])
+
+    def _recode_label_column(self, df: Optional[pd.DataFrame]) -> str:
+        if self.state.recode_label_mode == "korean" and df is not None:
+            for c in ["NAME_KR", "LABEL_KR", "NAME_KO"]:
+                if c in df.columns:
+                    return c
+        return "NAME"
+
+    def _recode_question_label_column(self, df: Optional[pd.DataFrame]) -> str:
+        if self.state.recode_label_mode == "korean" and df is not None and "QUESTION_KR" in df.columns:
+            return "QUESTION_KR"
+        return "QUESTION"
+
+    def _get_recode_lookup(self, question: str) -> Dict[str, str]:
+        if self.state.recode_df is None:
+            return {}
+        r = self.state.recode_df
+        mask = r["QUESTION"].astype(str).str.strip() == str(question).strip()
+        r = r[mask]
+        if r.empty:
+            return {}
+        name_col = self._recode_label_column(r)
+        if name_col not in r.columns:
+            name_col = "NAME"
+        return dict(zip(r["CODE"].astype(str).str.strip(), r[name_col].astype(str).str.strip()))
 
 # =============================================================================
 # app.py (Part 6/8)
@@ -3467,12 +3667,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             except Exception:
                 vals = vals.sort_values()
 
-            rec_name = {}
-            if self.state.recode_df is not None:
-                r = self.state.recode_df
-                r = r[r["QUESTION"].astype(str).str.strip() == ind_val]
-                rec_name = dict(zip(r["CODE"].astype(str).str.strip(), r["NAME"].astype(str).str.strip()))
-
+            rec_name = self._get_recode_lookup(ind_val)
             recode_names = [rec_name.get(v, "") for v in vals.values]
 
             seg_labels = []
@@ -4413,11 +4608,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         r1 = QtWidgets.QHBoxLayout()
         self.cmb_group_source = QtWidgets.QComboBox()
-        self.txt_group_newcol = QtWidgets.QLineEdit("custom_seg")
+        self.cmb_group_source.currentTextChanged.connect(self._on_group_source_changed)
+        self.txt_group_newcol = QtWidgets.QLineEdit("")
         self.btn_group_build = QtWidgets.QPushButton("Build Mapping Table")
         style_button(self.btn_group_build, level=1)
         self.btn_group_build.clicked.connect(self._build_group_mapping)
-        self.btn_group_apply = QtWidgets.QPushButton("Apply Mapping -> Create Seg")
+        self.btn_group_apply = QtWidgets.QPushButton("Create IV (Apply Mapping)")
         style_button(self.btn_group_apply, level=2)
         self.btn_group_apply.clicked.connect(self._apply_group_mapping)
 
@@ -4570,6 +4766,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             src = self.cmb_group_source.currentText().strip()
             if not src:
                 raise RuntimeError("Select source column.")
+            if not self.txt_group_newcol.text().strip():
+                self.txt_group_newcol.setText(f"{src}_seg")
 
             vals = pd.Series(df[src].dropna().unique()).astype(str)
             try:
@@ -4579,13 +4777,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             except:
                 vals = vals.sort_values()
 
-            rec_name = {}
-            if self.state.recode_df is not None:
-                r = self.state.recode_df
-                if src in r["QUESTION"].astype(str).values:
-                    r = r[r["QUESTION"].astype(str).str.strip() == src]
-                    rec_name = dict(zip(r["CODE"].astype(str).str.strip(), r["NAME"].astype(str).str.strip()))
-
+            rec_name = self._get_recode_lookup(src)
             recode_names = [rec_name.get(v, "") for v in vals.values]
             seg_default = [rec_name.get(v, v) if rec_name.get(v, "") != "" else v for v in vals.values]
 
@@ -4606,7 +4798,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             src = self.cmb_group_source.currentText().strip()
             newcol = self.txt_group_newcol.text().strip()
             if not newcol:
-                raise RuntimeError("Enter new column name.")
+                newcol = src
             if not newcol.endswith("_seg"):
                 newcol += "_seg"
 
@@ -4626,6 +4818,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
         except Exception as e:
             show_error(self, "Apply Mapping Error", e)
 
+    def _on_group_source_changed(self, text: str):
+        """Auto-suggest a new column name based on the source column."""
+        if not text:
+            return
+        current = self.txt_group_newcol.text().strip()
+        if current == "" or current.endswith("_seg") or current == "custom_seg":
+            suggested = f"{text}_seg"
+            self.txt_group_newcol.setText(suggested)
+
     def _compose_segs(self):
         try:
             self._ensure_df()
@@ -4635,7 +4836,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 raise RuntimeError("Select 2 or more *_seg columns.")
             newcol = self.txt_compose_newcol.text().strip()
             if not newcol:
-                raise RuntimeError("Enter new column name.")
+                base = "_".join(cols)
+                newcol = base
             if not newcol.endswith("_seg"):
                 newcol += "_seg"
             sep = self.txt_compose_sep.text() or "|"
@@ -4746,10 +4948,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lst_demand_segcols.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         seg_l.addWidget(self.lst_demand_segcols, 2)
 
-        seg_l.addWidget(QtWidgets.QLabel("Target Variables (multi-select):"))
+        tgt_header = QtWidgets.QHBoxLayout()
+        tgt_header.addWidget(QtWidgets.QLabel("Target Variables (multi-select):"))
+        self.chk_demand_targets_all = QtWidgets.QCheckBox("Check/Uncheck All")
+        self.chk_demand_targets_all.stateChanged.connect(self._on_toggle_all_demand_targets)
+        tgt_header.addStretch(1)
+        tgt_header.addWidget(self.chk_demand_targets_all)
+        seg_l.addLayout(tgt_header)
         self.lst_demand_targets = QtWidgets.QListWidget()
         self.lst_demand_targets.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.lst_demand_targets.setMaximumHeight(120)
+        self.lst_demand_targets.itemChanged.connect(self._on_demand_target_item_changed)
         seg_l.addWidget(self.lst_demand_targets, 1)
 
         r = QtWidgets.QHBoxLayout()
@@ -4901,6 +5110,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 targets = self._checked_or_selected_items(self.lst_demand_targets)
                 min_n = int(self.spin_demand_min_n.value())
 
+                targets_used = list(targets)
+
                 prof, feat_cols, labels_by_row = self._build_segment_profiles(
                     seg_cols, sep, use_factors, fac_k, targets, min_n
                 )
@@ -4953,6 +5164,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     "y": xy[:, 1],
                     "n": prof["n"].values,
                     "cluster_id": cl,
+                    "targets_used": [", ".join(targets_used)] * len(ids),
                 })
                 cl_s = pd.Series(cl, index=ids)
 
@@ -4964,7 +5176,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.state.cluster_colors = {i + 1: palette[i % len(palette)] for i in range(k)}
                 self.state.demand_seg_profile = prof
                 self.state.demand_seg_components = seg_cols
-                self.state.demand_targets = targets
+                self.state.demand_targets = targets_used
+                self.state.demand_targets_used = targets_used
                 self.state.demand_features_used = feat_cols
                 self.state.demand_seg_labels = labels_by_row
                 self.state.demand_seg_sep = sep
@@ -5045,9 +5258,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 palette = pal_hex()
                 self.state.cluster_colors = {i + 1: palette[i % len(palette)] for i in range(k)}
                 self.state.demand_seg_profile = None
-                self.state.demand_targets = targets
-                self.state.demand_features_used = feat_cols
-                self.state.demand_seg_components = None
+                self.state.demand_targets_used = None
                 self.state.manual_dirty = False
 
                 args = (ids, labels, xy, cl, self.state.cluster_names, self.state.cluster_colors)
@@ -5102,6 +5313,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if cnt.empty:
             raise RuntimeError("No segments found for the selected *_seg columns.")
 
+        # Drop underpowered segment combinations so Min N actually affects the run
+        valid_levels = cnt[cnt >= max(1, int(min_n))].index.tolist()
+        if not valid_levels:
+            raise RuntimeError(f"모든 세그먼트가 Min N({min_n})보다 작습니다. 필터를 낮추거나 세그를 합쳐주세요.")
+        df = df[df["_SEG_LABEL_"].isin(valid_levels)].copy()
+        cnt = df["_SEG_LABEL_"].value_counts()
+
         if not targets:
             raise RuntimeError("Target 변수를 1개 이상 선택해 주세요. (Segments-as-points는 타깃×세그 분포 기반)")
 
@@ -5114,22 +5332,22 @@ class IntegratedApp(QtWidgets.QMainWindow):
         for tgt in targets:
             pivot = (
                 df.assign(_cnt=1)
-                .pivot_table(index=tgt, columns="_SEG_LABEL_", values="_cnt", aggfunc="sum", fill_value=0)
+                .pivot_table(index="_SEG_LABEL_", columns=tgt, values="_cnt", aggfunc="sum", fill_value=0)
                 .astype(float)
             )
 
-            # Align all segment columns to the full set
+            # Align all segment columns to the full set and normalize column-wise (distribution vector for each segment)
             pivot = pivot.reindex(columns=seg_levels, fill_value=0.0)
-            col_sum = pivot.sum(axis=0)
+            col_sum = pivot.sum(axis=0).replace(0, np.nan)
             pivot_norm = pivot.divide(col_sum, axis=1).fillna(0.0)
+            pivot_norm.index = [f"{tgt}::{idx}" for idx in pivot_norm.index.astype(str)]
             pivot_norms.append(pivot_norm)
 
         pivot_stack = pd.concat(pivot_norms, axis=0)
-
-        if pivot_stack.shape[1] < 2:
-            raise RuntimeError("세그먼트 조합이 1개뿐입니다. 최소 2개 이상이어야 합니다.")
-
         seg_matrix = pivot_stack.T
+
+        if seg_matrix.shape[0] < 2:
+            raise RuntimeError("세그먼트 조합이 1개뿐입니다. 최소 2개 이상이어야 합니다.")
         seg_matrix["n"] = seg_matrix.index.map(cnt.get).fillna(0).astype(int)
 
         # Initialize feature list early so it always exists, even if factor logic is skipped
@@ -5206,6 +5424,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
             lambda r: sep.join(r.values), axis=1
         )
         return lbl
+
+    def _get_demand_seg_labels(self) -> Optional[pd.Series]:
+        """Safely return cached demand segment labels or recompute without truth-value checks."""
+        if self.state.demand_seg_labels is not None:
+            return self.state.demand_seg_labels
+        return self._current_segment_labels()
 
     def _variables_as_matrix(self, cols: List[str]):
         df = to_numeric_df(self.state.df, cols)
@@ -5477,6 +5701,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     "Sub-segment N": int(n_map.get(seg, 0)) if n_map else "-",
                     "Cluster Total N": n_sum if n_map else "-",
                     "Points in Cluster": len(items),
+                    "Targets Used": ", ".join(self.state.demand_targets_used or self.state.demand_targets or []),
                 })
         out = pd.DataFrame(rows).sort_values(["Cluster ID", "Sub-segment"]).reset_index(drop=True)
         self.tbl_cluster_summary.set_df(out, max_rows=2000)
@@ -5677,9 +5902,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lbl_export = QtWidgets.QLabel(
             "Export Results to Excel:\n"
-            "Sheets: 01_Data, 02_RECODE, 03_Factor_Loadings, 04_Factor_Scores,\n"
-            "05_DT_ImprovePivot, 05_DT_Importance, 06_DT_BestSplit,\n"
-            "07_DT_Full_Nodes, 07_DT_Split_Groups, 07_DT_Path_Info, 07_DT_Variable_Paths,\n"
+            "Sheets: 00_Metadata, 01_Data, 02_RECODE, 03_Factor_Loadings, 04_Factor_Scores,\n"
+            "05_DT_ImprovePivot, 05_DT_Importance, 06_DT_BestSplit, 07_DT_Full_Nodes, ...\n"
             "13_Demand_Clusters, 14_Variable_Types, 15_Raw_with_Clusters"
         )
         self.lbl_export.setWordWrap(True)
@@ -5723,6 +5947,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 raise RuntimeError("Select output path.")
 
             with pd.ExcelWriter(out, engine="openpyxl") as w:
+                metadata_rows = []
+                tgt_list = self.state.demand_targets_used or self.state.demand_targets
+                if tgt_list:
+                    metadata_rows.append({"key": "demand_targets_used", "value": ", ".join(tgt_list)})
+                if metadata_rows:
+                    pd.DataFrame(metadata_rows).to_excel(w, sheet_name="00_Metadata", index=False)
+
                 self.state.df.to_excel(w, sheet_name="01_Data", index=False)
                 if self.state.recode_df is not None:
                     self.state.recode_df.to_excel(w, sheet_name="02_RECODE", index=False)
@@ -5758,7 +5989,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     cl_df.to_excel(w, sheet_name="13_Demand_Clusters", index=False)
 
                 if self.state.demand_mode.startswith("Segments") and self.state.cluster_assign is not None:
-                    seg_labels = self.state.demand_seg_labels or self._current_segment_labels()
+                    seg_labels = self._get_demand_seg_labels()
                     if seg_labels is not None:
                         cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
                         raw = self.state.df.copy()
