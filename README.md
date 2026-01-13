@@ -98,6 +98,12 @@ AI 어시스턴트를 쓰려면 OpenAI 또는 Gemini API 키가 필요합니다.
 > Gemini 기본 모델: `gemini-3-pro-preview` (UI 기본값). 권장 모델: `gemini-3-pro-preview`, `gemini-3.5-pro-preview`, `gemini-3.5-pro-preview-0409`, `gemini-1.5-pro`, `gemini-1.5-flash`, `gemini-1.5-flash-001`. UI 라벨에 괄호/`models/`가 있어도 자동 정규화합니다.  
 > 보안: 저장소에 키는 포함되지 않습니다. 실행 시 UI 또는 환경변수(`OPENAI_API_KEY`, `GEMINI_API_KEY`)로 입력하세요.
 
+> OpenAI 기본 모델: `gpt-4o-mini` (UI 기본값), 고성능: `gpt-4o`.
+>
+> Gemini 기본 모델: `gemini-3-pro-preview` (UI 기본값). 지원·권장 모델 예시: `gemini-3-pro-preview`, `gemini-3.5-pro-preview`, `gemini-3.5-pro-preview-0409`, `gemini-1.5-pro`, `gemini-1.5-flash`, `gemini-1.5-flash-001`. UI에서 괄호가 포함된 라벨이나 `models/` 접두사가 붙어 있어도 앱이 자동으로 정규화해 올바른 엔드포인트로 요청합니다. 모델명이 잘못되면 404 안내 메시지와 함께 시도한 모델 목록을 표시합니다.
+
+> 보안 참고: 이 저장소에는 어떤 API 키도 포함되어 있지 않습니다. 키는 실행 시 UI 입력란이나 환경변수(예: `OPENAI_API_KEY`, `GEMINI_API_KEY`)로 직접 넣어야 하며, 배포나 커밋 전에 키가 코드나 설정 파일에 남지 않았는지 한 번 더 확인해 주세요.
+
 ### 🔎 로컬 코드 RAG 어시스턴트
 1. `pip install -r requirements-rag.txt`  
 2. `export OPENAI_API_KEY="sk-..."` (PowerShell: `$env:OPENAI_API_KEY="sk-..."`)  
@@ -116,6 +122,20 @@ AI 어시스턴트를 쓰려면 OpenAI 또는 Gemini API 키가 필요합니다.
 python scripts/build_windows.py --name auto_seg --entry app.py
 ```
 - 경로·이름을 단순화해 `Invalid argument` 오류를 예방합니다. 필요 시 `--dist`, `--build`, `--extra`로 폴더와 옵션을 지정하세요.
+
+### 🪟 Windows에서 PyInstaller 빌드 팁
+PyInstaller로 `.exe`를 만들 때 경로가 길거나 특수문자가 포함되면 `Invalid argument` 오류가 날 수 있습니다. 아래 스크립트는 경로/이름을 정리한 뒤 빌드를 실행해 문제를 예방합니다.
+
+1. **명령 예시**
+   ```bash
+   python scripts/build_windows.py --name auto_seg --entry app.py
+   ```
+   필요하면 `--dist`(출력 폴더), `--build`(작업 폴더), `--extra`(추가 PyInstaller 인자)를 덧붙일 수 있습니다.
+
+2. **오류 대처**
+   - dist/work 경로가 로컬 디스크인지 확인하세요(네트워크 드라이브/공유 폴더일 경우 권한 오류가 발생할 수 있음).
+   - exe 이름에 공백·특수문자가 없는지 확인하고, 더 짧은 이름을 사용해 보세요.
+   - 스크립트는 빌드 전에 경로 쓰기 가능 여부를 점검하고, 실패 시 안내 메시지를 출력합니다.
 
 ### 🔄 GitHub 동기화 안내
 원격이 설정되어 있지 않습니다. GitHub에 반영하려면 원격을 추가한 뒤 `work` 브랜치(또는 사용 중 브랜치)를 직접 push 해야 합니다.

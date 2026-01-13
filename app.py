@@ -2398,8 +2398,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
             it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
             it.setCheckState(QtCore.Qt.CheckState.Unchecked)
             self.lst_demand_targets.addItem(it)
-        self.lst_demand_targets.blockSignals(False)
-        self._restore_demand_target_checks()
+
+        if hasattr(self, "lst_delete_cols"):
+            self.lst_delete_cols.clear()
+            for c in cols:
+                label = c
+                if c in set(self._factor_score_columns()) or str(c).startswith("PCA") or str(c).endswith("_seg"):
+                    label = f"{c} (derived)"
+                item = QtWidgets.QListWidgetItem(label)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, c)
+                self.lst_delete_cols.addItem(item)
+
+        self._refresh_dt_edit_var_options()
 
     # -------------------------------------------------------------------------
     # [v8.1] Variable Type Manager
@@ -2438,8 +2448,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 if not hasattr(self.state, "dt_importance_summary"):
                     self.state.dt_importance_summary = None
-                if not hasattr(self.state, "demand_targets_used"):
-                    self.state.demand_targets_used = getattr(self.state, "demand_targets", None)
+                if not hasattr(self.state, "dt_selected_deps"):
+                    self.state.dt_selected_deps = None
+                if not hasattr(self.state, "dt_selected_inds"):
+                    self.state.dt_selected_inds = None
+                if not hasattr(self.state, "dt_edit_group_map"):
+                    self.state.dt_edit_group_map = {}
+                if not hasattr(self.state, "dt_edit_view_mode"):
+                    self.state.dt_edit_view_mode = "split"
 
                 if self.state.df is not None:
                     self.tbl_preview.set_df(self.state.df)
@@ -2898,6 +2914,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(left, 2)
 
         right = QtWidgets.QVBoxLayout()
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.addWidget(QtWidgets.QLabel("Min |loading|:"))
+        self.spin_factor_loading_min = QtWidgets.QDoubleSpinBox()
+        self.spin_factor_loading_min.setRange(0.0, 1.0)
+        self.spin_factor_loading_min.setSingleStep(0.05)
+        self.spin_factor_loading_min.setValue(0.0)
+        self.spin_factor_loading_min.setDecimals(2)
+        self.spin_factor_loading_min.valueChanged.connect(self._render_factor_loadings_table)
+        filter_row.addWidget(self.spin_factor_loading_min)
+        filter_row.addStretch(1)
+        right.addLayout(filter_row)
         right.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
         self.tbl_factor_loadings = DataFrameTable(float_decimals=3)
         right.addWidget(self.tbl_factor_loadings, 1)
@@ -3206,9 +3233,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if rename_map:
             disp = disp.rename(columns=rename_map)
 
-        disp["_maxabs_"] = disp.abs().max(axis=1)
-        disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
-        disp = disp.reset_index().rename(columns={"index": "variable"})
+        min_abs = float(self.spin_factor_loading_min.value()) if hasattr(self, "spin_factor_loading_min") else 0.0
+        loadings_only = disp.copy()
+        if min_abs > 0:
+            loadings_only = loadings_only.where(loadings_only.abs() >= min_abs)
+            loadings_only = loadings_only.dropna(how="all")
+
+        loadings_only["_maxabs_"] = loadings_only.abs().max(axis=1)
+        loadings_only = loadings_only.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
+        loadings_only = loadings_only.reset_index().rename(columns={"index": "variable"})
+        disp = loadings_only
         self.tbl_factor_loadings.set_df(disp)
         self._sync_factor_name_editor()
 
@@ -5073,7 +5107,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
                 use_factors = bool(self.chk_demand_use_factors.isChecked())
                 fac_k = int(self.spin_demand_factor_k.value())
-                targets = self.state.demand_targets or self._selected_checked_items(self.lst_demand_targets)
+                targets = self._checked_or_selected_items(self.lst_demand_targets)
                 min_n = int(self.spin_demand_min_n.value())
 
                 targets_used = list(targets)
@@ -5841,36 +5875,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.cluster_names,
             self.state.cluster_colors,
         )
-
-    def _sync_clusters_from_edit_plot(self, status_msg: Optional[str] = None) -> bool:
-        """Sync cluster assignments (and derived tables) from the editable plot without Series truthiness checks."""
-        if self.state.demand_xy is None:
-            return False
-
-        s = self.plot_edit.get_cluster_series()
-        if s is None or s.empty:
-            return False
-
-        self.state.cluster_assign = s
-        if "id" in self.state.demand_xy.columns:
-            df = self.state.demand_xy.copy()
-            mapped = df["id"].astype(str).map(s)
-            if "cluster_id" in df.columns:
-                mapped = mapped.fillna(df["cluster_id"])
-            df["cluster_id"] = mapped.astype(int)
-            self.state.demand_xy = df
-
-        if self.state.demand_mode.startswith("Segments"):
-            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
-
-        self.state.manual_dirty = True
-        self._update_cluster_summary()
-        self._update_profiler()
-        self._refresh_demand_preview()
-
-        if status_msg:
-            self._set_status(status_msg)
-        return True
 
     def _rename_cluster(self):
         try:
