@@ -238,6 +238,7 @@ class AppState:
     factor_scores: Optional[pd.DataFrame] = None
     factor_score_cols: List[str] = field(default_factory=list)
     factor_loadings: Optional[pd.DataFrame] = None
+    factor_loadings_order: Optional[List[str]] = None
     factor_mode: str = "PCA"
     factor_ai_names: Dict[str, str] = field(default_factory=dict)
     factor_ai_suggestions: Dict[str, str] = field(default_factory=dict)
@@ -2607,6 +2608,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.factor_mode = "PCA"
         self.state.factor_ai_names = {}
         self.state.factor_ai_suggestions = {}
+        self.state.factor_loadings_order = None
 
         if hasattr(self, "tbl_factor_loadings"):
             self.tbl_factor_loadings.set_df(None)
@@ -2932,6 +2934,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
         loadings_header = QtWidgets.QHBoxLayout()
         loadings_header.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
         loadings_header.addStretch(1)
+        self.btn_factor_apply_order = QtWidgets.QPushButton("Apply Row Order")
+        style_button(self.btn_factor_apply_order, level=1)
+        self.btn_factor_apply_order.clicked.connect(self._apply_factor_loadings_order)
+        self.btn_factor_reset_order = QtWidgets.QPushButton("Reset Order")
+        style_button(self.btn_factor_reset_order, level=1)
+        self.btn_factor_reset_order.clicked.connect(self._reset_factor_loadings_order)
+        loadings_header.addWidget(self.btn_factor_apply_order)
+        loadings_header.addWidget(self.btn_factor_reset_order)
+        loadings_header.addSpacing(12)
         loadings_header.addWidget(QtWidgets.QLabel("Min |loading|"))
         self.txt_factor_min_loading = QtWidgets.QLineEdit()
         self.txt_factor_min_loading.setFixedWidth(80)
@@ -2941,6 +2952,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         loadings_header.addWidget(self.txt_factor_min_loading)
         right.addLayout(loadings_header)
         self.tbl_factor_loadings = DataFrameTable(float_decimals=3)
+        self.tbl_factor_loadings.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self.tbl_factor_loadings.setDragEnabled(True)
+        self.tbl_factor_loadings.setDropIndicatorShown(True)
+        self.tbl_factor_loadings.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
         right.addWidget(self.tbl_factor_loadings, 1)
         layout.addLayout(right, 3)
 
@@ -3258,6 +3273,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
             disp = disp.rename(columns=rename_map)
 
         base = self.state.factor_loadings
+        if self.state.factor_loadings_order:
+            try:
+                base = base.reindex(self.state.factor_loadings_order)
+                disp = disp.reindex(self.state.factor_loadings_order)
+            except Exception:
+                pass
         abs_values = base.abs()
         dominant_idx = abs_values.values.argmax(axis=1)
         dominant_cols = pd.Index(base.columns).take(dominant_idx)
@@ -3271,18 +3292,47 @@ class IntegratedApp(QtWidgets.QMainWindow):
             disp = disp.mask(disp.abs() < min_cut)
         disp["_dominant_order_"] = dominant_order
         disp["_dominant_abs_"] = dominant_abs
-        disp = disp.sort_values(
-            ["_dominant_order_", "_dominant_abs_"],
-            ascending=[True, False],
-        ).drop(columns=["_dominant_order_", "_dominant_abs_"])
+        if not self.state.factor_loadings_order:
+            disp = disp.sort_values(
+                ["_dominant_order_", "_dominant_abs_"],
+                ascending=[True, False],
+            )
+        disp = disp.drop(columns=["_dominant_order_", "_dominant_abs_"])
         disp = disp.reset_index().rename(columns={"index": "variable"})
         variable_keys = disp["variable"].copy()
         disp["variable"] = disp["variable"].map(lambda v: self._resolve_question_label(v, include_code=True))
         self.tbl_factor_loadings.set_df(disp)
+        self._factor_loadings_var_keys = list(variable_keys)
+        for row, key in enumerate(self._factor_loadings_var_keys):
+            item = self.tbl_factor_loadings.item(row, 0)
+            if item is not None:
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
         display_col_map = {k: rename_map.get(k, k) for k in base.columns}
         dominant_display = dominant_series.map(display_col_map).reindex(variable_keys).values
         self._apply_factor_dominant_highlight(dominant_display)
         self._sync_factor_name_editor()
+
+    def _apply_factor_loadings_order(self):
+        if self.state.factor_loadings is None:
+            return
+        if not hasattr(self, "_factor_loadings_var_keys"):
+            return
+        ordered_keys: List[str] = []
+        for row in range(self.tbl_factor_loadings.rowCount()):
+            item = self.tbl_factor_loadings.item(row, 0)
+            if item is None:
+                continue
+            key = item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text()
+            ordered_keys.append(str(key))
+        if ordered_keys:
+            self.state.factor_loadings_order = ordered_keys
+            self._render_factor_loadings_table()
+            self._set_status("요인 문항 순서를 저장했습니다.")
+
+    def _reset_factor_loadings_order(self):
+        self.state.factor_loadings_order = None
+        self._render_factor_loadings_table()
+        self._set_status("요인 문항 순서를 초기화했습니다.")
 
     def _apply_factor_dominant_highlight(self, dominant_cols: np.ndarray):
         if not hasattr(self, "tbl_factor_loadings") or dominant_cols.size == 0:
