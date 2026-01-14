@@ -2898,7 +2898,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(left, 2)
 
         right = QtWidgets.QVBoxLayout()
-        right.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
+        loadings_header = QtWidgets.QHBoxLayout()
+        loadings_header.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
+        loadings_header.addStretch(1)
+        loadings_header.addWidget(QtWidgets.QLabel("Min |loading|"))
+        self.txt_factor_min_loading = QtWidgets.QLineEdit()
+        self.txt_factor_min_loading.setFixedWidth(80)
+        self.txt_factor_min_loading.setPlaceholderText("0.00")
+        self.txt_factor_min_loading.setValidator(QtGui.QDoubleValidator(0.0, 10.0, 3))
+        self.txt_factor_min_loading.textChanged.connect(self._render_factor_loadings_table)
+        loadings_header.addWidget(self.txt_factor_min_loading)
+        right.addLayout(loadings_header)
         self.tbl_factor_loadings = DataFrameTable(float_decimals=3)
         right.addWidget(self.tbl_factor_loadings, 1)
         layout.addLayout(right, 3)
@@ -3198,6 +3208,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
 
         disp = self.state.factor_loadings.copy()
+        min_cut = 0.0
+        min_text = ""
+        if hasattr(self, "txt_factor_min_loading"):
+            min_text = self.txt_factor_min_loading.text().strip()
+        if min_text:
+            try:
+                min_cut = float(min_text)
+            except ValueError:
+                min_cut = 0.0
+
         rename_map = {
             col: f"{self.state.factor_ai_names[col]} ({col})"
             for col in disp.columns
@@ -3207,6 +3227,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             disp = disp.rename(columns=rename_map)
 
         disp["_maxabs_"] = disp.abs().max(axis=1)
+        if min_cut > 0:
+            disp = disp[disp["_maxabs_"] >= min_cut]
         disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
         disp = disp.reset_index().rename(columns={"index": "variable"})
         self.tbl_factor_loadings.set_df(disp)
