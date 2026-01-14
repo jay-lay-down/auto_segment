@@ -2898,7 +2898,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(left, 2)
 
         right = QtWidgets.QVBoxLayout()
-        right.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
+        loadings_header = QtWidgets.QHBoxLayout()
+        loadings_header.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
+        loadings_header.addStretch(1)
+        loadings_header.addWidget(QtWidgets.QLabel("Min |loading|"))
+        self.txt_factor_min_loading = QtWidgets.QLineEdit()
+        self.txt_factor_min_loading.setFixedWidth(80)
+        self.txt_factor_min_loading.setPlaceholderText("0.00")
+        self.txt_factor_min_loading.setValidator(QtGui.QDoubleValidator(0.0, 10.0, 3))
+        self.txt_factor_min_loading.textChanged.connect(self._render_factor_loadings_table)
+        loadings_header.addWidget(self.txt_factor_min_loading)
+        right.addLayout(loadings_header)
         self.tbl_factor_loadings = DataFrameTable(float_decimals=3)
         right.addWidget(self.tbl_factor_loadings, 1)
         layout.addLayout(right, 3)
@@ -3198,6 +3208,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
 
         disp = self.state.factor_loadings.copy()
+        min_cut = 0.0
+        min_text = ""
+        if hasattr(self, "txt_factor_min_loading"):
+            min_text = self.txt_factor_min_loading.text().strip()
+        if min_text:
+            try:
+                min_cut = float(min_text)
+            except ValueError:
+                min_cut = 0.0
+
         rename_map = {
             col: f"{self.state.factor_ai_names[col]} ({col})"
             for col in disp.columns
@@ -3206,11 +3226,57 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if rename_map:
             disp = disp.rename(columns=rename_map)
 
-        disp["_maxabs_"] = disp.abs().max(axis=1)
-        disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
+        base = self.state.factor_loadings
+        abs_values = base.abs()
+        dominant_idx = abs_values.values.argmax(axis=1)
+        dominant_cols = pd.Index(base.columns).take(dominant_idx)
+        dominant_vals = base.to_numpy()[np.arange(len(base)), dominant_idx]
+        factor_order = {col: i for i, col in enumerate(base.columns)}
+        dominant_series = pd.Series(dominant_cols, index=base.index)
+        dominant_order = pd.Series([factor_order[col] for col in dominant_cols], index=base.index)
+        dominant_abs = pd.Series(np.abs(dominant_vals), index=base.index)
+
+        if min_cut > 0:
+            disp = disp.mask(disp.abs() < min_cut)
+        disp["_dominant_order_"] = dominant_order
+        disp["_dominant_abs_"] = dominant_abs
+        disp = disp.sort_values(
+            ["_dominant_order_", "_dominant_abs_"],
+            ascending=[True, False],
+        ).drop(columns=["_dominant_order_", "_dominant_abs_"])
         disp = disp.reset_index().rename(columns={"index": "variable"})
         self.tbl_factor_loadings.set_df(disp)
+        self._apply_factor_group_shading(dominant_series.reindex(disp["variable"]).values)
         self._sync_factor_name_editor()
+
+    def _apply_factor_group_shading(self, dominant_cols: np.ndarray):
+        if not hasattr(self, "tbl_factor_loadings") or dominant_cols.size == 0:
+            return
+
+        palette = [
+            "#f3f7ff",
+            "#f7f3ff",
+            "#fff7f0",
+            "#f0fff4",
+            "#fff0f6",
+            "#f0fbff",
+            "#fffde8",
+            "#f5f5f5",
+        ]
+        color_map: Dict[str, QtGui.QColor] = {}
+        for col in dominant_cols:
+            if col not in color_map:
+                color_map[col] = QtGui.QColor(palette[len(color_map) % len(palette)])
+
+        for row in range(self.tbl_factor_loadings.rowCount()):
+            factor = dominant_cols[row]
+            color = color_map.get(factor)
+            if color is None:
+                continue
+            for col in range(self.tbl_factor_loadings.columnCount()):
+                item = self.tbl_factor_loadings.item(row, col)
+                if item is not None:
+                    item.setBackground(QtGui.QBrush(color))
 
     def _sync_factor_name_editor(self, suggestions: Optional[Dict[str, str]] = None):
         """Refresh the editable factor-name table with current factors and suggestions."""
