@@ -6513,7 +6513,7 @@ def main():
     app.setStyle("Fusion")
     font_path = resource_path("Pretendard-Medium.otf")
     if not os.path.exists(font_path):
-        font_path = r"C:\Users\70089004\seg\Pretendard-Medium.otf"
+        font_path = str(Path(__file__).resolve().parent / "Pretendard-Medium.otf")
     if os.path.exists(font_path):
         font_id = QtGui.QFontDatabase.addApplicationFont(font_path)
         if font_id != -1:
