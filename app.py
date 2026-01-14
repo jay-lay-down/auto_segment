@@ -238,6 +238,7 @@ class AppState:
     factor_scores: Optional[pd.DataFrame] = None
     factor_score_cols: List[str] = field(default_factory=list)
     factor_loadings: Optional[pd.DataFrame] = None
+    factor_loadings_order: Optional[List[str]] = None
     factor_mode: str = "PCA"
     factor_ai_names: Dict[str, str] = field(default_factory=dict)
     factor_ai_suggestions: Dict[str, str] = field(default_factory=dict)
@@ -2252,7 +2253,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         for i in range(widget.count()):
             it = widget.item(i)
             if it.checkState() == QtCore.Qt.CheckState.Checked:
-                out.append(it.text())
+                data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                out.append(data if data is not None else it.text())
         return out
 
     def _checked_or_selected_items(self, widget: QtWidgets.QListWidget) -> List[str]:
@@ -2261,7 +2263,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
         checked = self._selected_checked_items(widget)
         if checked:
             return checked
-        return [it.text() for it in widget.selectedItems()]
+        out = []
+        for it in widget.selectedItems():
+            data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+            out.append(data if data is not None else it.text())
+        return out
 
     def _set_checked_for_selected(self, widget: QtWidgets.QListWidget, checked: bool):
         st = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
@@ -2279,7 +2285,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
             want = set(names)
             for i in range(widget.count()):
                 it = widget.item(i)
-                st = QtCore.Qt.CheckState.Checked if it.text() in want else QtCore.Qt.CheckState.Unchecked
+                data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                key = data if data is not None else it.text()
+                st = QtCore.Qt.CheckState.Checked if key in want else QtCore.Qt.CheckState.Unchecked
                 it.setCheckState(st)
         finally:
             widget.blockSignals(block_prev)
@@ -2329,7 +2337,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
         # Factor Tab
         self.lst_factor_cols.clear()
         for c in cols:
-            it = QtWidgets.QListWidgetItem(c)
+            display = self._resolve_question_label(c, include_code=True)
+            it = QtWidgets.QListWidgetItem(display)
+            it.setData(QtCore.Qt.ItemDataRole.UserRole, c)
             it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
             it.setCheckState(QtCore.Qt.CheckState.Unchecked)
             # [v8.1] Mark categorical variables with different color
@@ -2598,6 +2608,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.factor_mode = "PCA"
         self.state.factor_ai_names = {}
         self.state.factor_ai_suggestions = {}
+        self.state.factor_loadings_order = None
 
         if hasattr(self, "tbl_factor_loadings"):
             self.tbl_factor_loadings.set_df(None)
@@ -2702,6 +2713,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _on_recode_label_mode_changed(self, mode: str):
         self.state.recode_label_mode = mode
         self._update_recode_tab()
+        self._refresh_all_column_lists()
+        self._render_factor_loadings_table()
         self._set_status(f"Recode label mode set to: {mode}")
 
     def _reload_recode_from_source(self):
@@ -2779,6 +2792,26 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if name_col not in r.columns:
             name_col = "NAME"
         return dict(zip(r["CODE"].astype(str).str.strip(), r[name_col].astype(str).str.strip()))
+
+    def _resolve_question_label(self, question: str, include_code: bool = False) -> str:
+        label = str(question)
+        if self.state.recode_label_mode != "korean" or self.state.recode_df is None:
+            return label
+        r = self.state.recode_df
+        if "QUESTION" not in r.columns:
+            return label
+        if "QUESTION_KR" not in r.columns:
+            return label
+        sub = r[r["QUESTION"].astype(str).str.strip() == str(question).strip()]
+        if sub.empty:
+            return label
+        kr = sub["QUESTION_KR"].dropna().astype(str).str.strip()
+        if kr.empty:
+            return label
+        resolved = kr.iloc[0]
+        if include_code and resolved and resolved != label:
+            return f"{resolved} ({label})"
+        return resolved or label
 
 # =============================================================================
 # app.py (Part 6/8)
@@ -2898,8 +2931,31 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(left, 2)
 
         right = QtWidgets.QVBoxLayout()
-        right.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
+        loadings_header = QtWidgets.QHBoxLayout()
+        loadings_header.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
+        loadings_header.addStretch(1)
+        self.btn_factor_apply_order = QtWidgets.QPushButton("Apply Row Order")
+        style_button(self.btn_factor_apply_order, level=1)
+        self.btn_factor_apply_order.clicked.connect(self._apply_factor_loadings_order)
+        self.btn_factor_reset_order = QtWidgets.QPushButton("Reset Order")
+        style_button(self.btn_factor_reset_order, level=1)
+        self.btn_factor_reset_order.clicked.connect(self._reset_factor_loadings_order)
+        loadings_header.addWidget(self.btn_factor_apply_order)
+        loadings_header.addWidget(self.btn_factor_reset_order)
+        loadings_header.addSpacing(12)
+        loadings_header.addWidget(QtWidgets.QLabel("Min |loading|"))
+        self.txt_factor_min_loading = QtWidgets.QLineEdit()
+        self.txt_factor_min_loading.setFixedWidth(80)
+        self.txt_factor_min_loading.setPlaceholderText("0.00")
+        self.txt_factor_min_loading.setValidator(QtGui.QDoubleValidator(0.0, 10.0, 3))
+        self.txt_factor_min_loading.textChanged.connect(self._render_factor_loadings_table)
+        loadings_header.addWidget(self.txt_factor_min_loading)
+        right.addLayout(loadings_header)
         self.tbl_factor_loadings = DataFrameTable(float_decimals=3)
+        self.tbl_factor_loadings.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self.tbl_factor_loadings.setDragEnabled(True)
+        self.tbl_factor_loadings.setDropIndicatorShown(True)
+        self.tbl_factor_loadings.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
         right.addWidget(self.tbl_factor_loadings, 1)
         layout.addLayout(right, 3)
 
@@ -3198,6 +3254,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
 
         disp = self.state.factor_loadings.copy()
+        min_cut = 0.0
+        min_text = ""
+        if hasattr(self, "txt_factor_min_loading"):
+            min_text = self.txt_factor_min_loading.text().strip()
+        if min_text:
+            try:
+                min_cut = float(min_text)
+            except ValueError:
+                min_cut = 0.0
+
         rename_map = {
             col: f"{self.state.factor_ai_names[col]} ({col})"
             for col in disp.columns
@@ -3206,11 +3272,99 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if rename_map:
             disp = disp.rename(columns=rename_map)
 
-        disp["_maxabs_"] = disp.abs().max(axis=1)
-        disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
+        base = self.state.factor_loadings
+        if self.state.factor_loadings_order:
+            try:
+                base = base.reindex(self.state.factor_loadings_order)
+                disp = disp.reindex(self.state.factor_loadings_order)
+            except Exception:
+                pass
+        abs_values = base.abs()
+        dominant_idx = abs_values.values.argmax(axis=1)
+        dominant_cols = pd.Index(base.columns).take(dominant_idx)
+        dominant_vals = base.to_numpy()[np.arange(len(base)), dominant_idx]
+        factor_order = {col: i for i, col in enumerate(base.columns)}
+        dominant_series = pd.Series(dominant_cols, index=base.index)
+        dominant_order = pd.Series([factor_order[col] for col in dominant_cols], index=base.index)
+        dominant_abs = pd.Series(np.abs(dominant_vals), index=base.index)
+
+        if min_cut > 0:
+            disp = disp.mask(disp.abs() < min_cut)
+        disp["_dominant_order_"] = dominant_order
+        disp["_dominant_abs_"] = dominant_abs
+        if not self.state.factor_loadings_order:
+            disp = disp.sort_values(
+                ["_dominant_order_", "_dominant_abs_"],
+                ascending=[True, False],
+            )
+        disp = disp.drop(columns=["_dominant_order_", "_dominant_abs_"])
         disp = disp.reset_index().rename(columns={"index": "variable"})
+        variable_keys = disp["variable"].copy()
+        disp["variable"] = disp["variable"].map(lambda v: self._resolve_question_label(v, include_code=True))
         self.tbl_factor_loadings.set_df(disp)
+        self._factor_loadings_var_keys = list(variable_keys)
+        for row, key in enumerate(self._factor_loadings_var_keys):
+            item = self.tbl_factor_loadings.item(row, 0)
+            if item is not None:
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
+        display_col_map = {k: rename_map.get(k, k) for k in base.columns}
+        dominant_display = dominant_series.map(display_col_map).reindex(variable_keys).values
+        self._apply_factor_dominant_highlight(dominant_display)
         self._sync_factor_name_editor()
+
+    def _apply_factor_loadings_order(self):
+        if self.state.factor_loadings is None:
+            return
+        if not hasattr(self, "_factor_loadings_var_keys"):
+            return
+        ordered_keys: List[str] = []
+        for row in range(self.tbl_factor_loadings.rowCount()):
+            item = self.tbl_factor_loadings.item(row, 0)
+            if item is None:
+                continue
+            key = item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text()
+            ordered_keys.append(str(key))
+        if ordered_keys:
+            self.state.factor_loadings_order = ordered_keys
+            self._render_factor_loadings_table()
+            self._set_status("요인 문항 순서를 저장했습니다.")
+
+    def _reset_factor_loadings_order(self):
+        self.state.factor_loadings_order = None
+        self._render_factor_loadings_table()
+        self._set_status("요인 문항 순서를 초기화했습니다.")
+
+    def _apply_factor_dominant_highlight(self, dominant_cols: np.ndarray):
+        if not hasattr(self, "tbl_factor_loadings") or dominant_cols.size == 0:
+            return
+
+        palette = [
+            "#f3f7ff",
+            "#f7f3ff",
+            "#fff7f0",
+            "#f0fff4",
+            "#fff0f6",
+            "#f0fbff",
+            "#fffde8",
+            "#f5f5f5",
+        ]
+        color_map: Dict[str, QtGui.QColor] = {}
+        for col in dominant_cols:
+            if col not in color_map:
+                color_map[col] = QtGui.QColor(palette[len(color_map) % len(palette)])
+
+        headers = [self.tbl_factor_loadings.horizontalHeaderItem(c).text() for c in range(self.tbl_factor_loadings.columnCount())]
+        for row in range(self.tbl_factor_loadings.rowCount()):
+            factor = dominant_cols[row]
+            if factor not in color_map:
+                continue
+            try:
+                col_idx = headers.index(factor)
+            except ValueError:
+                continue
+            item = self.tbl_factor_loadings.item(row, col_idx)
+            if item is not None:
+                item.setBackground(QtGui.QBrush(color_map[factor]))
 
     def _sync_factor_name_editor(self, suggestions: Optional[Dict[str, str]] = None):
         """Refresh the editable factor-name table with current factors and suggestions."""
@@ -4540,9 +4694,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.txt_bin_lab2 = QtWidgets.QLineEdit("B")
         self.chk_bin_else_other = QtWidgets.QCheckBox("Else=Other")
         self.txt_bin_else_lab = QtWidgets.QLineEdit("Other")
-        self.txt_bin_else_lab.setMaximumWidth(90)
+        self.txt_bin_else_lab.setMinimumWidth(80)
 
         self.txt_bin_newcol = QtWidgets.QLineEdit("")
+        self.txt_bin_newcol.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.txt_bin_val1.setMinimumWidth(70)
+        self.txt_bin_val2.setMinimumWidth(70)
+        self.txt_bin_lab1.setMinimumWidth(70)
+        self.txt_bin_lab2.setMinimumWidth(70)
         self.btn_bin_apply = QtWidgets.QPushButton("Apply Binary Recode")
         style_button(self.btn_bin_apply, level=2)
         self.btn_bin_apply.clicked.connect(self._apply_binary_recode)
@@ -4576,6 +4735,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.cmb_group_source = QtWidgets.QComboBox()
         self.cmb_group_source.currentTextChanged.connect(self._on_group_source_changed)
         self.txt_group_newcol = QtWidgets.QLineEdit("")
+        self.txt_group_newcol.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self.btn_group_build = QtWidgets.QPushButton("Build Mapping Table")
         style_button(self.btn_group_build, level=1)
         self.btn_group_build.clicked.connect(self._build_group_mapping)
@@ -4598,6 +4758,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         merge_row = QtWidgets.QHBoxLayout()
         self.txt_group_merge_label = QtWidgets.QLineEdit("MyGroup")
+        self.txt_group_merge_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self.btn_group_merge_apply = QtWidgets.QPushButton("Merge Selected Rows (Apply Label)")
         style_button(self.btn_group_merge_apply, level=1)
         self.btn_group_merge_apply.clicked.connect(self._merge_group_mapping_selected)
@@ -4616,7 +4777,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         right = QtWidgets.QVBoxLayout()
         self.txt_compose_newcol = QtWidgets.QLineEdit("combo_seg")
+        self.txt_compose_newcol.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self.txt_compose_sep = QtWidgets.QLineEdit("|")
+        self.txt_compose_sep.setMinimumWidth(60)
+        self.txt_compose_sep.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self.btn_compose = QtWidgets.QPushButton("Create Combined Segment")
         style_button(self.btn_compose, level=2)
         self.btn_compose.clicked.connect(self._compose_segs)
@@ -5491,25 +5655,25 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._on_new_cluster_toggle(False)
         left.addWidget(add_group)
 
-        # [v8.1] Enhanced Cluster Summary with sub-segment details
-        left.addWidget(QtWidgets.QLabel("<b>Cluster Summary</b> (Points & Sub-segments)"))
-        self.tbl_cluster_summary = DataFrameTable(float_decimals=2)
-        left.addWidget(self.tbl_cluster_summary, 1)
-        self.btn_refresh_cluster_summary = QtWidgets.QPushButton("표 업데이트 (세그 n 갱신)")
-        style_button(self.btn_refresh_cluster_summary, level=1)
-        self.btn_refresh_cluster_summary.clicked.connect(self._manual_refresh_cluster_table)
-        left.addWidget(self.btn_refresh_cluster_summary)
-
         save_group = QtWidgets.QGroupBox("세그 결과 저장")
-        save_lay = QtWidgets.QHBoxLayout(save_group)
+        save_lay = QtWidgets.QVBoxLayout(save_group)
+        save_row_top = QtWidgets.QHBoxLayout()
+        save_row_bottom = QtWidgets.QHBoxLayout()
         self._seg_save_counter = 1
         self.txt_seg_save_name = QtWidgets.QLineEdit("seg_result_1")
+        self.txt_seg_save_name.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.chk_seg_save_cluster_id = QtWidgets.QCheckBox("Also include cluster_id")
+        self.chk_seg_save_cluster_id.setChecked(False)
         self.btn_seg_save = QtWidgets.QPushButton("Save Seg Result")
         style_button(self.btn_seg_save, level=2)
         self.btn_seg_save.clicked.connect(self._save_segmentation_result)
-        save_lay.addWidget(QtWidgets.QLabel("Column"))
-        save_lay.addWidget(self.txt_seg_save_name)
-        save_lay.addWidget(self.btn_seg_save)
+        save_row_top.addWidget(QtWidgets.QLabel("Column"))
+        save_row_top.addWidget(self.txt_seg_save_name, 1)
+        save_row_bottom.addWidget(self.chk_seg_save_cluster_id)
+        save_row_bottom.addStretch(1)
+        save_row_bottom.addWidget(self.btn_seg_save)
+        save_lay.addLayout(save_row_top)
+        save_lay.addLayout(save_row_bottom)
         left.addWidget(save_group)
 
         rename_box = QtWidgets.QHBoxLayout()
@@ -5532,10 +5696,37 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(center, 2)
 
         right = QtWidgets.QVBoxLayout()
-        right.addWidget(QtWidgets.QLabel("<b>Smart Segment Profiler (Z-Scores)</b>"))
+        right_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+
+        summary_widget = QtWidgets.QWidget()
+        summary_layout = QtWidgets.QVBoxLayout(summary_widget)
+        summary_layout.addWidget(QtWidgets.QLabel("<b>Cluster Summary</b> (Points & Sub-segments)"))
+        self.tbl_cluster_summary = DataFrameTable(float_decimals=2)
+        self.tbl_cluster_summary.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_cluster_summary.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tbl_cluster_summary.selectionModel().selectionChanged.connect(
+            self._on_cluster_summary_selection_changed
+        )
+        summary_layout.addWidget(self.tbl_cluster_summary, 1)
+        self.btn_refresh_cluster_summary = QtWidgets.QPushButton("표 업데이트 (세그 n 갱신)")
+        style_button(self.btn_refresh_cluster_summary, level=1)
+        self.btn_refresh_cluster_summary.clicked.connect(self._manual_refresh_cluster_table)
+        summary_layout.addWidget(self.btn_refresh_cluster_summary)
+        right_splitter.addWidget(summary_widget)
+
+        profiler_widget = QtWidgets.QWidget()
+        profiler_layout = QtWidgets.QVBoxLayout(profiler_widget)
+        profiler_layout.addWidget(QtWidgets.QLabel("<b>Smart Segment Profiler (Z-Scores)</b>"))
         self.txt_profile_report = QtWidgets.QTextEdit()
         self.txt_profile_report.setReadOnly(True)
-        right.addWidget(self.txt_profile_report)
+        profiler_layout.addWidget(self.txt_profile_report)
+        right_splitter.addWidget(profiler_widget)
+
+        right_splitter.setStretchFactor(0, 2)
+        right_splitter.setStretchFactor(1, 1)
+        right_splitter.setSizes([420, 220])
+
+        right.addWidget(right_splitter)
         layout.addLayout(right, 1)
 
         self._on_edit_mode_toggled()
@@ -5671,6 +5862,73 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 })
         out = pd.DataFrame(rows).sort_values(["Cluster ID", "Sub-segment"]).reset_index(drop=True)
         self.tbl_cluster_summary.set_df(out, max_rows=2000)
+        self._apply_cluster_summary_tint(out)
+
+    def _cluster_color_hex(self, cid: int) -> str:
+        if cid in (self.state.cluster_colors or {}):
+            return self.state.cluster_colors[cid]
+        return pal_hex()[(int(cid) - 1) % len(pal_hex())]
+
+    def _apply_cluster_summary_tint(self, df: pd.DataFrame):
+        if df is None or df.empty or not hasattr(self, "tbl_cluster_summary"):
+            return
+        if "Cluster ID" not in df.columns:
+            return
+        for row in range(self.tbl_cluster_summary.rowCount()):
+            try:
+                cid = int(df.iloc[row]["Cluster ID"])
+            except Exception:
+                continue
+            color = QtGui.QColor(self._cluster_color_hex(cid))
+            color.setAlpha(36)
+            brush = QtGui.QBrush(color)
+            for col in range(self.tbl_cluster_summary.columnCount()):
+                item = self.tbl_cluster_summary.item(row, col)
+                if item is not None:
+                    item.setBackground(brush)
+
+    def _on_cluster_summary_selection_changed(self, *_args):
+        if not hasattr(self, "tbl_cluster_summary"):
+            return
+
+        selected = self.tbl_cluster_summary.selectedItems()
+        if not selected:
+            return
+
+        headers = [self.tbl_cluster_summary.horizontalHeaderItem(c).text() for c in range(self.tbl_cluster_summary.columnCount())]
+        try:
+            n_idx = headers.index("Sub-segment N")
+        except ValueError:
+            n_idx = None
+
+        total = 0
+        if n_idx is not None:
+            for item in selected:
+                if item.column() != n_idx:
+                    continue
+                try:
+                    total += int(str(item.text()).replace(",", "").strip())
+                except Exception:
+                    continue
+            if total > 0:
+                QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"Σ N = {total:,}")
+
+        try:
+            row = selected[0].row()
+            cid_item = self.tbl_cluster_summary.item(row, headers.index("Cluster ID"))
+            if cid_item is not None:
+                cid = int(cid_item.text())
+                self._sync_new_cluster_fields_from_summary(cid)
+        except Exception:
+            return
+
+    def _sync_new_cluster_fields_from_summary(self, cid: int):
+        name = self.state.cluster_names.get(int(cid), f"Cluster {int(cid)}")
+        color = self._cluster_color_hex(int(cid))
+        self.txt_new_cluster_name.setText(name)
+        self._new_cluster_color_hex = color
+        self._update_new_cluster_color_button()
+        self._apply_new_cluster_template()
 
     def _manual_refresh_cluster_table(self):
         synced = self._sync_clusters_from_edit_plot("클러스터 표를 최신 상태로 동기화했습니다.")
@@ -5695,17 +5953,21 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if not col.endswith("_seg"):
                 col = f"{col}_seg"
 
-            name_map = {int(cid): self.state.cluster_names.get(int(cid), f"Cluster {int(cid)}") for cid in self.state.cluster_assign.unique()}
             df = self.state.df.copy()
 
             out_series = pd.Series(index=df.index, dtype=object)
             id_series = pd.Series(index=df.index, dtype=object)
 
-            if self.state.demand_mode.startswith("Segments") and self.state.demand_seg_labels is not None:
-                seg_labels = self.state.demand_seg_labels.astype(str)
+            name_map = {int(cid): self.state.cluster_names.get(int(cid), f"Cluster {int(cid)}") for cid in self.state.cluster_assign.unique()}
+
+            if self.state.demand_mode.startswith("Segments"):
+                seg_labels = self._get_demand_seg_labels()
+                if seg_labels is None:
+                    raise RuntimeError("세그먼트 라벨을 찾을 수 없습니다. 세그먼트 설정을 확인하세요.")
+                seg_labels = seg_labels.astype(str)
                 cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
                 cl_ids = seg_labels.map(cl_map)
-                out_series = cl_ids.map(name_map).fillna("")
+                out_series = seg_labels
                 id_series = cl_ids.fillna(-1).astype(int)
             elif "id" in df.columns:
                 id_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
@@ -5716,7 +5978,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 raise RuntimeError("세그 결과를 원본 데이터에 매핑할 수 없습니다.")
 
             df[col] = out_series
-            df[f"{col}_id"] = id_series
+            if self.chk_seg_save_cluster_id.isChecked():
+                df[f"{col}_id"] = id_series
             self.state.df = df
             self.tbl_preview.set_df(df)
             self._refresh_all_column_lists()
