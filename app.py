@@ -2945,10 +2945,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
         style_button(self.btn_ai_name, 3)
         self._register_text(self.btn_ai_name, "AI 요인명 추천", "AI Auto-Name Factors")
 
+        self.btn_save_factor = QtWidgets.QPushButton("요인 결과 저장")
+        self.btn_save_factor.clicked.connect(self._save_factor_results)
+        style_button(self.btn_save_factor, 2)
+        self._register_text(self.btn_save_factor, "요인 결과 저장", "Save Factor Results")
+
         ctrl.addWidget(QtWidgets.QLabel("Number of Factors (k):"))
         ctrl.addWidget(self.spin_factor_k)
         ctrl.addWidget(self.btn_run_factor)
         ctrl.addWidget(self.btn_ai_name)
+        ctrl.addWidget(self.btn_save_factor)
         left.addLayout(ctrl)
 
         self.lbl_factor_info = QtWidgets.QLabel("Analysis not run.")
@@ -3124,6 +3130,34 @@ class IntegratedApp(QtWidgets.QMainWindow):
         except Exception as e:
             self.state.last_error = str(e)
             show_error(self, "Analysis Error", e)
+
+    def _save_factor_results(self):
+        if self.state.factor_loadings is None and self.state.factor_scores is None:
+            QtWidgets.QMessageBox.warning(self, "No Factors", "Run Factor Analysis first.")
+            return
+        try:
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save Factor Results",
+                "",
+                "Excel Files (*.xlsx)"
+            )
+            if not path:
+                return
+            if not path.lower().endswith(".xlsx"):
+                path = f"{path}.xlsx"
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                if self.state.factor_loadings is not None:
+                    self.state.factor_loadings.reset_index().rename(
+                        columns={"index": "variable"}
+                    ).to_excel(writer, sheet_name="Factor_Loadings", index=False)
+                if self.state.factor_scores is not None:
+                    self.state.factor_scores.reset_index().rename(
+                        columns={"index": "row_index"}
+                    ).to_excel(writer, sheet_name="Factor_Scores", index=False)
+            self._set_status(f"요인 결과 저장 완료: {path}")
+        except Exception as e:
+            show_error(self, "Save Factor Results Error", e)
 
     def _ai_name_factors(self):
         """Uses OpenAI API to rename factors with retry logic."""
@@ -4820,8 +4854,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
         b.addLayout(r1)
 
         self.tbl_group_map = DataFrameTable(editable=True, float_decimals=2)
+        self.tbl_group_map.setMinimumHeight(300)
         self.tbl_group_map.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked)
-        b.addWidget(self.tbl_group_map, 1)
+        b.addWidget(self.tbl_group_map, 2)
 
         merge_row = QtWidgets.QHBoxLayout()
         self.txt_group_merge_label = QtWidgets.QLineEdit("MyGroup")
@@ -4835,7 +4870,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         merge_row.addWidget(self.txt_group_merge_label, 2)
         merge_row.addWidget(self.btn_group_merge_apply)
         b.addLayout(merge_row)
-        layout.addWidget(box, 1)
+        layout.addWidget(box, 3)
 
         # Compose Section
         box2 = QtWidgets.QGroupBox("Combine Segments: Multiple *_seg -> Combined Segment")
@@ -4879,6 +4914,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_delete_cols = QtWidgets.QListWidget()
         self.lst_delete_cols.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.lst_delete_cols.setMaximumHeight(80)
         dlay.addWidget(self.lst_delete_cols, 1)
 
         del_row = QtWidgets.QHBoxLayout()
@@ -4891,7 +4927,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         del_row.addWidget(self.btn_delete_cols)
         dlay.addLayout(del_row)
 
-        layout.addWidget(box3, 1)
+        layout.addWidget(box3, 0)
 
     def _apply_binary_recode(self):
         try:
@@ -6511,9 +6547,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
-    font_path = resource_path("Pretendard-Medium.otf")
+    font_path = resource_path("Pretendard-Regular.ttf")
     if not os.path.exists(font_path):
-        font_path = r"C:\Users\70089004\seg\Pretendard-Medium.otf"
+        font_path = str(Path(__file__).resolve().parent / "Pretendard-Regular.ttf")
     if os.path.exists(font_path):
         font_id = QtGui.QFontDatabase.addApplicationFont(font_path)
         if font_id != -1:
