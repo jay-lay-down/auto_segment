@@ -31,6 +31,7 @@ import math
 import ast
 import time  # Added for retry delays
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
@@ -66,6 +67,11 @@ def qcolor(hex_: str, alpha: int = 255) -> QtGui.QColor:
     c = QtGui.QColor(hex_)
     c.setAlpha(int(alpha))
     return c
+
+
+def resource_path(rel_path: str) -> str:
+    base = getattr(sys, "_MEIPASS", str(Path(__file__).resolve().parent))
+    return str(Path(base) / rel_path)
 
 
 def is_categorical_series(s: pd.Series, max_unique_numeric_as_cat: int = 20) -> bool:
@@ -6505,7 +6511,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
-    font_path = r"C:\Users\70089004\seg\Pretendard-Medium.otf"
+    font_path = resource_path("Pretendard-Medium.otf")
+    if not os.path.exists(font_path):
+        font_path = r"C:\Users\70089004\seg\Pretendard-Medium.otf"
     if os.path.exists(font_path):
         font_id = QtGui.QFontDatabase.addApplicationFont(font_path)
         if font_id != -1:
