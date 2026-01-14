@@ -238,6 +238,8 @@ class AppState:
     factor_scores: Optional[pd.DataFrame] = None
     factor_score_cols: List[str] = field(default_factory=list)
     factor_loadings: Optional[pd.DataFrame] = None
+    factor_loadings_order: Optional[List[str]] = None
+    ui_lang: str = "ko"
     factor_mode: str = "PCA"
     factor_ai_names: Dict[str, str] = field(default_factory=dict)
     factor_ai_suggestions: Dict[str, str] = field(default_factory=dict)
@@ -2184,6 +2186,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
         vartype_act.triggered.connect(self._open_variable_type_manager)
         file_menu.addAction(vartype_act)
 
+        self._i18n_texts: List[Tuple[Any, str, str]] = []
+        self._i18n_tab_labels: Dict[int, Tuple[str, str]] = {}
+
         self.tabs = QtWidgets.QTabWidget()
         self.setCentralWidget(self.tabs)
 
@@ -2201,6 +2206,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._build_tab_rag()
 
         self._apply_tab_styles()
+        self._apply_ui_language(self.state.ui_lang)
 
         # Footer credit
         footer = QtWidgets.QLabel(
@@ -2210,6 +2216,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         footer.setTextFormat(QtCore.Qt.TextFormat.RichText)
         footer.setOpenExternalLinks(True)
         self.statusBar().addPermanentWidget(footer)
+        self._add_language_toggle()
 
         self._set_status("Ready.")
 
@@ -2243,6 +2250,37 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _set_status(self, text: str):
         self.statusBar().showMessage(text)
 
+    def _add_language_toggle(self):
+        label = QtWidgets.QLabel("언어:")
+        combo = QtWidgets.QComboBox()
+        combo.addItem("한국어", "ko")
+        combo.addItem("English", "en")
+        combo.setCurrentIndex(0 if self.state.ui_lang == "ko" else 1)
+        combo.currentIndexChanged.connect(lambda _: self._apply_ui_language(combo.currentData()))
+        self.statusBar().addPermanentWidget(label)
+        self.statusBar().addPermanentWidget(combo)
+
+    def _register_text(self, widget: Any, ko: str, en: str):
+        if widget is None:
+            return
+        self._i18n_texts.append((widget, ko, en))
+
+    def _register_tab_label(self, tab: QtWidgets.QWidget, ko: str, en: str):
+        idx = self.tabs.indexOf(tab)
+        if idx >= 0:
+            self._i18n_tab_labels[idx] = (ko, en)
+
+    def _apply_ui_language(self, lang: str):
+        self.state.ui_lang = "en" if lang == "en" else "ko"
+        for widget, ko, en in self._i18n_texts:
+            text = en if self.state.ui_lang == "en" else ko
+            try:
+                widget.setText(text)
+            except Exception:
+                continue
+        for idx, (ko, en) in self._i18n_tab_labels.items():
+            self.tabs.setTabText(idx, en if self.state.ui_lang == "en" else ko)
+
     def _ensure_df(self):
         if self.state.df is None:
             raise RuntimeError("No data loaded.")
@@ -2252,7 +2290,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         for i in range(widget.count()):
             it = widget.item(i)
             if it.checkState() == QtCore.Qt.CheckState.Checked:
-                out.append(it.text())
+                data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                out.append(data if data is not None else it.text())
         return out
 
     def _checked_or_selected_items(self, widget: QtWidgets.QListWidget) -> List[str]:
@@ -2261,7 +2300,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
         checked = self._selected_checked_items(widget)
         if checked:
             return checked
-        return [it.text() for it in widget.selectedItems()]
+        out = []
+        for it in widget.selectedItems():
+            data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+            out.append(data if data is not None else it.text())
+        return out
 
     def _set_checked_for_selected(self, widget: QtWidgets.QListWidget, checked: bool):
         st = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
@@ -2279,7 +2322,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
             want = set(names)
             for i in range(widget.count()):
                 it = widget.item(i)
-                st = QtCore.Qt.CheckState.Checked if it.text() in want else QtCore.Qt.CheckState.Unchecked
+                data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                key = data if data is not None else it.text()
+                st = QtCore.Qt.CheckState.Checked if key in want else QtCore.Qt.CheckState.Unchecked
                 it.setCheckState(st)
         finally:
             widget.blockSignals(block_prev)
@@ -2329,7 +2374,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
         # Factor Tab
         self.lst_factor_cols.clear()
         for c in cols:
-            it = QtWidgets.QListWidgetItem(c)
+            display = self._resolve_question_label(c, include_code=True)
+            it = QtWidgets.QListWidgetItem(display)
+            it.setData(QtCore.Qt.ItemDataRole.UserRole, c)
             it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
             it.setCheckState(QtCore.Qt.CheckState.Unchecked)
             # [v8.1] Mark categorical variables with different color
@@ -2465,19 +2512,22 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _build_tab_data(self):
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Data Loading")
+        self.tabs.addTab(tab, "데이터 로딩")
+        self._register_tab_label(tab, "데이터 로딩", "Data Loading")
         layout = QtWidgets.QVBoxLayout(tab)
 
         row1 = QtWidgets.QHBoxLayout()
         self.txt_path = QtWidgets.QLineEdit()
-        self.btn_browse = QtWidgets.QPushButton("Browse Excel")
+        self.btn_browse = QtWidgets.QPushButton("엑셀 찾기")
         style_button(self.btn_browse, level=1)
         self.btn_browse.clicked.connect(self._browse_excel)
+        self._register_text(self.btn_browse, "엑셀 찾기", "Browse Excel")
 
         self.cmb_sheet = QtWidgets.QComboBox()
-        self.btn_load = QtWidgets.QPushButton("Load Data")
+        self.btn_load = QtWidgets.QPushButton("데이터 불러오기")
         style_button(self.btn_load, level=2)
         self.btn_load.clicked.connect(self._load_excel)
+        self._register_text(self.btn_load, "데이터 불러오기", "Load Data")
 
         row1.addWidget(QtWidgets.QLabel("File Path:"))
         row1.addWidget(self.txt_path, 3)
@@ -2490,9 +2540,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         # [v8.1] Variable Type Manager Button in Data Tab
         row2 = QtWidgets.QHBoxLayout()
-        self.btn_var_type_mgr = QtWidgets.QPushButton("📊 Variable Type Manager (Numeric/Categorical)")
+        self.btn_var_type_mgr = QtWidgets.QPushButton("📊 변수 유형 관리자 (연속/범주)")
         style_button(self.btn_var_type_mgr, level=3)
         self.btn_var_type_mgr.clicked.connect(self._open_variable_type_manager)
+        self._register_text(self.btn_var_type_mgr, "📊 변수 유형 관리자 (연속/범주)", "📊 Variable Type Manager (Numeric/Categorical)")
         self.btn_var_type_mgr.setToolTip(
             "SPSS-style variable type settings.\n"
             "Set variables as Numeric (continuous) or Categorical (discrete).\n"
@@ -2598,6 +2649,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.state.factor_mode = "PCA"
         self.state.factor_ai_names = {}
         self.state.factor_ai_suggestions = {}
+        self.state.factor_loadings_order = None
 
         if hasattr(self, "tbl_factor_loadings"):
             self.tbl_factor_loadings.set_df(None)
@@ -2639,18 +2691,21 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _build_tab_recode(self):
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Recode Mapping")
+        self.tabs.addTab(tab, "리코드 매핑")
+        self._register_tab_label(tab, "리코드 매핑", "Recode Mapping")
         layout = QtWidgets.QVBoxLayout(tab)
 
         layout.addWidget(QtWidgets.QLabel("Load & edit RECODE sheets (QUESTION / CODE / NAME / *_KR)."))
 
         ctrl = QtWidgets.QHBoxLayout()
-        self.btn_reload_recode = QtWidgets.QPushButton("Reload RECODE sheets from file")
+        self.btn_reload_recode = QtWidgets.QPushButton("RECODE 시트 새로고침")
         style_button(self.btn_reload_recode, level=1)
         self.btn_reload_recode.clicked.connect(self._reload_recode_from_source)
-        self.btn_save_recode = QtWidgets.QPushButton("Apply grid edits to RECODE")
+        self._register_text(self.btn_reload_recode, "RECODE 시트 새로고침", "Reload RECODE sheets from file")
+        self.btn_save_recode = QtWidgets.QPushButton("RECODE 변경 적용")
         style_button(self.btn_save_recode, level=2)
         self.btn_save_recode.clicked.connect(self._save_recode_edits)
+        self._register_text(self.btn_save_recode, "RECODE 변경 적용", "Apply grid edits to RECODE")
         ctrl.addWidget(self.btn_reload_recode)
         ctrl.addWidget(self.btn_save_recode)
         ctrl.addStretch(1)
@@ -2702,6 +2757,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _on_recode_label_mode_changed(self, mode: str):
         self.state.recode_label_mode = mode
         self._update_recode_tab()
+        self._refresh_all_column_lists()
+        self._render_factor_loadings_table()
         self._set_status(f"Recode label mode set to: {mode}")
 
     def _reload_recode_from_source(self):
@@ -2780,6 +2837,26 @@ class IntegratedApp(QtWidgets.QMainWindow):
             name_col = "NAME"
         return dict(zip(r["CODE"].astype(str).str.strip(), r[name_col].astype(str).str.strip()))
 
+    def _resolve_question_label(self, question: str, include_code: bool = False) -> str:
+        label = str(question)
+        if self.state.recode_label_mode != "korean" or self.state.recode_df is None:
+            return label
+        r = self.state.recode_df
+        if "QUESTION" not in r.columns:
+            return label
+        if "QUESTION_KR" not in r.columns:
+            return label
+        sub = r[r["QUESTION"].astype(str).str.strip() == str(question).strip()]
+        if sub.empty:
+            return label
+        kr = sub["QUESTION_KR"].dropna().astype(str).str.strip()
+        if kr.empty:
+            return label
+        resolved = kr.iloc[0]
+        if include_code and resolved and resolved != label:
+            return f"{resolved} ({label})"
+        return resolved or label
+
 # =============================================================================
 # app.py (Part 6/8)
 # Factor Analysis (AI Naming) & Decision Tree Setting Tabs
@@ -2790,7 +2867,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _build_tab_factor(self):
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Factor Analysis")
+        self.tabs.addTab(tab, "요인 분석")
+        self._register_tab_label(tab, "요인 분석", "Factor Analysis")
 
         layout = QtWidgets.QHBoxLayout(tab)
         left = QtWidgets.QVBoxLayout()
@@ -2815,13 +2893,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         # Selection Buttons
         btnrow = QtWidgets.QHBoxLayout()
-        self.btn_fac_check_sel = QtWidgets.QPushButton("Check Selected")
+        self.btn_fac_check_sel = QtWidgets.QPushButton("선택 체크")
         style_button(self.btn_fac_check_sel, level=1)
-        self.btn_fac_uncheck_sel = QtWidgets.QPushButton("Uncheck Selected")
+        self.btn_fac_uncheck_sel = QtWidgets.QPushButton("선택 해제")
         style_button(self.btn_fac_uncheck_sel, level=1)
-        self.btn_fac_check_all = QtWidgets.QPushButton("Check All Numeric")
+        self.btn_fac_check_all = QtWidgets.QPushButton("숫자 전체 체크")
         style_button(self.btn_fac_check_all, level=1)
-        self.btn_fac_uncheck_all = QtWidgets.QPushButton("Uncheck All")
+        self.btn_fac_uncheck_all = QtWidgets.QPushButton("전체 해제")
         style_button(self.btn_fac_uncheck_all, level=1)
 
         self.btn_fac_check_sel.clicked.connect(lambda: self._set_checked_for_selected(self.lst_factor_cols, True))
@@ -2851,13 +2929,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.spin_factor_k = QtWidgets.QSpinBox()
         self.spin_factor_k.setRange(2, 50)
         self.spin_factor_k.setValue(5)
-        self.btn_run_factor = QtWidgets.QPushButton("Run Analysis")
-        style_button(self.btn_run_factor, level=2)
+        self.btn_run_factor = QtWidgets.QPushButton("분석 시작")
+        style_button(self.btn_run_factor, level=4)
         self.btn_run_factor.clicked.connect(self._run_factor_analysis)
+        self._register_text(self.btn_run_factor, "분석 시작", "Run Analysis")
 
-        self.btn_ai_name = QtWidgets.QPushButton("AI Auto-Name Factors")
+        self.btn_ai_name = QtWidgets.QPushButton("AI 요인명 추천")
         self.btn_ai_name.clicked.connect(self._ai_name_factors)
         style_button(self.btn_ai_name, 3)
+        self._register_text(self.btn_ai_name, "AI 요인명 추천", "AI Auto-Name Factors")
 
         ctrl.addWidget(QtWidgets.QLabel("Number of Factors (k):"))
         ctrl.addWidget(self.spin_factor_k)
@@ -2884,12 +2964,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
         name_lay.addWidget(self.tbl_factor_name_editor, 1)
 
         name_btn_row = QtWidgets.QHBoxLayout()
-        self.btn_apply_factor_names = QtWidgets.QPushButton("Apply Edited Names")
+        self.btn_apply_factor_names = QtWidgets.QPushButton("요인명 적용")
         style_button(self.btn_apply_factor_names, level=2)
         self.btn_apply_factor_names.clicked.connect(self._apply_factor_names_from_editor)
-        self.btn_reset_factor_names = QtWidgets.QPushButton("Clear Names")
+        self.btn_reset_factor_names = QtWidgets.QPushButton("요인명 초기화")
         style_button(self.btn_reset_factor_names, level=1)
         self.btn_reset_factor_names.clicked.connect(self._reset_factor_names)
+        self._register_text(self.btn_apply_factor_names, "요인명 적용", "Apply Edited Names")
+        self._register_text(self.btn_reset_factor_names, "요인명 초기화", "Clear Names")
         name_btn_row.addWidget(self.btn_apply_factor_names)
         name_btn_row.addWidget(self.btn_reset_factor_names)
         name_lay.addLayout(name_btn_row)
@@ -2898,8 +2980,33 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(left, 2)
 
         right = QtWidgets.QVBoxLayout()
-        right.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
+        loadings_header = QtWidgets.QHBoxLayout()
+        loadings_header.addWidget(QtWidgets.QLabel("Loadings Matrix (Preview):"))
+        loadings_header.addStretch(1)
+        self.btn_factor_apply_order = QtWidgets.QPushButton("행 순서 적용")
+        style_button(self.btn_factor_apply_order, level=1)
+        self.btn_factor_apply_order.clicked.connect(self._apply_factor_loadings_order)
+        self.btn_factor_reset_order = QtWidgets.QPushButton("행 순서 초기화")
+        style_button(self.btn_factor_reset_order, level=1)
+        self.btn_factor_reset_order.clicked.connect(self._reset_factor_loadings_order)
+        self._register_text(self.btn_factor_apply_order, "행 순서 적용", "Apply Row Order")
+        self._register_text(self.btn_factor_reset_order, "행 순서 초기화", "Reset Order")
+        loadings_header.addWidget(self.btn_factor_apply_order)
+        loadings_header.addWidget(self.btn_factor_reset_order)
+        loadings_header.addSpacing(12)
+        loadings_header.addWidget(QtWidgets.QLabel("Min |loading|"))
+        self.txt_factor_min_loading = QtWidgets.QLineEdit()
+        self.txt_factor_min_loading.setFixedWidth(80)
+        self.txt_factor_min_loading.setPlaceholderText("0.00")
+        self.txt_factor_min_loading.setValidator(QtGui.QDoubleValidator(0.0, 10.0, 3))
+        self.txt_factor_min_loading.textChanged.connect(self._render_factor_loadings_table)
+        loadings_header.addWidget(self.txt_factor_min_loading)
+        right.addLayout(loadings_header)
         self.tbl_factor_loadings = DataFrameTable(float_decimals=3)
+        self.tbl_factor_loadings.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self.tbl_factor_loadings.setDragEnabled(True)
+        self.tbl_factor_loadings.setDropIndicatorShown(True)
+        self.tbl_factor_loadings.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
         right.addWidget(self.tbl_factor_loadings, 1)
         layout.addLayout(right, 3)
 
@@ -3198,6 +3305,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
 
         disp = self.state.factor_loadings.copy()
+        min_cut = 0.0
+        min_text = ""
+        if hasattr(self, "txt_factor_min_loading"):
+            min_text = self.txt_factor_min_loading.text().strip()
+        if min_text:
+            try:
+                min_cut = float(min_text)
+            except ValueError:
+                min_cut = 0.0
+
         rename_map = {
             col: f"{self.state.factor_ai_names[col]} ({col})"
             for col in disp.columns
@@ -3206,11 +3323,99 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if rename_map:
             disp = disp.rename(columns=rename_map)
 
-        disp["_maxabs_"] = disp.abs().max(axis=1)
-        disp = disp.sort_values("_maxabs_", ascending=False).drop(columns=["_maxabs_"])
+        base = self.state.factor_loadings
+        if self.state.factor_loadings_order:
+            try:
+                base = base.reindex(self.state.factor_loadings_order)
+                disp = disp.reindex(self.state.factor_loadings_order)
+            except Exception:
+                pass
+        abs_values = base.abs()
+        dominant_idx = abs_values.values.argmax(axis=1)
+        dominant_cols = pd.Index(base.columns).take(dominant_idx)
+        dominant_vals = base.to_numpy()[np.arange(len(base)), dominant_idx]
+        factor_order = {col: i for i, col in enumerate(base.columns)}
+        dominant_series = pd.Series(dominant_cols, index=base.index)
+        dominant_order = pd.Series([factor_order[col] for col in dominant_cols], index=base.index)
+        dominant_abs = pd.Series(np.abs(dominant_vals), index=base.index)
+
+        if min_cut > 0:
+            disp = disp.mask(disp.abs() < min_cut)
+        disp["_dominant_order_"] = dominant_order
+        disp["_dominant_abs_"] = dominant_abs
+        if not self.state.factor_loadings_order:
+            disp = disp.sort_values(
+                ["_dominant_order_", "_dominant_abs_"],
+                ascending=[True, False],
+            )
+        disp = disp.drop(columns=["_dominant_order_", "_dominant_abs_"])
         disp = disp.reset_index().rename(columns={"index": "variable"})
+        variable_keys = disp["variable"].copy()
+        disp["variable"] = disp["variable"].map(lambda v: self._resolve_question_label(v, include_code=True))
         self.tbl_factor_loadings.set_df(disp)
+        self._factor_loadings_var_keys = list(variable_keys)
+        for row, key in enumerate(self._factor_loadings_var_keys):
+            item = self.tbl_factor_loadings.item(row, 0)
+            if item is not None:
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
+        display_col_map = {k: rename_map.get(k, k) for k in base.columns}
+        dominant_display = dominant_series.map(display_col_map).reindex(variable_keys).values
+        self._apply_factor_dominant_highlight(dominant_display)
         self._sync_factor_name_editor()
+
+    def _apply_factor_loadings_order(self):
+        if self.state.factor_loadings is None:
+            return
+        if not hasattr(self, "_factor_loadings_var_keys"):
+            return
+        ordered_keys: List[str] = []
+        for row in range(self.tbl_factor_loadings.rowCount()):
+            item = self.tbl_factor_loadings.item(row, 0)
+            if item is None:
+                continue
+            key = item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text()
+            ordered_keys.append(str(key))
+        if ordered_keys:
+            self.state.factor_loadings_order = ordered_keys
+            self._render_factor_loadings_table()
+            self._set_status("요인 문항 순서를 저장했습니다.")
+
+    def _reset_factor_loadings_order(self):
+        self.state.factor_loadings_order = None
+        self._render_factor_loadings_table()
+        self._set_status("요인 문항 순서를 초기화했습니다.")
+
+    def _apply_factor_dominant_highlight(self, dominant_cols: np.ndarray):
+        if not hasattr(self, "tbl_factor_loadings") or dominant_cols.size == 0:
+            return
+
+        palette = [
+            "#f3f7ff",
+            "#f7f3ff",
+            "#fff7f0",
+            "#f0fff4",
+            "#fff0f6",
+            "#f0fbff",
+            "#fffde8",
+            "#f5f5f5",
+        ]
+        color_map: Dict[str, QtGui.QColor] = {}
+        for col in dominant_cols:
+            if col not in color_map:
+                color_map[col] = QtGui.QColor(palette[len(color_map) % len(palette)])
+
+        headers = [self.tbl_factor_loadings.horizontalHeaderItem(c).text() for c in range(self.tbl_factor_loadings.columnCount())]
+        for row in range(self.tbl_factor_loadings.rowCount()):
+            factor = dominant_cols[row]
+            if factor not in color_map:
+                continue
+            try:
+                col_idx = headers.index(factor)
+            except ValueError:
+                continue
+            item = self.tbl_factor_loadings.item(row, col_idx)
+            if item is not None:
+                item.setBackground(QtGui.QBrush(color_map[factor]))
 
     def _sync_factor_name_editor(self, suggestions: Optional[Dict[str, str]] = None):
         """Refresh the editable factor-name table with current factors and suggestions."""
@@ -3327,7 +3532,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _build_tab_dt_setting(self):
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Decision Tree Setting")
+        self.tabs.addTab(tab, "의사결정나무 설정")
+        self._register_tab_label(tab, "의사결정나무 설정", "Decision Tree Setting")
 
         layout = QtWidgets.QVBoxLayout(tab)
 
@@ -3345,20 +3551,21 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         # Controls: Targets
         row = QtWidgets.QHBoxLayout()
-        self.chk_use_all_factors = QtWidgets.QCheckBox("Use all Factors (Factor1..k) as Targets")
+        self.chk_use_all_factors = QtWidgets.QCheckBox("모든 요인(Factor1..k)을 타깃으로 사용")
         self.chk_use_all_factors.setChecked(True)
-        self.btn_run_tree = QtWidgets.QPushButton("Run Decision Tree Analysis")
-        style_button(self.btn_run_tree, level=2)
+        self.btn_run_tree = QtWidgets.QPushButton("분석 시작")
+        style_button(self.btn_run_tree, level=4)
         self.btn_run_tree.clicked.connect(self._run_decision_tree_outputs)
+        self._register_text(self.btn_run_tree, "분석 시작", "Run Decision Tree Analysis")
 
         row.addWidget(self.chk_use_all_factors)
         row.addStretch(1)
         row.addWidget(self.btn_run_tree)
         layout.addLayout(row)
 
-        extra_box = QtWidgets.QGroupBox("Extra Targets (Optional, multi-select)")
+        extra_box = QtWidgets.QGroupBox("추가 타깃(선택)")
         extra_layout = QtWidgets.QVBoxLayout(extra_box)
-        extra_layout.addWidget(QtWidgets.QLabel("Check one or more existing columns to treat as additional targets."))
+        extra_layout.addWidget(QtWidgets.QLabel("추가 타깃으로 사용할 컬럼을 선택하세요."))
 
         extra_row = QtWidgets.QHBoxLayout()
         self.lst_dep_extra = QtWidgets.QListWidget()
@@ -3366,9 +3573,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lst_dep_extra.setMaximumHeight(90)
         extra_row.addWidget(self.lst_dep_extra, 1)
 
-        self.btn_dep_extra_check_all = QtWidgets.QPushButton("Check All")
+        self.btn_dep_extra_check_all = QtWidgets.QPushButton("전체 체크")
         style_button(self.btn_dep_extra_check_all, level=1)
-        self.btn_dep_extra_uncheck_all = QtWidgets.QPushButton("Uncheck All")
+        self.btn_dep_extra_uncheck_all = QtWidgets.QPushButton("전체 해제")
         style_button(self.btn_dep_extra_uncheck_all, level=1)
 
         self.btn_dep_extra_check_all.clicked.connect(lambda: self._set_all_checks(self.lst_dep_extra, True))
@@ -3384,21 +3591,21 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addWidget(extra_box)
 
         # Controls: Predictors (Whitelist)
-        pred_box = QtWidgets.QGroupBox("Select Predictors (Independent Variables)")
+        pred_box = QtWidgets.QGroupBox("독립변수(예측변수) 선택")
         pred_layout = QtWidgets.QVBoxLayout(pred_box)
 
         p_row = QtWidgets.QHBoxLayout()
         self.txt_dt_pred_filter = QtWidgets.QLineEdit()
-        self.txt_dt_pred_filter.setPlaceholderText("Filter variables...")
+        self.txt_dt_pred_filter.setPlaceholderText("변수 필터...")
         self.txt_dt_pred_filter.textChanged.connect(self._filter_dt_pred_list)
 
-        self.btn_dt_pred_check_sel = QtWidgets.QPushButton("Check Selected")
+        self.btn_dt_pred_check_sel = QtWidgets.QPushButton("선택 체크")
         style_button(self.btn_dt_pred_check_sel, level=1)
-        self.btn_dt_pred_uncheck_sel = QtWidgets.QPushButton("Uncheck Selected")
+        self.btn_dt_pred_uncheck_sel = QtWidgets.QPushButton("선택 해제")
         style_button(self.btn_dt_pred_uncheck_sel, level=1)
-        self.btn_dt_pred_check_all = QtWidgets.QPushButton("Check All")
+        self.btn_dt_pred_check_all = QtWidgets.QPushButton("전체 체크")
         style_button(self.btn_dt_pred_check_all, level=1)
-        self.btn_dt_pred_uncheck_all = QtWidgets.QPushButton("Uncheck All")
+        self.btn_dt_pred_uncheck_all = QtWidgets.QPushButton("전체 해제")
         style_button(self.btn_dt_pred_uncheck_all, level=1)
 
         self.btn_dt_pred_check_sel.clicked.connect(lambda: self._set_checked_for_selected(self.lst_dt_predictors, True))
@@ -3430,10 +3637,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
         l1.addWidget(self.tbl_dt_pivot, 1)
 
         rec_layout = QtWidgets.QHBoxLayout()
-        self.btn_dt_recommend = QtWidgets.QPushButton("Recommend Grouping based on Selection → Send to Group Tab")
-        style_button(self.btn_dt_recommend, level=3)
+        self.btn_dt_recommend = QtWidgets.QPushButton("선택 기준 그룹 추천 → 그룹 탭 전송")
+        style_button(self.btn_dt_recommend, level=2)
         self.btn_dt_recommend.setMinimumHeight(40)
         self.btn_dt_recommend.clicked.connect(self._recommend_grouping_transfer)
+        self._register_text(self.btn_dt_recommend, "선택 기준 그룹 추천 → 그룹 탭 전송", "Recommend Grouping → Send to Group Tab")
 
         rec_layout.addWidget(self.btn_dt_recommend)
         rec_layout.addStretch(1)
@@ -3721,7 +3929,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._dt_results_built = True
 
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Decision Tree Results")
+        self.tabs.addTab(tab, "의사결정나무 결과")
+        self._register_tab_label(tab, "의사결정나무 결과", "Decision Tree Results")
 
         layout = QtWidgets.QVBoxLayout(tab)
 
@@ -3739,9 +3948,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.spin_dt_full_depth = QtWidgets.QSpinBox()
         self.spin_dt_full_depth.setRange(1, 30)
         self.spin_dt_full_depth.setValue(6)
-        self.btn_dt_full_run = QtWidgets.QPushButton("Run Full Tree Analysis")
-        style_button(self.btn_dt_full_run, level=2)
+        self.btn_dt_full_run = QtWidgets.QPushButton("분석 시작")
+        style_button(self.btn_dt_full_run, level=4)
         self.btn_dt_full_run.clicked.connect(self._run_dt_full_for_selected)
+        self._register_text(self.btn_dt_full_run, "분석 시작", "Run Full Tree Analysis")
 
         ctrl.addWidget(QtWidgets.QLabel("Target (Dep)"))
         ctrl.addWidget(self.cmb_dt_full_dep, 2)
@@ -4048,7 +4258,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._dt_editing_built = True
 
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Decision Tree Editing")
+        self.tabs.addTab(tab, "의사결정나무 편집")
+        self._register_tab_label(tab, "의사결정나무 편집", "Decision Tree Editing")
 
         layout = QtWidgets.QVBoxLayout(tab)
 
@@ -4525,7 +4736,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _build_tab_grouping(self):
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Group & Compose")
+        self.tabs.addTab(tab, "그룹/조합")
+        self._register_tab_label(tab, "그룹/조합", "Group & Compose")
 
         layout = QtWidgets.QVBoxLayout(tab)
 
@@ -4540,12 +4752,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.txt_bin_lab2 = QtWidgets.QLineEdit("B")
         self.chk_bin_else_other = QtWidgets.QCheckBox("Else=Other")
         self.txt_bin_else_lab = QtWidgets.QLineEdit("Other")
-        self.txt_bin_else_lab.setMaximumWidth(90)
+        self.txt_bin_else_lab.setMinimumWidth(80)
 
         self.txt_bin_newcol = QtWidgets.QLineEdit("")
-        self.btn_bin_apply = QtWidgets.QPushButton("Apply Binary Recode")
+        self.txt_bin_newcol.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.txt_bin_val1.setMinimumWidth(70)
+        self.txt_bin_val2.setMinimumWidth(70)
+        self.txt_bin_lab1.setMinimumWidth(70)
+        self.txt_bin_lab2.setMinimumWidth(70)
+        self.btn_bin_apply = QtWidgets.QPushButton("이진 리코드 적용")
         style_button(self.btn_bin_apply, level=2)
         self.btn_bin_apply.clicked.connect(self._apply_binary_recode)
+        self._register_text(self.btn_bin_apply, "이진 리코드 적용", "Apply Binary Recode")
 
         bin_layout.addWidget(QtWidgets.QLabel("Column"))
         bin_layout.addWidget(self.cmb_bin_col, 2)
@@ -4576,12 +4794,15 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.cmb_group_source = QtWidgets.QComboBox()
         self.cmb_group_source.currentTextChanged.connect(self._on_group_source_changed)
         self.txt_group_newcol = QtWidgets.QLineEdit("")
-        self.btn_group_build = QtWidgets.QPushButton("Build Mapping Table")
+        self.txt_group_newcol.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.btn_group_build = QtWidgets.QPushButton("매핑표 생성")
         style_button(self.btn_group_build, level=1)
         self.btn_group_build.clicked.connect(self._build_group_mapping)
-        self.btn_group_apply = QtWidgets.QPushButton("Create IV (Apply Mapping)")
+        self.btn_group_apply = QtWidgets.QPushButton("IV 생성(매핑 적용)")
         style_button(self.btn_group_apply, level=2)
         self.btn_group_apply.clicked.connect(self._apply_group_mapping)
+        self._register_text(self.btn_group_build, "매핑표 생성", "Build Mapping Table")
+        self._register_text(self.btn_group_apply, "IV 생성(매핑 적용)", "Create IV (Apply Mapping)")
 
         r1.addWidget(QtWidgets.QLabel("Source Column"))
         r1.addWidget(self.cmb_group_source)
@@ -4598,9 +4819,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         merge_row = QtWidgets.QHBoxLayout()
         self.txt_group_merge_label = QtWidgets.QLineEdit("MyGroup")
-        self.btn_group_merge_apply = QtWidgets.QPushButton("Merge Selected Rows (Apply Label)")
+        self.txt_group_merge_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.btn_group_merge_apply = QtWidgets.QPushButton("선택 행 병합(라벨 적용)")
         style_button(self.btn_group_merge_apply, level=1)
         self.btn_group_merge_apply.clicked.connect(self._merge_group_mapping_selected)
+        self._register_text(self.btn_group_merge_apply, "선택 행 병합(라벨 적용)", "Merge Selected Rows (Apply Label)")
 
         merge_row.addWidget(QtWidgets.QLabel("Select rows above & Enter Label to merge:"))
         merge_row.addWidget(self.txt_group_merge_label, 2)
@@ -4616,10 +4839,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         right = QtWidgets.QVBoxLayout()
         self.txt_compose_newcol = QtWidgets.QLineEdit("combo_seg")
+        self.txt_compose_newcol.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self.txt_compose_sep = QtWidgets.QLineEdit("|")
-        self.btn_compose = QtWidgets.QPushButton("Create Combined Segment")
+        self.txt_compose_sep.setMinimumWidth(60)
+        self.txt_compose_sep.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.btn_compose = QtWidgets.QPushButton("세그 조합 생성")
         style_button(self.btn_compose, level=2)
         self.btn_compose.clicked.connect(self._compose_segs)
+        self._register_text(self.btn_compose, "세그 조합 생성", "Create Combined Segment")
 
         right.addWidget(QtWidgets.QLabel("Select *_seg columns"))
         right.addWidget(QtWidgets.QLabel("New Column Name"))
@@ -4649,9 +4876,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         dlay.addWidget(self.lst_delete_cols, 1)
 
         del_row = QtWidgets.QHBoxLayout()
-        self.btn_delete_cols = QtWidgets.QPushButton("Delete Selected Columns")
+        self.btn_delete_cols = QtWidgets.QPushButton("선택 컬럼 삭제")
         style_button(self.btn_delete_cols, level=2)
         self.btn_delete_cols.clicked.connect(self._delete_selected_columns)
+        self._register_text(self.btn_delete_cols, "선택 컬럼 삭제", "Delete Selected Columns")
 
         del_row.addStretch(1)
         del_row.addWidget(self.btn_delete_cols)
@@ -4882,7 +5110,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _build_tab_seg_setting(self):
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Segmentation Setting")
+        self.tabs.addTab(tab, "세그먼트 설정")
+        self._register_tab_label(tab, "세그먼트 설정", "Segmentation Setting")
         layout = QtWidgets.QHBoxLayout(tab)
 
         left = QtWidgets.QVBoxLayout()
@@ -4961,10 +5190,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         var_l.addWidget(self.lst_demand_vars, 2)
 
         vbtn = QtWidgets.QHBoxLayout()
-        self.btn_demand_check_sel = QtWidgets.QPushButton("Check Selected")
-        self.btn_demand_uncheck_sel = QtWidgets.QPushButton("Uncheck Selected")
+        self.btn_demand_check_sel = QtWidgets.QPushButton("선택 체크")
+        self.btn_demand_uncheck_sel = QtWidgets.QPushButton("선택 해제")
         self.btn_demand_check_sel.clicked.connect(lambda: self._set_checked_for_selected(self.lst_demand_vars, True))
         self.btn_demand_uncheck_sel.clicked.connect(lambda: self._set_checked_for_selected(self.lst_demand_vars, False))
+        self._register_text(self.btn_demand_check_sel, "선택 체크", "Check Selected")
+        self._register_text(self.btn_demand_uncheck_sel, "선택 해제", "Uncheck Selected")
         vbtn.addWidget(self.btn_demand_check_sel)
         vbtn.addWidget(self.btn_demand_uncheck_sel)
         var_l.addLayout(vbtn)
@@ -4978,9 +5209,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.spin_demand_k = QtWidgets.QSpinBox()
         self.spin_demand_k.setRange(2, 30)
         self.spin_demand_k.setValue(6)
-        self.btn_run_demand = QtWidgets.QPushButton("Run Demand Space")
-        style_button(self.btn_run_demand, level=2)
+        self.btn_run_demand = QtWidgets.QPushButton("분석 시작")
+        style_button(self.btn_run_demand, level=4)
         self.btn_run_demand.clicked.connect(self._run_demand_space)
+        self._register_text(self.btn_run_demand, "분석 시작", "Run Demand Space")
 
         row.addWidget(QtWidgets.QLabel("Method"))
         row.addWidget(self.cmb_demand_coord)
@@ -5414,7 +5646,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _build_tab_seg_editing(self):
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Segmentation Editing")
+        self.tabs.addTab(tab, "세그먼트 편집")
+        self._register_tab_label(tab, "세그먼트 편집", "Segmentation Editing")
         layout = QtWidgets.QHBoxLayout(tab)
 
         # Initialize the editable plot first so dependent controls can reference it safely
@@ -5445,12 +5678,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.chk_free_move_points.toggled.connect(lambda v: self.plot_edit.set_free_move_points(v))
         self.chk_show_all_point_labels = QtWidgets.QCheckBox("Show All Labels")
         self.chk_show_all_point_labels.toggled.connect(lambda v: self.plot_edit.set_show_all_point_labels(v))
-        self.btn_auto_labels = QtWidgets.QPushButton("Auto-Arrange Labels")
+        self.btn_auto_labels = QtWidgets.QPushButton("라벨 자동 정렬")
         style_button(self.btn_auto_labels, level=1)
         self.btn_auto_labels.clicked.connect(lambda: self.plot_edit.auto_arrange_labels())
-        self.btn_reset_label_pos = QtWidgets.QPushButton("Reset Label Pos")
+        self.btn_reset_label_pos = QtWidgets.QPushButton("라벨 위치 초기화")
         style_button(self.btn_reset_label_pos, level=1)
         self.btn_reset_label_pos.clicked.connect(lambda: self.plot_edit.reset_label_positions())
+        self._register_text(self.btn_auto_labels, "라벨 자동 정렬", "Auto-Arrange Labels")
+        self._register_text(self.btn_reset_label_pos, "라벨 위치 초기화", "Reset Label Pos")
 
         olay.addWidget(self.chk_free_move_points)
         olay.addWidget(self.chk_show_all_point_labels)
@@ -5477,9 +5712,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         color_row = QtWidgets.QHBoxLayout()
         self._new_cluster_color_hex = pal_hex()[0]
-        self.btn_new_cluster_color = QtWidgets.QPushButton("Pick Color")
+        self.btn_new_cluster_color = QtWidgets.QPushButton("색상 선택")
         style_button(self.btn_new_cluster_color, level=1)
         self.btn_new_cluster_color.clicked.connect(self._pick_new_cluster_color)
+        self._register_text(self.btn_new_cluster_color, "색상 선택", "Pick Color")
         self.lbl_new_cluster_color = QtWidgets.QLabel(self._new_cluster_color_hex)
         color_row.addWidget(QtWidgets.QLabel("Color"))
         color_row.addWidget(self.btn_new_cluster_color)
@@ -5491,34 +5727,36 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._on_new_cluster_toggle(False)
         left.addWidget(add_group)
 
-        # [v8.1] Enhanced Cluster Summary with sub-segment details
-        left.addWidget(QtWidgets.QLabel("<b>Cluster Summary</b> (Points & Sub-segments)"))
-        self.tbl_cluster_summary = DataFrameTable(float_decimals=2)
-        left.addWidget(self.tbl_cluster_summary, 1)
-        self.btn_refresh_cluster_summary = QtWidgets.QPushButton("표 업데이트 (세그 n 갱신)")
-        style_button(self.btn_refresh_cluster_summary, level=1)
-        self.btn_refresh_cluster_summary.clicked.connect(self._manual_refresh_cluster_table)
-        left.addWidget(self.btn_refresh_cluster_summary)
-
         save_group = QtWidgets.QGroupBox("세그 결과 저장")
-        save_lay = QtWidgets.QHBoxLayout(save_group)
+        save_lay = QtWidgets.QVBoxLayout(save_group)
+        save_row_top = QtWidgets.QHBoxLayout()
+        save_row_bottom = QtWidgets.QHBoxLayout()
         self._seg_save_counter = 1
         self.txt_seg_save_name = QtWidgets.QLineEdit("seg_result_1")
-        self.btn_seg_save = QtWidgets.QPushButton("Save Seg Result")
+        self.txt_seg_save_name.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.chk_seg_save_cluster_id = QtWidgets.QCheckBox("Also include cluster_id")
+        self.chk_seg_save_cluster_id.setChecked(False)
+        self.btn_seg_save = QtWidgets.QPushButton("세그 결과 저장")
         style_button(self.btn_seg_save, level=2)
         self.btn_seg_save.clicked.connect(self._save_segmentation_result)
-        save_lay.addWidget(QtWidgets.QLabel("Column"))
-        save_lay.addWidget(self.txt_seg_save_name)
-        save_lay.addWidget(self.btn_seg_save)
+        self._register_text(self.btn_seg_save, "세그 결과 저장", "Save Seg Result")
+        save_row_top.addWidget(QtWidgets.QLabel("Column"))
+        save_row_top.addWidget(self.txt_seg_save_name, 1)
+        save_row_bottom.addWidget(self.chk_seg_save_cluster_id)
+        save_row_bottom.addStretch(1)
+        save_row_bottom.addWidget(self.btn_seg_save)
+        save_lay.addLayout(save_row_top)
+        save_lay.addLayout(save_row_bottom)
         left.addWidget(save_group)
 
         rename_box = QtWidgets.QHBoxLayout()
         self.spin_rename_cluster_id = QtWidgets.QSpinBox()
         self.spin_rename_cluster_id.setRange(1, 999)
         self.txt_rename_cluster = QtWidgets.QLineEdit("Name")
-        self.btn_rename_cluster = QtWidgets.QPushButton("Rename")
+        self.btn_rename_cluster = QtWidgets.QPushButton("이름 변경")
         style_button(self.btn_rename_cluster, level=1)
         self.btn_rename_cluster.clicked.connect(self._rename_cluster)
+        self._register_text(self.btn_rename_cluster, "이름 변경", "Rename")
         rename_box.addWidget(QtWidgets.QLabel("ID"))
         rename_box.addWidget(self.spin_rename_cluster_id)
         rename_box.addWidget(self.txt_rename_cluster)
@@ -5532,10 +5770,38 @@ class IntegratedApp(QtWidgets.QMainWindow):
         layout.addLayout(center, 2)
 
         right = QtWidgets.QVBoxLayout()
-        right.addWidget(QtWidgets.QLabel("<b>Smart Segment Profiler (Z-Scores)</b>"))
+        right_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+
+        summary_widget = QtWidgets.QWidget()
+        summary_layout = QtWidgets.QVBoxLayout(summary_widget)
+        summary_layout.addWidget(QtWidgets.QLabel("<b>Cluster Summary</b> (Points & Sub-segments)"))
+        self.tbl_cluster_summary = DataFrameTable(float_decimals=2)
+        self.tbl_cluster_summary.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_cluster_summary.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tbl_cluster_summary.selectionModel().selectionChanged.connect(
+            self._on_cluster_summary_selection_changed
+        )
+        summary_layout.addWidget(self.tbl_cluster_summary, 1)
+        self.btn_refresh_cluster_summary = QtWidgets.QPushButton("표 업데이트 (세그 N 갱신)")
+        style_button(self.btn_refresh_cluster_summary, level=1)
+        self.btn_refresh_cluster_summary.clicked.connect(self._manual_refresh_cluster_table)
+        self._register_text(self.btn_refresh_cluster_summary, "표 업데이트 (세그 N 갱신)", "Refresh Table (Update N)")
+        summary_layout.addWidget(self.btn_refresh_cluster_summary)
+        right_splitter.addWidget(summary_widget)
+
+        profiler_widget = QtWidgets.QWidget()
+        profiler_layout = QtWidgets.QVBoxLayout(profiler_widget)
+        profiler_layout.addWidget(QtWidgets.QLabel("<b>Smart Segment Profiler (Z-Scores)</b>"))
         self.txt_profile_report = QtWidgets.QTextEdit()
         self.txt_profile_report.setReadOnly(True)
-        right.addWidget(self.txt_profile_report)
+        profiler_layout.addWidget(self.txt_profile_report)
+        right_splitter.addWidget(profiler_widget)
+
+        right_splitter.setStretchFactor(0, 2)
+        right_splitter.setStretchFactor(1, 1)
+        right_splitter.setSizes([420, 220])
+
+        right.addWidget(right_splitter)
         layout.addLayout(right, 1)
 
         self._on_edit_mode_toggled()
@@ -5671,6 +5937,73 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 })
         out = pd.DataFrame(rows).sort_values(["Cluster ID", "Sub-segment"]).reset_index(drop=True)
         self.tbl_cluster_summary.set_df(out, max_rows=2000)
+        self._apply_cluster_summary_tint(out)
+
+    def _cluster_color_hex(self, cid: int) -> str:
+        if cid in (self.state.cluster_colors or {}):
+            return self.state.cluster_colors[cid]
+        return pal_hex()[(int(cid) - 1) % len(pal_hex())]
+
+    def _apply_cluster_summary_tint(self, df: pd.DataFrame):
+        if df is None or df.empty or not hasattr(self, "tbl_cluster_summary"):
+            return
+        if "Cluster ID" not in df.columns:
+            return
+        for row in range(self.tbl_cluster_summary.rowCount()):
+            try:
+                cid = int(df.iloc[row]["Cluster ID"])
+            except Exception:
+                continue
+            color = QtGui.QColor(self._cluster_color_hex(cid))
+            color.setAlpha(36)
+            brush = QtGui.QBrush(color)
+            for col in range(self.tbl_cluster_summary.columnCount()):
+                item = self.tbl_cluster_summary.item(row, col)
+                if item is not None:
+                    item.setBackground(brush)
+
+    def _on_cluster_summary_selection_changed(self, *_args):
+        if not hasattr(self, "tbl_cluster_summary"):
+            return
+
+        selected = self.tbl_cluster_summary.selectedItems()
+        if not selected:
+            return
+
+        headers = [self.tbl_cluster_summary.horizontalHeaderItem(c).text() for c in range(self.tbl_cluster_summary.columnCount())]
+        try:
+            n_idx = headers.index("Sub-segment N")
+        except ValueError:
+            n_idx = None
+
+        total = 0
+        if n_idx is not None:
+            for item in selected:
+                if item.column() != n_idx:
+                    continue
+                try:
+                    total += int(str(item.text()).replace(",", "").strip())
+                except Exception:
+                    continue
+            if total > 0:
+                QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"Σ N = {total:,}")
+
+        try:
+            row = selected[0].row()
+            cid_item = self.tbl_cluster_summary.item(row, headers.index("Cluster ID"))
+            if cid_item is not None:
+                cid = int(cid_item.text())
+                self._sync_new_cluster_fields_from_summary(cid)
+        except Exception:
+            return
+
+    def _sync_new_cluster_fields_from_summary(self, cid: int):
+        name = self.state.cluster_names.get(int(cid), f"Cluster {int(cid)}")
+        color = self._cluster_color_hex(int(cid))
+        self.txt_new_cluster_name.setText(name)
+        self._new_cluster_color_hex = color
+        self._update_new_cluster_color_button()
+        self._apply_new_cluster_template()
 
     def _manual_refresh_cluster_table(self):
         synced = self._sync_clusters_from_edit_plot("클러스터 표를 최신 상태로 동기화했습니다.")
@@ -5695,17 +6028,21 @@ class IntegratedApp(QtWidgets.QMainWindow):
             if not col.endswith("_seg"):
                 col = f"{col}_seg"
 
-            name_map = {int(cid): self.state.cluster_names.get(int(cid), f"Cluster {int(cid)}") for cid in self.state.cluster_assign.unique()}
             df = self.state.df.copy()
 
             out_series = pd.Series(index=df.index, dtype=object)
             id_series = pd.Series(index=df.index, dtype=object)
 
-            if self.state.demand_mode.startswith("Segments") and self.state.demand_seg_labels is not None:
-                seg_labels = self.state.demand_seg_labels.astype(str)
+            name_map = {int(cid): self.state.cluster_names.get(int(cid), f"Cluster {int(cid)}") for cid in self.state.cluster_assign.unique()}
+
+            if self.state.demand_mode.startswith("Segments"):
+                seg_labels = self._get_demand_seg_labels()
+                if seg_labels is None:
+                    raise RuntimeError("세그먼트 라벨을 찾을 수 없습니다. 세그먼트 설정을 확인하세요.")
+                seg_labels = seg_labels.astype(str)
                 cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
                 cl_ids = seg_labels.map(cl_map)
-                out_series = cl_ids.map(name_map).fillna("")
+                out_series = seg_labels
                 id_series = cl_ids.fillna(-1).astype(int)
             elif "id" in df.columns:
                 id_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
@@ -5716,7 +6053,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 raise RuntimeError("세그 결과를 원본 데이터에 매핑할 수 없습니다.")
 
             df[col] = out_series
-            df[f"{col}_id"] = id_series
+            if self.chk_seg_save_cluster_id.isChecked():
+                df[f"{col}_id"] = id_series
             self.state.df = df
             self.tbl_preview.set_df(df)
             self._refresh_all_column_lists()
@@ -5893,7 +6231,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _build_tab_export(self):
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Export")
+        self.tabs.addTab(tab, "내보내기")
+        self._register_tab_label(tab, "내보내기", "Export")
         layout = QtWidgets.QVBoxLayout(tab)
 
         self.lbl_export = QtWidgets.QLabel(
@@ -5907,12 +6246,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         row = QtWidgets.QHBoxLayout()
         self.txt_export_path = QtWidgets.QLineEdit()
-        self.btn_export_browse = QtWidgets.QPushButton("Browse...")
+        self.btn_export_browse = QtWidgets.QPushButton("찾기")
         style_button(self.btn_export_browse, level=1)
         self.btn_export_browse.clicked.connect(self._browse_export_path)
-        self.btn_export = QtWidgets.QPushButton("Export to Excel")
+        self.btn_export = QtWidgets.QPushButton("엑셀 내보내기")
         style_button(self.btn_export, level=2)
         self.btn_export.clicked.connect(self._export_excel)
+        self._register_text(self.btn_export_browse, "찾기", "Browse...")
+        self._register_text(self.btn_export, "엑셀 내보내기", "Export to Excel")
 
         row.addWidget(QtWidgets.QLabel("Output Path"))
         row.addWidget(self.txt_export_path, 3)
@@ -6012,7 +6353,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _build_tab_rag(self):
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "AI Assistant (RAG)")
+        self.tabs.addTab(tab, "AI 어시스턴트 (RAG)")
+        self._register_tab_label(tab, "AI 어시스턴트 (RAG)", "AI Assistant (RAG)")
         layout = QtWidgets.QVBoxLayout(tab)
 
         layout.addWidget(QtWidgets.QLabel("<b>AI Assistant</b>: Ask questions about your current data/analysis."))
@@ -6060,9 +6402,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.txt_user_query.setPlaceholderText("Ex: 'Interpret the Factor 1 loadings' or 'Why did the decision tree select Age?'")
         self.txt_user_query.returnPressed.connect(self._send_rag_query)
 
-        self.btn_send_query = QtWidgets.QPushButton("Send / Gen Prompt")
+        self.btn_send_query = QtWidgets.QPushButton("질문 전송")
         style_button(self.btn_send_query, level=2)
         self.btn_send_query.clicked.connect(self._send_rag_query)
+        self._register_text(self.btn_send_query, "질문 전송", "Send / Gen Prompt")
 
         input_row.addWidget(self.txt_user_query, 3)
         input_row.addWidget(self.btn_send_query)
@@ -6162,6 +6505,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
+    font_path = r"C:\Users\70089004\seg\Pretendard-Medium.otf"
+    if os.path.exists(font_path):
+        font_id = QtGui.QFontDatabase.addApplicationFont(font_path)
+        if font_id != -1:
+            families = QtGui.QFontDatabase.applicationFontFamilies(font_id)
+            if families:
+                app.setFont(QtGui.QFont(families[0], 10))
     win = IntegratedApp()
     win.show()
     sys.exit(app.exec())
