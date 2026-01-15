@@ -1634,6 +1634,7 @@ class DemandClusterPlot(pg.PlotWidget):
         self._new_cluster_enabled: bool = False
         self._new_cluster_name: str = ""
         self._new_cluster_color: Optional[QtGui.QColor] = None
+        self._new_cluster_target_id: Optional[int] = None
         self._new_clusters_created: List[Tuple[int, str, QtGui.QColor]] = []
         self._new_cluster_history: List[Tuple[int, List[int], List[int]]] = []
 
@@ -1654,6 +1655,8 @@ class DemandClusterPlot(pg.PlotWidget):
     def set_new_cluster_mode(self, on: bool):
         self._new_cluster_enabled = bool(on)
         self.reset_interaction_state(clear_selection=True)
+        if not self._new_cluster_enabled:
+            self._new_cluster_target_id = None
 
     def set_new_cluster_template(self, name: str, color: Optional[str]):
         self._new_cluster_name = name or ""
@@ -1664,6 +1667,12 @@ class DemandClusterPlot(pg.PlotWidget):
                 self._new_cluster_color = None
         else:
             self._new_cluster_color = None
+
+    def set_new_cluster_target(self, cid: Optional[int]):
+        self._new_cluster_target_id = int(cid) if cid is not None else None
+
+    def clear_new_cluster_target(self):
+        self._new_cluster_target_id = None
 
     def reset_interaction_state(self, clear_selection: bool = False):
         self._dragging = False
@@ -2108,7 +2117,10 @@ class DemandClusterPlot(pg.PlotWidget):
         self.sigCoordsChanged.emit()
 
     def _create_cluster_from_drop(self, drop_xy: Tuple[float, float]):
-        new_cid = int(max(self._cluster) if len(self._cluster) else 0) + 1
+        if self._new_cluster_target_id is not None:
+            new_cid = int(self._new_cluster_target_id)
+        else:
+            new_cid = int(max(self._cluster) if len(self._cluster) else 0) + 1
         default_name = f"Cluster {new_cid}"
         base_name = self._new_cluster_name.strip() or default_name
         existing_names = {str(v).strip().lower() for v in self._cluster_names.values()}
@@ -2120,13 +2132,17 @@ class DemandClusterPlot(pg.PlotWidget):
             name = f"{base_name} {suffix}"
             suffix += 1
 
-        color = self._new_cluster_color or self._cluster_color(new_cid, alpha=255)
-        color, replaced = self._resolve_new_cluster_color(QtGui.QColor(color), new_cid)
-        if replaced:
-            QtWidgets.QToolTip.showText(
-                QtGui.QCursor.pos(),
-                "이미 사용 중인 색입니다. 비슷한 다른 색으로 자동 변경했습니다."
-            )
+        is_new_cluster = new_cid not in self._cluster_names
+        if is_new_cluster:
+            color = self._new_cluster_color or self._cluster_color(new_cid, alpha=255)
+            color, replaced = self._resolve_new_cluster_color(QtGui.QColor(color), new_cid)
+            if replaced:
+                QtWidgets.QToolTip.showText(
+                    QtGui.QCursor.pos(),
+                    "이미 사용 중인 색입니다. 비슷한 다른 색으로 자동 변경했습니다."
+                )
+        else:
+            color = self._cluster_custom_colors.get(new_cid, self._cluster_color(new_cid, alpha=255))
 
         if self._drag_temp_positions is not None:
             self._xy = self._drag_temp_positions
@@ -2136,10 +2152,11 @@ class DemandClusterPlot(pg.PlotWidget):
         for i in selected_indices:
             self._cluster[i] = new_cid
 
-        self._cluster_names[new_cid] = name
-        self._cluster_custom_colors[new_cid] = QtGui.QColor(color)
-        self._new_clusters_created.append((new_cid, name, QtGui.QColor(color)))
-        self._new_cluster_history.append((new_cid, selected_indices, prev_clusters))
+        if is_new_cluster:
+            self._cluster_names[new_cid] = name
+            self._cluster_custom_colors[new_cid] = QtGui.QColor(color)
+            self._new_clusters_created.append((new_cid, name, QtGui.QColor(color)))
+            self._new_cluster_history.append((new_cid, selected_indices, prev_clusters))
 
         self._drag_temp_positions = None
         self._drag_anchor_xy = None
@@ -2154,6 +2171,12 @@ class DemandClusterPlot(pg.PlotWidget):
         if self._new_cluster_enabled and not inside_hull:
             dst = None
         if self._new_cluster_enabled and dst is None:
+            if self._new_cluster_target_id is None:
+                QtWidgets.QToolTip.showText(
+                    QtGui.QCursor.pos(),
+                    "새 클러스터 생성 버튼을 먼저 눌러주세요."
+                )
+                return
             if self._drag_anchor_xy is not None:
                 dist = float(np.hypot(drop_xy[0] - self._drag_anchor_xy[0], drop_xy[1] - self._drag_anchor_xy[1]))
                 if dist < self._min_drag_distance():
@@ -6040,6 +6063,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         left = QtWidgets.QVBoxLayout()
 
         toggle_group = QtWidgets.QGroupBox("Edit Mode (Toggle)")
+        toggle_group.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
         tgl_lay = QtWidgets.QVBoxLayout(toggle_group)
         tgl_lay.setContentsMargins(2, 2, 2, 2)
         tgl_lay.setSpacing(2)
@@ -6079,6 +6103,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         add_group = QtWidgets.QGroupBox("Add Cluster (Drag into empty space)")
         add_lay = QtWidgets.QVBoxLayout(add_group)
+        self.btn_create_new_cluster = QtWidgets.QPushButton("새 클러스터 생성")
+        style_button(self.btn_create_new_cluster, level=1)
+        self.btn_create_new_cluster.clicked.connect(self._on_create_new_cluster_clicked)
+        self._register_text(self.btn_create_new_cluster, "새 클러스터 생성", "Create New Cluster")
+        add_lay.addWidget(self.btn_create_new_cluster)
         self.chk_add_cluster_mode = QtWidgets.QCheckBox("Enable drag-to-add cluster")
         self.chk_add_cluster_mode.setToolTip(
             "Select points, enable, then drop into an empty area to spawn a new cluster with the chosen name/color."
@@ -6111,6 +6140,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._register_text(self.btn_undo_new_cluster, "새 클러스터 되돌리기", "Undo Last Cluster")
         add_lay.addWidget(self.btn_undo_new_cluster)
 
+        self._pending_new_cluster_id = None
+        self._pending_new_cluster_dirty = False
         self._update_new_cluster_color_button()
         self._apply_new_cluster_template()
         self._on_new_cluster_toggle(False)
@@ -6348,6 +6379,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.txt_new_cluster_name.setEnabled(bool(checked))
         self.btn_new_cluster_color.setEnabled(bool(checked))
         self.lbl_new_cluster_color.setEnabled(bool(checked))
+        self.btn_create_new_cluster.setEnabled(bool(checked))
         self.plot_edit.set_new_cluster_mode(bool(checked))
         if checked:
             self._active_cluster_id = None
@@ -6355,6 +6387,33 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._active_cluster_id = None
             self._set_new_cluster_default_name(force=True)
             self._apply_new_cluster_template()
+        else:
+            self._pending_new_cluster_id = None
+            self._pending_new_cluster_dirty = False
+            self.plot_edit.clear_new_cluster_target()
+
+    def _on_create_new_cluster_clicked(self):
+        if not self.chk_add_cluster_mode.isChecked():
+            self.chk_add_cluster_mode.setChecked(True)
+        if self._pending_new_cluster_id is not None and self._pending_new_cluster_dirty:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "새 클러스터 미저장",
+                "저장되지 않은 새 클러스터가 있습니다.\n"
+                "세그 결과 저장 후 새 클러스터를 생성하세요.",
+            )
+            return
+        next_id = self._next_cluster_id()
+        self._pending_new_cluster_id = int(next_id)
+        self._pending_new_cluster_dirty = False
+        current_name = self.txt_new_cluster_name.text().strip()
+        if not current_name or self._is_default_cluster_name(current_name):
+            self._suppress_cluster_name_update = True
+            self.txt_new_cluster_name.setText(f"Cluster {next_id}")
+            self._suppress_cluster_name_update = False
+        self._apply_new_cluster_template()
+        self.plot_edit.set_new_cluster_target(next_id)
+        self._set_status(f"새 클러스터 {next_id} 생성 모드입니다.")
 
     def _pick_new_cluster_color(self):
         col = QtWidgets.QColorDialog.getColor(QtGui.QColor(self._new_cluster_color_hex), self, "Select Cluster Color")
@@ -6607,6 +6666,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._seg_save_counter = getattr(self, "_seg_save_counter", 1) + 1
             self.txt_seg_save_name.setText(f"seg_result_{self._seg_save_counter}")
             self._set_status(f"세그 결과를 '{col}' 컬럼에 저장했습니다.")
+            self._pending_new_cluster_id = None
+            self._pending_new_cluster_dirty = False
+            if hasattr(self, "plot_edit"):
+                self.plot_edit.clear_new_cluster_target()
         except Exception as e:
             show_error(self, "Save Seg Result Error", e)
 
@@ -6663,6 +6726,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
     def _on_manual_clusters_changed(self):
         self._sync_clusters_from_edit_plot("Manual clusters updated.")
+        pending_id = getattr(self, "_pending_new_cluster_id", None)
+        if pending_id is not None and self.state.cluster_assign is not None:
+            if int(pending_id) in set(map(int, self.state.cluster_assign.unique())):
+                self._pending_new_cluster_dirty = True
 
     def _on_manual_coords_changed(self):
         if self.state.demand_xy is None:
