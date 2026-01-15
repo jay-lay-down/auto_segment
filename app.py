@@ -1617,6 +1617,7 @@ class DemandClusterPlot(pg.PlotWidget):
         self._dragging = False
         self._drag_temp_positions: Optional[np.ndarray] = None
         self._drag_anchor_xy: Optional[Tuple[float, float]] = None
+        self._drag_committed: bool = False
 
         self._free_move_points: bool = False
         self._show_all_point_labels: bool = False
@@ -1972,12 +1973,50 @@ class DemandClusterPlot(pg.PlotWidget):
         if allow_far_new:
             min_dist = float(np.sqrt(d2[nearest]))
             scale = self._cluster_scale()
-            thresh = max(0.18 * scale, 0.0)
+            thresh = max(0.22 * scale, 0.0)
             if scale <= 0:
                 thresh = 0.0
             if thresh > 0 and min_dist > thresh:
                 return None
         return nearest
+
+    def _min_drag_distance(self) -> float:
+        scale = self._cluster_scale()
+        return max(0.03 * scale, 0.35)
+
+    def _drop_too_close_to_points(self, drop_xy: Tuple[float, float]) -> bool:
+        if self._xy.shape[0] == 0:
+            return False
+        scale = self._cluster_scale()
+        thr = max(0.08 * scale, 0.8)
+        dx = self._xy[:, 0] - drop_xy[0]
+        dy = self._xy[:, 1] - drop_xy[1]
+        d2 = dx * dx + dy * dy
+        return bool(d2.min() <= thr * thr)
+
+    def _resolve_new_cluster_color(self, color: QtGui.QColor, new_cid: int) -> Tuple[QtGui.QColor, bool]:
+        used_colors = set()
+        for cid in sorted(set(map(int, self._cluster.tolist()))):
+            try:
+                used_colors.add(self._cluster_color(cid, alpha=255).name().lower())
+            except Exception:
+                continue
+        original = QtGui.QColor(color).name().lower()
+        if original not in used_colors:
+            return color, False
+
+        hsv = QtGui.QColor(color).toHsv()
+        hue = hsv.hue()
+        if hue < 0:
+            hue = 0
+        for step in range(1, 13):
+            new_hue = (hue + step * 30) % 360
+            candidate = QtGui.QColor.fromHsv(new_hue, hsv.saturation(), hsv.value())
+            if candidate.name().lower() not in used_colors:
+                return candidate, True
+
+        fallback = self._cluster_color(new_cid, alpha=255)
+        return fallback, True
 
     def _assign_selected_to_cluster(self, dst: Optional[int]):
         if dst is None or not self._selected:
@@ -2026,6 +2065,12 @@ class DemandClusterPlot(pg.PlotWidget):
             suffix += 1
 
         color = self._new_cluster_color or self._cluster_color(new_cid, alpha=255)
+        color, replaced = self._resolve_new_cluster_color(QtGui.QColor(color), new_cid)
+        if replaced:
+            QtWidgets.QToolTip.showText(
+                QtGui.QCursor.pos(),
+                "이미 사용 중인 색입니다. 비슷한 다른 색으로 자동 변경했습니다."
+            )
 
         if self._drag_temp_positions is not None:
             self._xy = self._drag_temp_positions
@@ -2046,6 +2091,26 @@ class DemandClusterPlot(pg.PlotWidget):
     def _drop_with_snap(self, drop_xy: Tuple[float, float]):
         dst = self._cluster_at_position(drop_xy, allow_far_new=self._new_cluster_enabled)
         if self._new_cluster_enabled and dst is None:
+            if self._drag_anchor_xy is not None:
+                dist = float(np.hypot(drop_xy[0] - self._drag_anchor_xy[0], drop_xy[1] - self._drag_anchor_xy[1]))
+                if dist < self._min_drag_distance():
+                    QtWidgets.QToolTip.showText(
+                        QtGui.QCursor.pos(),
+                        "드래그 거리가 너무 짧아 새 클러스터 생성이 취소되었습니다."
+                    )
+                    return
+            if self._drop_too_close_to_points(drop_xy):
+                QtWidgets.QToolTip.showText(
+                    QtGui.QCursor.pos(),
+                    "기존 포인트/클러스터 근처에서는 새 클러스터를 만들 수 없습니다."
+                )
+                return
+            if len(self._selected) < 3:
+                QtWidgets.QToolTip.showText(
+                    QtGui.QCursor.pos(),
+                    "새 클러스터 생성은 최소 3개 포인트가 필요합니다."
+                )
+                return
             self._create_cluster_from_drop(drop_xy)
         else:
             self._assign_selected_to_cluster(dst)
@@ -2063,6 +2128,7 @@ class DemandClusterPlot(pg.PlotWidget):
             if i not in self._selected:
                 self._selected = {i}
             self._dragging = True
+            self._drag_committed = False
             self._drag_temp_positions = self._xy.copy()
             self._drag_anchor_xy = (pos[0], pos[1])
             ev.accept()
@@ -2076,6 +2142,9 @@ class DemandClusterPlot(pg.PlotWidget):
         ev.accept()
 
         if ev.isFinish():
+            if self._drag_committed:
+                return
+            self._drag_committed = True
             self._dragging = False
             if self._free_move_points:
                 self._commit_selected_move(pos)
