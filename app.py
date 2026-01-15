@@ -1629,6 +1629,7 @@ class DemandClusterPlot(pg.PlotWidget):
         self._new_cluster_name: str = ""
         self._new_cluster_color: Optional[QtGui.QColor] = None
         self._new_clusters_created: List[Tuple[int, str, QtGui.QColor]] = []
+        self._new_cluster_history: List[Tuple[int, List[int], List[int]]] = []
 
     def set_edit_mode_active(self, active: bool):
         self._edit_mode_active = active
@@ -1686,6 +1687,22 @@ class DemandClusterPlot(pg.PlotWidget):
                 continue
         self._new_clusters_created.clear()
         return items
+
+    def undo_last_new_cluster(self) -> Optional[int]:
+        if not self._new_cluster_history:
+            return None
+        cid, indices, prev_clusters = self._new_cluster_history.pop()
+        for idx, prev in zip(indices, prev_clusters):
+            self._cluster[idx] = int(prev)
+        self._cluster_names.pop(int(cid), None)
+        self._cluster_custom_colors.pop(int(cid), None)
+        self._new_clusters_created = [
+            item for item in self._new_clusters_created if int(item[0]) != int(cid)
+        ]
+        self.redraw_all()
+        self.sigClustersChanged.emit()
+        self._emit_selection_changed()
+        return int(cid)
 
     def reset_label_positions(self):
         self._label_pos_override.clear()
@@ -2075,16 +2092,20 @@ class DemandClusterPlot(pg.PlotWidget):
         if self._drag_temp_positions is not None:
             self._xy = self._drag_temp_positions
 
-        for i in self._selected:
+        selected_indices = sorted(self._selected)
+        prev_clusters = [int(self._cluster[i]) for i in selected_indices]
+        for i in selected_indices:
             self._cluster[i] = new_cid
 
         self._cluster_names[new_cid] = name
         self._cluster_custom_colors[new_cid] = QtGui.QColor(color)
         self._new_clusters_created.append((new_cid, name, QtGui.QColor(color)))
+        self._new_cluster_history.append((new_cid, selected_indices, prev_clusters))
 
         self._drag_temp_positions = None
         self._drag_anchor_xy = None
         self.redraw_all()
+        self.select_cluster(new_cid)
         self.sigClustersChanged.emit()
         self._emit_selection_changed()
 
@@ -5949,6 +5970,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         toggle_group = QtWidgets.QGroupBox("Edit Mode (Toggle)")
         tgl_lay = QtWidgets.QVBoxLayout(toggle_group)
+        tgl_lay.setContentsMargins(6, 6, 6, 6)
+        tgl_lay.setSpacing(4)
         self.radio_edit_points = QtWidgets.QRadioButton("Edit Points (Move/Merge)")
         self.radio_edit_points.setToolTip("Drag points to move/merge. Pan is locked.")
         self.radio_edit_view = QtWidgets.QRadioButton("View/Pan Mode")
@@ -6010,6 +6033,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         color_row.addWidget(self.btn_new_cluster_color)
         color_row.addWidget(self.lbl_new_cluster_color)
         add_lay.addLayout(color_row)
+
+        self.btn_undo_new_cluster = QtWidgets.QPushButton("새 클러스터 되돌리기")
+        style_button(self.btn_undo_new_cluster, level=1)
+        self.btn_undo_new_cluster.clicked.connect(self._undo_last_cluster_creation)
+        self._register_text(self.btn_undo_new_cluster, "새 클러스터 되돌리기", "Undo Last Cluster")
+        add_lay.addWidget(self.btn_undo_new_cluster)
 
         self._update_new_cluster_color_button()
         self._apply_new_cluster_template()
@@ -6112,11 +6141,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         # Bring in any newly created cluster names/colors from the edit plot
         new_clusters = self.plot_edit.consume_new_clusters()
+        new_cluster_ids: List[int] = []
         for cid, name, color in new_clusters:
             if name:
                 self.state.cluster_names[int(cid)] = name
             if color:
                 self.state.cluster_colors[int(cid)] = color
+            new_cluster_ids.append(int(cid))
 
         plot_names = self.plot_edit.get_cluster_names()
         plot_colors = self.plot_edit.get_cluster_colors()
@@ -6144,7 +6175,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         if self.state.demand_mode.startswith("Segments"):
             self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
 
-            seg_labels = self.state.demand_seg_labels or self._current_segment_labels()
+            seg_labels = self.state.demand_seg_labels if self.state.demand_seg_labels is not None else self._current_segment_labels()
             if seg_labels is not None and self.state.df is not None:
                 cl_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
                 df = self.state.df.copy()
@@ -6162,6 +6193,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._update_profiler()
         self._refresh_demand_preview()
         self._set_new_cluster_default_name()
+        if new_cluster_ids:
+            cid = new_cluster_ids[-1]
+            self.plot_edit.select_cluster(cid)
+            self._on_plot_selection_changed(cid)
         if status_msg:
             self._set_status(status_msg)
         return True
@@ -6255,6 +6290,17 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.plot_preview.set_cluster_colors(self.state.cluster_colors)
                 self._update_cluster_summary()
                 self.state.manual_dirty = True
+
+    def _undo_last_cluster_creation(self):
+        if not hasattr(self, "plot_edit"):
+            return
+        cid = self.plot_edit.undo_last_new_cluster()
+        if cid is None:
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "되돌릴 새 클러스터가 없습니다.")
+            return
+        self._sync_clusters_from_edit_plot("새 클러스터 생성을 되돌렸습니다.")
+        self._active_cluster_id = None
+        self._set_new_cluster_default_name(force=True)
 
     def _update_cluster_summary(self):
         """[v8.1] Enhanced to show sub-segment details for each cluster."""
@@ -6453,6 +6499,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 cl_ids = seg_labels.map(cl_map)
                 out_series = seg_labels
                 id_series = cl_ids.fillna(-1).astype(int)
+                df["Sub-segment"] = seg_labels.values
             elif "id" in df.columns:
                 id_map = {str(k): int(v) for k, v in self.state.cluster_assign.items()}
                 cl_ids = df["id"].astype(str).map(id_map)
