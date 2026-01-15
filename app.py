@@ -2018,8 +2018,6 @@ class DemandClusterPlot(pg.PlotWidget):
             min_dist = float(np.sqrt(d2[nearest]))
             scale = self._cluster_scale()
             thresh = max(0.22 * scale, 0.0)
-            if scale <= 0:
-                thresh = 0.0
             if thresh > 0 and min_dist > thresh:
                 return None
         return nearest
@@ -2176,33 +2174,32 @@ class DemandClusterPlot(pg.PlotWidget):
         self._emit_selection_changed()
 
     def _drop_with_snap(self, drop_xy: Tuple[float, float]):
-        inside_hull = self._inside_any_hull(drop_xy)
-        dst = self._cluster_at_position(drop_xy, allow_far_new=self._new_cluster_enabled)
-        if self._new_cluster_enabled and not inside_hull:
-            dst = None
-        if self._new_cluster_enabled and dst is None:
-            if self._new_cluster_target_id is None:
-                QtWidgets.QToolTip.showText(
-                    QtGui.QCursor.pos(),
-                    "새 클러스터 생성 버튼을 먼저 눌러주세요."
-                )
-                return
-            if self._drag_anchor_xy is not None:
-                dist = float(np.hypot(drop_xy[0] - self._drag_anchor_xy[0], drop_xy[1] - self._drag_anchor_xy[1]))
-                if dist < self._min_drag_distance():
+        if self._new_cluster_enabled:
+            dst = self._cluster_at_position(drop_xy, allow_far_new=True)
+            if dst is None:
+                if self._drag_anchor_xy is not None:
+                    dist = float(np.hypot(drop_xy[0] - self._drag_anchor_xy[0], drop_xy[1] - self._drag_anchor_xy[1]))
+                    if dist < self._min_drag_distance():
+                        QtWidgets.QToolTip.showText(
+                            QtGui.QCursor.pos(),
+                            "드래그 거리가 너무 짧아 새 클러스터 생성이 취소되었습니다."
+                        )
+                        return
+                if not self._selected:
                     QtWidgets.QToolTip.showText(
                         QtGui.QCursor.pos(),
-                        "드래그 거리가 너무 짧아 새 클러스터 생성이 취소되었습니다."
+                        "새 클러스터 생성은 포인트 선택이 필요합니다."
                     )
                     return
-            if not self._selected:
-                QtWidgets.QToolTip.showText(
-                    QtGui.QCursor.pos(),
-                    "새 클러스터 생성은 포인트 선택이 필요합니다."
-                )
-                return
-            self._create_cluster_from_drop(drop_xy)
+                next_id = int(max(self._cluster) if len(self._cluster) else 0) + 1
+                if not self._new_cluster_name.strip():
+                    self._new_cluster_name = f"New Cluster {next_id}"
+                self._new_cluster_target_id = None
+                self._create_cluster_from_drop(drop_xy)
+            else:
+                self._assign_selected_to_cluster(dst)
         else:
+            dst = self._cluster_at_position(drop_xy, allow_far_new=False)
             self._assign_selected_to_cluster(dst)
 
     def drag_event(self, pos: Tuple[float, float], ev):
