@@ -1584,6 +1584,7 @@ class DemandClusterPlot(pg.PlotWidget):
     """
     sigClustersChanged = QtCore.pyqtSignal()
     sigCoordsChanged = QtCore.pyqtSignal()
+    sigSelectionChanged = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None, editable: bool = True):
         self._vb = ClusterViewBox(self)
@@ -1627,7 +1628,6 @@ class DemandClusterPlot(pg.PlotWidget):
         self._new_cluster_name: str = ""
         self._new_cluster_color: Optional[QtGui.QColor] = None
         self._new_clusters_created: List[Tuple[int, str, QtGui.QColor]] = []
-        self._new_cluster_counter: int = 1
 
     def set_edit_mode_active(self, active: bool):
         self._edit_mode_active = active
@@ -1654,13 +1654,27 @@ class DemandClusterPlot(pg.PlotWidget):
                 self._new_cluster_color = None
         else:
             self._new_cluster_color = None
-        if name and name.lower().startswith("new cluster"):
-            try:
-                tail = name.split(" ", 2)[-1]
-                num = int(tail)
-                self._new_cluster_counter = max(self._new_cluster_counter, num)
-            except Exception:
-                pass
+
+    def _emit_selection_changed(self):
+        if not self._selected:
+            self.sigSelectionChanged.emit(None)
+            return
+        cluster_ids = {int(self._cluster[i]) for i in self._selected}
+        if len(cluster_ids) == 1:
+            self.sigSelectionChanged.emit(cluster_ids.pop())
+        else:
+            self.sigSelectionChanged.emit(None)
+
+    def select_cluster(self, cid: Optional[int]):
+        if cid is None:
+            self._selected.clear()
+            self._draw_scatter()
+            self.sigSelectionChanged.emit(None)
+            return
+        indices = set(np.where(self._cluster == int(cid))[0].tolist())
+        self._selected = indices
+        self._draw_scatter()
+        self.sigSelectionChanged.emit(int(cid))
 
     def consume_new_clusters(self) -> List[Tuple[int, str, str]]:
         items: List[Tuple[int, str, str]] = []
@@ -1904,6 +1918,7 @@ class DemandClusterPlot(pg.PlotWidget):
             if not shift:
                 self._selected.clear()
                 self._draw_scatter()
+                self._emit_selection_changed()
             return
         if shift:
             if i in self._selected:
@@ -1913,6 +1928,7 @@ class DemandClusterPlot(pg.PlotWidget):
         else:
             self._selected = {i}
         self._draw_scatter()
+        self._emit_selection_changed()
 
     def _cluster_centroids(self) -> Dict[int, Tuple[float, float]]:
         out = {}
@@ -1975,6 +1991,7 @@ class DemandClusterPlot(pg.PlotWidget):
         self._drag_anchor_xy = None
         self.redraw_all()
         self.sigClustersChanged.emit()
+        self._emit_selection_changed()
 
     def _commit_selected_move(self, drop_xy: Tuple[float, float]):
         if self._drag_anchor_xy is None or not self._selected:
@@ -1997,8 +2014,11 @@ class DemandClusterPlot(pg.PlotWidget):
 
     def _create_cluster_from_drop(self, drop_xy: Tuple[float, float]):
         new_cid = int(max(self._cluster) if len(self._cluster) else 0) + 1
-        base_name = self._new_cluster_name.strip() or f"New Cluster {self._new_cluster_counter}"
+        default_name = f"Cluster {new_cid}"
+        base_name = self._new_cluster_name.strip() or default_name
         existing_names = {str(v).strip().lower() for v in self._cluster_names.values()}
+        if base_name.strip().lower() in existing_names:
+            base_name = default_name
         name = base_name
         suffix = 2
         while name.strip().lower() in existing_names:
@@ -2016,12 +2036,12 @@ class DemandClusterPlot(pg.PlotWidget):
         self._cluster_names[new_cid] = name
         self._cluster_custom_colors[new_cid] = QtGui.QColor(color)
         self._new_clusters_created.append((new_cid, name, QtGui.QColor(color)))
-        self._new_cluster_counter = max(self._new_cluster_counter + 1, new_cid + 1)
 
         self._drag_temp_positions = None
         self._drag_anchor_xy = None
         self.redraw_all()
         self.sigClustersChanged.emit()
+        self._emit_selection_changed()
 
     def _drop_with_snap(self, drop_xy: Tuple[float, float]):
         dst = self._cluster_at_position(drop_xy, allow_far_new=self._new_cluster_enabled)
@@ -2047,6 +2067,7 @@ class DemandClusterPlot(pg.PlotWidget):
             self._drag_anchor_xy = (pos[0], pos[1])
             ev.accept()
             self._draw_scatter()
+            self._emit_selection_changed()
             return
 
         if not self._dragging:
@@ -2169,6 +2190,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         # Compatibility flags for optional/legacy tab builders
         self._dt_results_built = False
+        self._active_cluster_id: Optional[int] = None
+        self._suppress_cluster_name_update = False
+        self._suppress_summary_selection = False
 
         # Menu Bar
         menubar = self.menuBar()
@@ -4780,6 +4804,16 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._register_tab_label(tab, "그룹/조합", "Group & Compose")
 
         layout = QtWidgets.QVBoxLayout(tab)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_contents = QtWidgets.QWidget()
+        scroll_layout = QtWidgets.QVBoxLayout(scroll_contents)
+        scroll_layout.setContentsMargins(8, 8, 8, 8)
+        scroll_layout.setSpacing(10)
+        scroll.setWidget(scroll_contents)
+        layout.addWidget(scroll)
 
         # Binary Recode Section
         box_bin = QtWidgets.QGroupBox("Quick Binary Recode (2 Values) -> *_seg")
@@ -4824,7 +4858,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         bin_layout.addWidget(QtWidgets.QLabel("New Name"))
         bin_layout.addWidget(self.txt_bin_newcol, 2)
         bin_layout.addWidget(self.btn_bin_apply)
-        layout.addWidget(box_bin)
+        scroll_layout.addWidget(box_bin)
 
         # Mapping Table Section
         box = QtWidgets.QGroupBox("General Grouping: Source Value -> Segment Label (Mapping Table)")
@@ -4870,7 +4904,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         merge_row.addWidget(self.txt_group_merge_label, 2)
         merge_row.addWidget(self.btn_group_merge_apply)
         b.addLayout(merge_row)
-        layout.addWidget(box, 3)
+        scroll_layout.addWidget(box, 3)
 
         # Compose Section
         box2 = QtWidgets.QGroupBox("Combine Segments: Multiple *_seg -> Combined Segment")
@@ -4899,7 +4933,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         c.addWidget(self.lst_compose_segs, 2)
         c.addLayout(right, 1)
-        layout.addWidget(box2, 1)
+        scroll_layout.addWidget(box2, 1)
 
         # Cleanup Section
         box3 = QtWidgets.QGroupBox("Cleanup: Delete Derived Columns (Factor / *_seg / Custom)")
@@ -4927,7 +4961,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         del_row.addWidget(self.btn_delete_cols)
         dlay.addLayout(del_row)
 
-        layout.addWidget(box3, 0)
+        scroll_layout.addWidget(box3, 0)
+        scroll_layout.addStretch(1)
 
     def _apply_binary_recode(self):
         try:
@@ -5429,6 +5464,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.plot_edit.set_data(*args)
                 self._update_cluster_summary()
                 self._update_profiler()
+                self._set_new_cluster_default_name()
 
                 tgt_txt = ", ".join(targets) if targets else "(none)"
                 self.lbl_demand_status.setText(
@@ -5506,6 +5542,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                 self.plot_edit.set_data(*args)
                 self._update_cluster_summary()
                 self._update_profiler()
+                self._set_new_cluster_default_name()
 
                 tgt_txt = ", ".join(targets)
                 self.lbl_demand_status.setText(f"Done: {coord_name}, vars={len(ids)}, k={k}, targets=[{tgt_txt}].")
@@ -5696,6 +5733,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.plot_edit = DemandClusterPlot(editable=True)
         self.plot_edit.sigClustersChanged.connect(self._on_manual_clusters_changed)
         self.plot_edit.sigCoordsChanged.connect(self._on_manual_coords_changed)
+        self.plot_edit.sigSelectionChanged.connect(self._on_plot_selection_changed)
 
         left = QtWidgets.QVBoxLayout()
 
@@ -5745,9 +5783,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         add_lay.addWidget(self.chk_add_cluster_mode)
 
         name_row = QtWidgets.QHBoxLayout()
-        self._new_cluster_seq = 1
-        self.txt_new_cluster_name = QtWidgets.QLineEdit(f"New Cluster {self._new_cluster_seq}")
-        self.txt_new_cluster_name.textChanged.connect(lambda _: self._apply_new_cluster_template())
+        self.txt_new_cluster_name = QtWidgets.QLineEdit(f"Cluster {self._next_cluster_id()}")
+        self.txt_new_cluster_name.textChanged.connect(self._on_cluster_name_edited)
         name_row.addWidget(QtWidgets.QLabel("Name"))
         name_row.addWidget(self.txt_new_cluster_name)
         add_lay.addLayout(name_row)
@@ -5857,11 +5894,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._set_status("View Mode: Pan/Zoom enabled. (Editing locked)")
 
     def _sync_clusters_from_edit_plot(self, status_msg: Optional[str] = None) -> bool:
-        if self.state.demand_xy is None or self.state.cluster_assign is None:
+        s = self.plot_edit.get_cluster_series()
+        if self.state.demand_xy is None or s is None or s.empty:
             self._set_status("세그먼트 결과가 없습니다. 먼저 Demand Space를 실행하세요.")
             return False
-
-        s = self.plot_edit.get_cluster_series()
         self.state.cluster_assign = s
 
         # Bring in any newly created cluster names/colors from the edit plot
@@ -5869,7 +5905,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
         for cid, name, color in new_clusters:
             if name:
                 self.state.cluster_names[int(cid)] = name
-                self._bump_new_cluster_placeholder(name)
             if color:
                 self.state.cluster_colors[int(cid)] = color
 
@@ -5916,6 +5951,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._update_cluster_summary()
         self._update_profiler()
         self._refresh_demand_preview()
+        self._set_new_cluster_default_name()
         if status_msg:
             self._set_status(status_msg)
         return True
@@ -5927,10 +5963,65 @@ class IntegratedApp(QtWidgets.QMainWindow):
             f"background-color: {col}; color: #000; border: 1px solid #555;"
         )
 
+    def _next_cluster_id(self) -> int:
+        ids: List[int] = []
+        if self.state.cluster_assign is not None and not self.state.cluster_assign.empty:
+            try:
+                ids.extend([int(v) for v in self.state.cluster_assign.unique()])
+            except Exception:
+                pass
+        if self.state.cluster_names:
+            try:
+                ids.extend([int(k) for k in self.state.cluster_names.keys()])
+            except Exception:
+                pass
+        if self.state.demand_xy is not None and "cluster_id" in self.state.demand_xy.columns:
+            try:
+                ids.extend([int(v) for v in self.state.demand_xy["cluster_id"].dropna().unique()])
+            except Exception:
+                pass
+        return max(ids) + 1 if ids else 1
+
+    def _is_default_cluster_name(self, name: str) -> bool:
+        txt = name.strip()
+        if not txt.startswith("Cluster "):
+            return False
+        tail = txt.replace("Cluster ", "", 1).strip()
+        return tail.isdigit()
+
+    def _set_new_cluster_default_name(self, force: bool = False):
+        if self._active_cluster_id is not None and not force:
+            return
+        current = self.txt_new_cluster_name.text().strip()
+        if not force and current and not self._is_default_cluster_name(current):
+            return
+        next_id = self._next_cluster_id()
+        self._suppress_cluster_name_update = True
+        self.txt_new_cluster_name.setText(f"Cluster {next_id}")
+        self._suppress_cluster_name_update = False
+        self._apply_new_cluster_template()
+
     def _apply_new_cluster_template(self):
         name = self.txt_new_cluster_name.text().strip()
         col = getattr(self, "_new_cluster_color_hex", None)
         self.plot_edit.set_new_cluster_template(name, col)
+
+    def _on_cluster_name_edited(self):
+        if self._suppress_cluster_name_update:
+            return
+        name = self.txt_new_cluster_name.text().strip()
+        self._apply_new_cluster_template()
+        if self._active_cluster_id is None:
+            return
+        if not name:
+            return
+        self.state.cluster_names[int(self._active_cluster_id)] = name
+        self.txt_rename_cluster.setText(name)
+        self.plot_edit.set_cluster_names(self.state.cluster_names)
+        self.plot_preview.set_cluster_names(self.state.cluster_names)
+        self._update_cluster_summary()
+        self._update_profiler()
+        self.state.manual_dirty = True
 
     def _on_new_cluster_toggle(self, checked: bool):
         self.txt_new_cluster_name.setEnabled(bool(checked))
@@ -5938,6 +6029,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.lbl_new_cluster_color.setEnabled(bool(checked))
         self.plot_edit.set_new_cluster_mode(bool(checked))
         if checked:
+            self._active_cluster_id = None
+            self._set_new_cluster_default_name(force=True)
             self._apply_new_cluster_template()
 
     def _pick_new_cluster_color(self):
@@ -5946,11 +6039,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._new_cluster_color_hex = col.name()
             self._update_new_cluster_color_button()
             self._apply_new_cluster_template()
+            if self._active_cluster_id is not None:
+                self.state.cluster_colors[int(self._active_cluster_id)] = col.name()
+                self.plot_edit.set_cluster_colors(self.state.cluster_colors)
+                self.plot_preview.set_cluster_colors(self.state.cluster_colors)
+                self._update_cluster_summary()
+                self.state.manual_dirty = True
 
     def _update_cluster_summary(self):
         """[v8.1] Enhanced to show sub-segment details for each cluster."""
         if self.state.demand_xy is None or self.state.cluster_assign is None:
             self.tbl_cluster_summary.set_df(None)
+            self._cluster_summary_df = None
             return
 
         cl = self.state.cluster_assign.copy()
@@ -5978,6 +6078,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
                     "Targets Used": ", ".join(self.state.demand_targets_used or self.state.demand_targets or []),
                 })
         out = pd.DataFrame(rows).sort_values(["Cluster ID", "Sub-segment"]).reset_index(drop=True)
+        self._cluster_summary_df = out
         self.tbl_cluster_summary.set_df(out, max_rows=2000)
         self._apply_cluster_summary_tint(out)
 
@@ -6007,9 +6108,18 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _on_cluster_summary_selection_changed(self, *_args):
         if not hasattr(self, "tbl_cluster_summary"):
             return
+        if self._suppress_summary_selection:
+            return
 
         selected = self.tbl_cluster_summary.selectedItems()
         if not selected:
+            self._active_cluster_id = None
+            self._set_new_cluster_default_name()
+            self._suppress_summary_selection = True
+            try:
+                self.plot_edit.select_cluster(None)
+            finally:
+                self._suppress_summary_selection = False
             return
 
         headers = [self.tbl_cluster_summary.horizontalHeaderItem(c).text() for c in range(self.tbl_cluster_summary.columnCount())]
@@ -6035,14 +6145,61 @@ class IntegratedApp(QtWidgets.QMainWindow):
             cid_item = self.tbl_cluster_summary.item(row, headers.index("Cluster ID"))
             if cid_item is not None:
                 cid = int(cid_item.text())
+                self._suppress_summary_selection = True
+                try:
+                    self.plot_edit.select_cluster(cid)
+                finally:
+                    self._suppress_summary_selection = False
                 self._sync_new_cluster_fields_from_summary(cid)
         except Exception:
             return
 
+    def _on_plot_selection_changed(self, cid: Optional[int]):
+        if not hasattr(self, "tbl_cluster_summary"):
+            return
+        if self._suppress_summary_selection:
+            return
+        self._suppress_summary_selection = True
+        try:
+            self.tbl_cluster_summary.clearSelection()
+            if cid is None:
+                self._active_cluster_id = None
+                self._set_new_cluster_default_name()
+                return
+            headers = [
+                self.tbl_cluster_summary.horizontalHeaderItem(c).text()
+                for c in range(self.tbl_cluster_summary.columnCount())
+            ]
+            if "Cluster ID" not in headers:
+                return
+            cid_col = headers.index("Cluster ID")
+            first_item = None
+            for row in range(self.tbl_cluster_summary.rowCount()):
+                item = self.tbl_cluster_summary.item(row, cid_col)
+                if item is None:
+                    continue
+                try:
+                    if int(item.text()) == int(cid):
+                        self.tbl_cluster_summary.selectRow(row)
+                        if first_item is None:
+                            first_item = item
+                except Exception:
+                    continue
+            if first_item is not None:
+                self.tbl_cluster_summary.scrollToItem(first_item)
+            self._sync_new_cluster_fields_from_summary(int(cid))
+        finally:
+            self._suppress_summary_selection = False
+
     def _sync_new_cluster_fields_from_summary(self, cid: int):
+        self._active_cluster_id = int(cid)
         name = self.state.cluster_names.get(int(cid), f"Cluster {int(cid)}")
         color = self._cluster_color_hex(int(cid))
+        self._suppress_cluster_name_update = True
         self.txt_new_cluster_name.setText(name)
+        self._suppress_cluster_name_update = False
+        self.spin_rename_cluster_id.setValue(int(cid))
+        self.txt_rename_cluster.setText(name)
         self._new_cluster_color_hex = color
         self._update_new_cluster_color_button()
         self._apply_new_cluster_template()
@@ -6109,21 +6266,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._set_status(f"세그 결과를 '{col}' 컬럼에 저장했습니다.")
         except Exception as e:
             show_error(self, "Save Seg Result Error", e)
-
-    def _bump_new_cluster_placeholder(self, last_created: Optional[str] = None):
-        if not last_created:
-            return
-        name = str(last_created).strip()
-        if not name.lower().startswith("new cluster"):
-            return
-        try:
-            parts = name.split()
-            num = int(parts[-1]) if parts[-1].isdigit() else None
-        except Exception:
-            num = None
-        if num is not None:
-            self._new_cluster_seq = max(self._new_cluster_seq, num + 1)
-            self.txt_new_cluster_name.setText(f"New Cluster {self._new_cluster_seq}")
 
     def _update_profiler(self):
         """Calculates Z-scores for each cluster to find distinctive features."""
@@ -6221,36 +6363,6 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self.state.cluster_names,
             self.state.cluster_colors,
         )
-
-    def _sync_clusters_from_edit_plot(self, status_msg: Optional[str] = None) -> bool:
-        """Sync cluster assignments (and derived tables) from the editable plot without Series truthiness checks."""
-        if self.state.demand_xy is None:
-            return False
-
-        s = self.plot_edit.get_cluster_series()
-        if s is None or s.empty:
-            return False
-
-        self.state.cluster_assign = s
-        if "id" in self.state.demand_xy.columns:
-            df = self.state.demand_xy.copy()
-            mapped = df["id"].astype(str).map(s)
-            if "cluster_id" in df.columns:
-                mapped = mapped.fillna(df["cluster_id"])
-            df["cluster_id"] = mapped.astype(int)
-            self.state.demand_xy = df
-
-        if self.state.demand_mode.startswith("Segments"):
-            self.state.demand_seg_cluster_map = {k: int(v) for k, v in self.state.cluster_assign.items()}
-
-        self.state.manual_dirty = True
-        self._update_cluster_summary()
-        self._update_profiler()
-        self._refresh_demand_preview()
-
-        if status_msg:
-            self._set_status(status_msg)
-        return True
 
     def _rename_cluster(self):
         try:
