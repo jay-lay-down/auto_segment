@@ -2242,6 +2242,28 @@ class VisualTreeWidget(QtWidgets.QGraphicsView):
             txt.setPos(p[0], p[1])
             self.scene.addItem(txt)
 
+
+# -----------------------------------------------------------------------------
+# Decision Tree Setting Splitter (with double-click reset)
+# -----------------------------------------------------------------------------
+
+class DecisionTreeSplitter(QtWidgets.QSplitter):
+    sigHandleDoubleClicked = QtCore.pyqtSignal()
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.setHandleWidth(8)
+        self.setChildrenCollapsible(False)
+
+    def createHandle(self):
+        handle = super().createHandle()
+        handle.setCursor(QtCore.Qt.CursorShape.SplitVCursor)
+        return handle
+
+    def mouseDoubleClickEvent(self, event):
+        self.sigHandleDoubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
+
 # =============================================================================
 # app.py (Part 5/8)
 # MainWindow, Data Loading, Project Save/Load, Variable Type Manager
@@ -3671,25 +3693,42 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._register_tab_label(tab, "의사결정나무 설정", "Decision Tree Setting")
 
         layout = QtWidgets.QVBoxLayout(tab)
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        splitter = DecisionTreeSplitter(QtCore.Qt.Orientation.Vertical)
         layout.addWidget(splitter, 1)
 
         top_widget = QtWidgets.QWidget()
         top_layout = QtWidgets.QVBoxLayout(top_widget)
-        top_layout.setContentsMargins(8, 8, 8, 8)
-        top_layout.setSpacing(10)
+        top_layout.setContentsMargins(6, 6, 6, 6)
+        top_layout.setSpacing(6)
 
         # [v8.1] Enhanced Header with Variable Type Info
-        head = QtWidgets.QLabel(
-            "<b>Decision Tree Analysis</b><br>"
+        head_row = QtWidgets.QHBoxLayout()
+        head_title = QtWidgets.QLabel("<b>Decision Tree Analysis</b>")
+        self.lbl_dt_head_summary = QtWidgets.QLabel(
+            "1) 타깃/예측변수 선택 → 2) 분석 시작 → 3) 결과 확인"
+        )
+        self.lbl_dt_head_summary.setWordWrap(True)
+        self.btn_dt_head_toggle = QtWidgets.QToolButton()
+        self.btn_dt_head_toggle.setText("자세히")
+        self.btn_dt_head_toggle.setCheckable(True)
+        self.btn_dt_head_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.btn_dt_head_toggle.toggled.connect(self._toggle_dt_head_details)
+        head_row.addWidget(head_title)
+        head_row.addStretch(1)
+        head_row.addWidget(self.btn_dt_head_toggle)
+        top_layout.addLayout(head_row)
+        top_layout.addWidget(self.lbl_dt_head_summary)
+
+        self.lbl_dt_head_details = QtWidgets.QLabel(
             "1. Select Dependent(Target) & Independent(Predictors) variables.<br>"
             "2. Click 'Run Analysis' to generate Improvement Pivot.<br>"
-            "3. Select a cell in Pivot and click 'Recommend Grouping' to auto-create segments.<br><br>"
+            "3. Select a cell in Pivot and click 'Recommend Grouping' to auto-create segments.<br>"
             "<i>Note: <span style='background-color:#fff3e0;'>Orange</span> = Categorical (Optimal Subset Split), "
             "White = Numeric (Threshold Split). Use Variable Type Manager to customize.</i>"
         )
-        head.setWordWrap(True)
-        top_layout.addWidget(head)
+        self.lbl_dt_head_details.setWordWrap(True)
+        self.lbl_dt_head_details.setVisible(False)
+        top_layout.addWidget(self.lbl_dt_head_details)
 
         # Controls: Targets
         row = QtWidgets.QHBoxLayout()
@@ -3775,8 +3814,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         # Importance + Pivot (Main View)
         results_widget = QtWidgets.QWidget()
         results_layout = QtWidgets.QVBoxLayout(results_widget)
-        results_layout.setContentsMargins(8, 8, 8, 8)
-        results_layout.setSpacing(8)
+        results_layout.setContentsMargins(6, 4, 6, 6)
+        results_layout.setSpacing(6)
 
         results_header = QtWidgets.QHBoxLayout()
         results_header.addWidget(QtWidgets.QLabel("<b>Results</b>"), 1)
@@ -3784,7 +3823,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
         style_button(self.btn_dt_toggle_results, level=1)
         self.btn_dt_toggle_results.setCheckable(True)
         self.btn_dt_toggle_results.toggled.connect(self._toggle_dt_setting_results)
+        self.btn_dt_reset_layout = QtWidgets.QPushButton("레이아웃 복원")
+        style_button(self.btn_dt_reset_layout, level=1)
+        self.btn_dt_reset_layout.clicked.connect(self._reset_dt_setting_splitter_layout)
         results_header.addWidget(self.btn_dt_toggle_results)
+        results_header.addWidget(self.btn_dt_reset_layout)
         results_layout.addLayout(results_header)
 
         w1 = QtWidgets.QWidget()
@@ -3810,12 +3853,11 @@ class IntegratedApp(QtWidgets.QMainWindow):
         results_layout.addWidget(w1, 1)
         splitter.addWidget(results_widget)
 
-        top_widget.setMinimumHeight(200)
+        top_widget.setMinimumHeight(170)
         results_widget.setMinimumHeight(200)
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        splitter.sigHandleDoubleClicked.connect(self._reset_dt_setting_splitter_layout)
         self.dt_setting_splitter = splitter
         self._restore_dt_setting_splitter_state()
 
@@ -3824,6 +3866,12 @@ class IntegratedApp(QtWidgets.QMainWindow):
         for i in range(self.lst_dt_predictors.count()):
             it = self.lst_dt_predictors.item(i)
             it.setHidden(term not in it.text().lower())
+
+    def _toggle_dt_head_details(self, checked: bool):
+        if not hasattr(self, "lbl_dt_head_details"):
+            return
+        self.lbl_dt_head_details.setVisible(bool(checked))
+        self.btn_dt_head_toggle.setText("접기" if checked else "자세히")
 
     def _save_dt_setting_splitter_state(self):
         if not hasattr(self, "dt_setting_splitter"):
@@ -3854,12 +3902,21 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._dt_setting_splitter_sizes = self.dt_setting_splitter.sizes()
         self.dt_setting_splitter.splitterMoved.connect(self._save_dt_setting_splitter_state)
 
+    def _reset_dt_setting_splitter_layout(self):
+        if not hasattr(self, "dt_setting_splitter"):
+            return
+        self.dt_setting_splitter.setSizes([320, 560])
+        self._dt_setting_splitter_sizes = self.dt_setting_splitter.sizes()
+        if hasattr(self, "btn_dt_toggle_results"):
+            self.btn_dt_toggle_results.setChecked(False)
+        self._save_dt_setting_splitter_state()
+
     def _toggle_dt_setting_results(self, checked: bool):
         if not hasattr(self, "dt_setting_splitter"):
             return
         if checked:
             self._dt_setting_splitter_sizes = self.dt_setting_splitter.sizes()
-            min_top = 200
+            min_top = 170
             min_bottom = 200
             total = sum(self._dt_setting_splitter_sizes or [0, 0])
             if total <= 0:
