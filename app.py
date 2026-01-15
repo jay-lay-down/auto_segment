@@ -2195,19 +2195,6 @@ class DemandClusterPlot(pg.PlotWidget):
                         "드래그 거리가 너무 짧아 새 클러스터 생성이 취소되었습니다."
                     )
                     return
-            ignore_clusters = set()
-            if len(self._selected) >= 2:
-                ignore_clusters = {int(self._cluster[i]) for i in self._selected}
-            if self._drop_too_close_to_points(
-                drop_xy,
-                ignore_selected=True,
-                ignore_clusters=ignore_clusters,
-            ):
-                QtWidgets.QToolTip.showText(
-                    QtGui.QCursor.pos(),
-                    "기존 포인트/클러스터 근처에서는 새 클러스터를 만들 수 없습니다."
-                )
-                return
             if not self._selected:
                 QtWidgets.QToolTip.showText(
                     QtGui.QCursor.pos(),
