@@ -2038,18 +2038,28 @@ class DemandClusterPlot(pg.PlotWidget):
         scale = self._cluster_scale()
         return max(0.03 * scale, 0.35)
 
-    def _drop_too_close_to_points(self, drop_xy: Tuple[float, float], ignore_selected: bool = False) -> bool:
+    def _drop_too_close_to_points(
+        self,
+        drop_xy: Tuple[float, float],
+        ignore_selected: bool = False,
+        ignore_clusters: Optional[set[int]] = None,
+    ) -> bool:
         if self._xy.shape[0] == 0:
             return False
         xy = self._drag_temp_positions if self._drag_temp_positions is not None else self._xy
         scale = self._cluster_scale()
         thr = max(0.08 * scale, 0.8)
         mask = None
-        if ignore_selected and self._selected:
+        if ignore_selected or ignore_clusters:
             mask = np.ones(len(xy), dtype=bool)
-            for i in self._selected:
-                if 0 <= i < len(mask):
-                    mask[i] = False
+            if ignore_selected and self._selected:
+                for i in self._selected:
+                    if 0 <= i < len(mask):
+                        mask[i] = False
+            if ignore_clusters:
+                for idx, cid in enumerate(self._cluster):
+                    if int(cid) in ignore_clusters:
+                        mask[idx] = False
         dx = xy[:, 0] - drop_xy[0]
         dy = xy[:, 1] - drop_xy[1]
         d2 = dx * dx + dy * dy
@@ -2185,12 +2195,6 @@ class DemandClusterPlot(pg.PlotWidget):
                         "드래그 거리가 너무 짧아 새 클러스터 생성이 취소되었습니다."
                     )
                     return
-            if self._drop_too_close_to_points(drop_xy, ignore_selected=True):
-                QtWidgets.QToolTip.showText(
-                    QtGui.QCursor.pos(),
-                    "기존 포인트/클러스터 근처에서는 새 클러스터를 만들 수 없습니다."
-                )
-                return
             if not self._selected:
                 QtWidgets.QToolTip.showText(
                     QtGui.QCursor.pos(),
