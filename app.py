@@ -30,6 +30,7 @@ import pickle
 import math
 import ast
 import time  # Added for retry delays
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -48,6 +49,11 @@ from sklearn.decomposition import PCA, FactorAnalysis
 from sklearn.manifold import MDS
 from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.preprocessing import StandardScaler
+
+# -------------------------------------------------------------------------
+# Logging
+# -------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Helper Functions: Colors & Formatting
@@ -1633,6 +1639,7 @@ class DemandClusterPlot(pg.PlotWidget):
 
     def set_edit_mode_active(self, active: bool):
         self._edit_mode_active = active
+        self.reset_interaction_state(clear_selection=True)
 
     def is_edit_mode_active(self) -> bool:
         return self._edit_mode_active and self._editable_widget
@@ -1646,6 +1653,7 @@ class DemandClusterPlot(pg.PlotWidget):
 
     def set_new_cluster_mode(self, on: bool):
         self._new_cluster_enabled = bool(on)
+        self.reset_interaction_state(clear_selection=True)
 
     def set_new_cluster_template(self, name: str, color: Optional[str]):
         self._new_cluster_name = name or ""
@@ -1656,6 +1664,16 @@ class DemandClusterPlot(pg.PlotWidget):
                 self._new_cluster_color = None
         else:
             self._new_cluster_color = None
+
+    def reset_interaction_state(self, clear_selection: bool = False):
+        self._dragging = False
+        self._drag_committed = False
+        self._drag_temp_positions = None
+        self._drag_anchor_xy = None
+        if clear_selection:
+            self._selected.clear()
+            self._draw_scatter()
+            self._emit_selection_changed()
 
     def _emit_selection_changed(self):
         if not self._selected:
@@ -2142,8 +2160,23 @@ class DemandClusterPlot(pg.PlotWidget):
             return
 
         if ev.isStart():
+            logger.debug(
+                "drag_start edit=%s new_cluster=%s free_move=%s selected=%s pos=%s",
+                self._edit_mode_active,
+                self._new_cluster_enabled,
+                self._free_move_points,
+                len(self._selected),
+                pos,
+            )
             i = self._nearest_point(pos[0], pos[1])
             if i is None:
+                if self._selected and (self._new_cluster_enabled or self._free_move_points):
+                    self._dragging = True
+                    self._drag_committed = False
+                    self._drag_temp_positions = self._xy.copy()
+                    self._drag_anchor_xy = (pos[0], pos[1])
+                    ev.accept()
+                    return
                 ev.ignore()
                 return
             if i not in self._selected:
@@ -2163,6 +2196,13 @@ class DemandClusterPlot(pg.PlotWidget):
         ev.accept()
 
         if ev.isFinish():
+            logger.debug(
+                "drag_finish free_move=%s new_cluster=%s selected=%s pos=%s",
+                self._free_move_points,
+                self._new_cluster_enabled,
+                len(self._selected),
+                pos,
+            )
             if self._drag_committed:
                 return
             self._drag_committed = True
@@ -2173,6 +2213,13 @@ class DemandClusterPlot(pg.PlotWidget):
                 self._drop_with_snap(pos)
             return
 
+        logger.debug(
+            "drag_move free_move=%s new_cluster=%s selected=%s pos=%s",
+            self._free_move_points,
+            self._new_cluster_enabled,
+            len(self._selected),
+            pos,
+        )
         if self._drag_temp_positions is not None and self._selected and self._drag_anchor_xy is not None:
             dx = pos[0] - self._drag_anchor_xy[0]
             dy = pos[1] - self._drag_anchor_xy[1]
@@ -6127,6 +6174,9 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _on_edit_mode_toggled(self):
         is_point_edit = self.radio_edit_points.isChecked()
         self.plot_edit.set_edit_mode_active(is_point_edit)
+        self.chk_add_cluster_mode.setEnabled(is_point_edit)
+        if not is_point_edit and self.chk_add_cluster_mode.isChecked():
+            self.chk_add_cluster_mode.setChecked(False)
         if is_point_edit:
             self._set_status("Edit Mode: Drag points/labels enabled. (Pan locked)")
         else:
@@ -6256,6 +6306,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             return
         name = self.txt_new_cluster_name.text().strip()
         self._apply_new_cluster_template()
+        if self.chk_add_cluster_mode.isChecked():
+            return
         if self._active_cluster_id is None:
             return
         if not name:
@@ -6275,6 +6327,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self.plot_edit.set_new_cluster_mode(bool(checked))
         if checked:
             self._active_cluster_id = None
+            self.tbl_cluster_summary.clearSelection()
+            self._active_cluster_id = None
             self._set_new_cluster_default_name(force=True)
             self._apply_new_cluster_template()
 
@@ -6284,6 +6338,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
             self._new_cluster_color_hex = col.name()
             self._update_new_cluster_color_button()
             self._apply_new_cluster_template()
+            if self.chk_add_cluster_mode.isChecked():
+                return
             if self._active_cluster_id is not None:
                 self.state.cluster_colors[int(self._active_cluster_id)] = col.name()
                 self.plot_edit.set_cluster_colors(self.state.cluster_colors)
@@ -6364,6 +6420,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
     def _on_cluster_summary_selection_changed(self, *_args):
         if not hasattr(self, "tbl_cluster_summary"):
             return
+        if self.chk_add_cluster_mode.isChecked():
+            return
         if self._suppress_summary_selection:
             return
 
@@ -6412,6 +6470,10 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
     def _on_plot_selection_changed(self, cid: Optional[int]):
         if not hasattr(self, "tbl_cluster_summary"):
+            return
+        if self.chk_add_cluster_mode.isChecked():
+            self._active_cluster_id = None
+            self._set_new_cluster_default_name()
             return
         if self._suppress_summary_selection:
             return
