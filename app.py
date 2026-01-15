@@ -2015,18 +2015,39 @@ class DemandClusterPlot(pg.PlotWidget):
                 return None
         return nearest
 
+    def _inside_any_hull(self, drop_xy: Tuple[float, float]) -> bool:
+        pt = QtCore.QPointF(drop_xy[0], drop_xy[1])
+        for hull_item in self._hull_items.values():
+            try:
+                if hull_item.path().contains(pt):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _min_drag_distance(self) -> float:
         scale = self._cluster_scale()
         return max(0.03 * scale, 0.35)
 
-    def _drop_too_close_to_points(self, drop_xy: Tuple[float, float]) -> bool:
+    def _drop_too_close_to_points(self, drop_xy: Tuple[float, float], ignore_selected: bool = False) -> bool:
         if self._xy.shape[0] == 0:
             return False
+        xy = self._drag_temp_positions if self._drag_temp_positions is not None else self._xy
         scale = self._cluster_scale()
         thr = max(0.08 * scale, 0.8)
-        dx = self._xy[:, 0] - drop_xy[0]
-        dy = self._xy[:, 1] - drop_xy[1]
+        mask = None
+        if ignore_selected and self._selected:
+            mask = np.ones(len(xy), dtype=bool)
+            for i in self._selected:
+                if 0 <= i < len(mask):
+                    mask[i] = False
+        dx = xy[:, 0] - drop_xy[0]
+        dy = xy[:, 1] - drop_xy[1]
         d2 = dx * dx + dy * dy
+        if mask is not None:
+            d2 = d2[mask]
+        if d2.size == 0:
+            return False
         return bool(d2.min() <= thr * thr)
 
     def _resolve_new_cluster_color(self, color: QtGui.QColor, new_cid: int) -> Tuple[QtGui.QColor, bool]:
@@ -2128,7 +2149,10 @@ class DemandClusterPlot(pg.PlotWidget):
         self._emit_selection_changed()
 
     def _drop_with_snap(self, drop_xy: Tuple[float, float]):
+        inside_hull = self._inside_any_hull(drop_xy)
         dst = self._cluster_at_position(drop_xy, allow_far_new=self._new_cluster_enabled)
+        if self._new_cluster_enabled and not inside_hull:
+            dst = None
         if self._new_cluster_enabled and dst is None:
             if self._drag_anchor_xy is not None:
                 dist = float(np.hypot(drop_xy[0] - self._drag_anchor_xy[0], drop_xy[1] - self._drag_anchor_xy[1]))
@@ -2138,16 +2162,16 @@ class DemandClusterPlot(pg.PlotWidget):
                         "드래그 거리가 너무 짧아 새 클러스터 생성이 취소되었습니다."
                     )
                     return
-            if self._drop_too_close_to_points(drop_xy):
+            if self._drop_too_close_to_points(drop_xy, ignore_selected=True):
                 QtWidgets.QToolTip.showText(
                     QtGui.QCursor.pos(),
                     "기존 포인트/클러스터 근처에서는 새 클러스터를 만들 수 없습니다."
                 )
                 return
-            if len(self._selected) < 3:
+            if not self._selected:
                 QtWidgets.QToolTip.showText(
                     QtGui.QCursor.pos(),
-                    "새 클러스터 생성은 최소 3개 포인트가 필요합니다."
+                    "새 클러스터 생성은 포인트 선택이 필요합니다."
                 )
                 return
             self._create_cluster_from_drop(drop_xy)
@@ -6017,8 +6041,8 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         toggle_group = QtWidgets.QGroupBox("Edit Mode (Toggle)")
         tgl_lay = QtWidgets.QVBoxLayout(toggle_group)
-        tgl_lay.setContentsMargins(6, 6, 6, 6)
-        tgl_lay.setSpacing(4)
+        tgl_lay.setContentsMargins(2, 2, 2, 2)
+        tgl_lay.setSpacing(2)
         self.radio_edit_points = QtWidgets.QRadioButton("Edit Points (Move/Merge)")
         self.radio_edit_points.setToolTip("Drag points to move/merge. Pan is locked.")
         self.radio_edit_view = QtWidgets.QRadioButton("View/Pan Mode")
