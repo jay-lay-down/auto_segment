@@ -2187,12 +2187,14 @@ class IntegratedApp(QtWidgets.QMainWindow):
         pg.setConfigOptions(antialias=True)
 
         self.state = AppState()
+        self._settings = QtCore.QSettings("AutoSegment", "AutoSegmentTool")
 
         # Compatibility flags for optional/legacy tab builders
         self._dt_results_built = False
         self._active_cluster_id: Optional[int] = None
         self._suppress_cluster_name_update = False
         self._suppress_summary_selection = False
+        self._dt_setting_splitter_sizes: Optional[List[int]] = None
 
         # Menu Bar
         menubar = self.menuBar()
@@ -3600,6 +3602,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
         self._register_tab_label(tab, "의사결정나무 설정", "Decision Tree Setting")
 
         layout = QtWidgets.QVBoxLayout(tab)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        layout.addWidget(splitter, 1)
+
+        top_widget = QtWidgets.QWidget()
+        top_layout = QtWidgets.QVBoxLayout(top_widget)
+        top_layout.setContentsMargins(8, 8, 8, 8)
+        top_layout.setSpacing(10)
 
         # [v8.1] Enhanced Header with Variable Type Info
         head = QtWidgets.QLabel(
@@ -3611,7 +3620,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
             "White = Numeric (Threshold Split). Use Variable Type Manager to customize.</i>"
         )
         head.setWordWrap(True)
-        layout.addWidget(head)
+        top_layout.addWidget(head)
 
         # Controls: Targets
         row = QtWidgets.QHBoxLayout()
@@ -3625,7 +3634,7 @@ class IntegratedApp(QtWidgets.QMainWindow):
         row.addWidget(self.chk_use_all_factors)
         row.addStretch(1)
         row.addWidget(self.btn_run_tree)
-        layout.addLayout(row)
+        top_layout.addLayout(row)
 
         extra_box = QtWidgets.QGroupBox("추가 타깃(선택)")
         extra_layout = QtWidgets.QVBoxLayout(extra_box)
@@ -3652,11 +3661,13 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         extra_row.addLayout(btn_col)
         extra_layout.addLayout(extra_row)
-        layout.addWidget(extra_box)
+        top_layout.addWidget(extra_box)
 
         # Controls: Predictors (Whitelist)
         pred_box = QtWidgets.QGroupBox("독립변수(예측변수) 선택")
         pred_layout = QtWidgets.QVBoxLayout(pred_box)
+        pred_layout.setContentsMargins(8, 8, 8, 8)
+        pred_layout.setSpacing(6)
 
         p_row = QtWidgets.QHBoxLayout()
         self.txt_dt_pred_filter = QtWidgets.QLineEdit()
@@ -3686,11 +3697,27 @@ class IntegratedApp(QtWidgets.QMainWindow):
 
         self.lst_dt_predictors = QtWidgets.QListWidget()
         self.lst_dt_predictors.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.lst_dt_predictors.setMaximumHeight(140)
+        self.lst_dt_predictors.setMaximumHeight(90)
         pred_layout.addWidget(self.lst_dt_predictors, 1)
-        layout.addWidget(pred_box)
+        top_layout.addWidget(pred_box)
+
+        splitter.addWidget(top_widget)
 
         # Importance + Pivot (Main View)
+        results_widget = QtWidgets.QWidget()
+        results_layout = QtWidgets.QVBoxLayout(results_widget)
+        results_layout.setContentsMargins(8, 8, 8, 8)
+        results_layout.setSpacing(8)
+
+        results_header = QtWidgets.QHBoxLayout()
+        results_header.addWidget(QtWidgets.QLabel("<b>Results</b>"), 1)
+        self.btn_dt_toggle_results = QtWidgets.QPushButton("결과 크게 보기")
+        style_button(self.btn_dt_toggle_results, level=1)
+        self.btn_dt_toggle_results.setCheckable(True)
+        self.btn_dt_toggle_results.toggled.connect(self._toggle_dt_setting_results)
+        results_header.addWidget(self.btn_dt_toggle_results)
+        results_layout.addLayout(results_header)
+
         w1 = QtWidgets.QWidget()
         l1 = QtWidgets.QVBoxLayout(w1)
         l1.addWidget(QtWidgets.QLabel("Predictor Importance (sum of improve_rel, cumulative %)"))
@@ -3711,13 +3738,70 @@ class IntegratedApp(QtWidgets.QMainWindow):
         rec_layout.addStretch(1)
         l1.addLayout(rec_layout)
 
-        layout.addWidget(w1, 1)
+        results_layout.addWidget(w1, 1)
+        splitter.addWidget(results_widget)
+
+        top_widget.setMinimumHeight(200)
+        results_widget.setMinimumHeight(200)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        self.dt_setting_splitter = splitter
+        self._restore_dt_setting_splitter_state()
 
     def _filter_dt_pred_list(self):
         term = self.txt_dt_pred_filter.text().strip().lower()
         for i in range(self.lst_dt_predictors.count()):
             it = self.lst_dt_predictors.item(i)
             it.setHidden(term not in it.text().lower())
+
+    def _save_dt_setting_splitter_state(self):
+        if not hasattr(self, "dt_setting_splitter"):
+            return
+        if hasattr(self, "btn_dt_toggle_results") and self.btn_dt_toggle_results.isChecked():
+            return
+        try:
+            state = self.dt_setting_splitter.saveState()
+            self._settings.setValue("dt_setting_splitter_state", state)
+            self._dt_setting_splitter_sizes = self.dt_setting_splitter.sizes()
+        except Exception:
+            return
+
+    def _restore_dt_setting_splitter_state(self):
+        if not hasattr(self, "dt_setting_splitter"):
+            return
+        restored = False
+        try:
+            state = self._settings.value("dt_setting_splitter_state")
+            if isinstance(state, QtCore.QByteArray):
+                restored = self.dt_setting_splitter.restoreState(state)
+            elif isinstance(state, (bytes, bytearray)):
+                restored = self.dt_setting_splitter.restoreState(QtCore.QByteArray(state))
+        except Exception:
+            restored = False
+        if not restored:
+            self.dt_setting_splitter.setSizes([380, 520])
+        self._dt_setting_splitter_sizes = self.dt_setting_splitter.sizes()
+        self.dt_setting_splitter.splitterMoved.connect(self._save_dt_setting_splitter_state)
+
+    def _toggle_dt_setting_results(self, checked: bool):
+        if not hasattr(self, "dt_setting_splitter"):
+            return
+        if checked:
+            self._dt_setting_splitter_sizes = self.dt_setting_splitter.sizes()
+            min_top = 200
+            min_bottom = 200
+            total = sum(self._dt_setting_splitter_sizes or [0, 0])
+            if total <= 0:
+                total = 800
+            self.dt_setting_splitter.setSizes([min_top, max(min_bottom, total - min_top)])
+            self.btn_dt_toggle_results.setText("설정 보기(복원)")
+        else:
+            if self._dt_setting_splitter_sizes:
+                self.dt_setting_splitter.setSizes(self._dt_setting_splitter_sizes)
+            self.btn_dt_toggle_results.setText("결과 크게 보기")
+            self._save_dt_setting_splitter_state()
 
     def _run_decision_tree_outputs(self):
         """Calculates Improve Pivot and Best Split tables with variable type awareness."""
